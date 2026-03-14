@@ -16,7 +16,7 @@
         "width": 400,
         "height": 600,
         "resizable": true,
-        "visible": true,
+        "visible": false,
         "decorations": true,
         "center": true,
         "label": "main"

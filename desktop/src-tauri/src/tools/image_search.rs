@@ -36,12 +36,34 @@ pub async fn image_verify(
 
     let image_bytes = std::fs::read(path)
         .map_err(|e| anyhow::anyhow!("Failed to read image '{}': {}", image_path, e))?;
+
+    // Most local vision models (LLaVA, MiniCPM-V, etc.) don't support WebP.
+    // Return a helpful message instead of sending it and getting a 400.
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    if ext == "webp" {
+        return Ok(format!(
+            "[image_verify skipped: {} is WebP which is not supported by most local vision models. \
+             Re-download as JPEG/PNG if you need to verify this image.]",
+            image_path
+        ));
+    }
+
+    // Guard against very large images that exhaust LM Studio's context window
+    const MAX_VERIFY_BYTES: usize = 4 * 1024 * 1024; // 4 MB
+    if image_bytes.len() > MAX_VERIFY_BYTES {
+        return Ok(format!(
+            "[image_verify skipped: {} is {:.1} MB which may exceed the vision model's context window. \
+             File exists and appears valid.]",
+            image_path,
+            image_bytes.len() as f64 / 1024.0 / 1024.0
+        ));
+    }
+
     let b64 = base64_encode(&image_bytes);
 
-    let mime = match path.extension().and_then(|e| e.to_str()) {
-        Some("png") => "image/png",
-        Some("gif") => "image/gif",
-        Some("webp") => "image/webp",
+    let mime = match ext.as_str() {
+        "png" => "image/png",
+        "gif" => "image/gif",
         _ => "image/jpeg",
     };
 
@@ -198,8 +220,8 @@ pub async fn image_download(query: &str, count: usize, dest_dir: &str) -> Result
     let sanitized = sanitize_filename(query);
     let dest_base = dest_dir.trim_end_matches('\\').to_string();
 
-    // Download concurrently (8 at a time), trying all candidates until we reach count
-    let sem = Arc::new(Semaphore::new(8));
+    // Download concurrently (3 at a time) — limits peak RAM usage
+    let sem = Arc::new(Semaphore::new(3));
     let client = Arc::new(client);
     let mut tasks = tokio::task::JoinSet::new();
 
@@ -460,13 +482,19 @@ async fn scrape_searxng_images(client: &reqwest::Client, query: &str, max: usize
 
 // ── Download ──────────────────────────────────────────────────────────────────
 
+/// Max image download size — large images spike RAM and choke LM Studio vision.
+const MAX_IMAGE_BYTES: usize = 6 * 1024 * 1024; // 6 MB
+
 /// Download an image URL, returning (bytes, extension).
-/// Uses Content-Type header for extension; validates magic bytes.
+/// Streams in chunks, validates magic bytes, enforces size cap.
 async fn download_image_bytes(client: &reqwest::Client, url: &str) -> Result<(Vec<u8>, &'static str)> {
+    use futures_util::StreamExt;
+
     let resp = client
         .get(url)
         .header("Referer", "https://www.google.com/")
-        .header("Accept", "image/webp,image/apng,image/*,*/*;q=0.8")
+        // Prefer JPEG/PNG — skip WebP at the HTTP level since many vision models reject it
+        .header("Accept", "image/jpeg,image/png,image/gif,image/*;q=0.8")
         .send()
         .await
         .map_err(|e| anyhow::anyhow!("Request failed: {}", e))?;
@@ -475,20 +503,31 @@ async fn download_image_bytes(client: &reqwest::Client, url: &str) -> Result<(Ve
         return Err(anyhow::anyhow!("HTTP {}", resp.status()));
     }
 
-    // Determine extension from Content-Type before consuming body
+    // Check Content-Length header upfront — skip obviously oversized files
+    if let Some(len) = resp.content_length() {
+        if len as usize > MAX_IMAGE_BYTES {
+            return Err(anyhow::anyhow!("Content-Length {} exceeds cap", len));
+        }
+    }
+
     let ct_ext = resp.headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .and_then(|ct| content_type_to_ext(ct));
 
-    let bytes = resp.bytes().await
-        .map_err(|e| anyhow::anyhow!("Failed to read bytes: {}", e))?
-        .to_vec();
+    // Stream into buffer, aborting if size cap exceeded
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::with_capacity(256 * 1024);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| anyhow::anyhow!("Stream error: {}", e))?;
+        if buf.len() + chunk.len() > MAX_IMAGE_BYTES {
+            return Err(anyhow::anyhow!("Image exceeds {}MB cap, skipping", MAX_IMAGE_BYTES / 1024 / 1024));
+        }
+        buf.extend_from_slice(&chunk);
+    }
 
-    // Validate magic bytes to confirm it's a real image
-    let ext = validate_image_bytes(&bytes, ct_ext, url)?;
-
-    Ok((bytes, ext))
+    let ext = validate_image_bytes(&buf, ct_ext, url)?;
+    Ok((buf, ext))
 }
 
 /// Check magic bytes and return the correct extension, or error if not a real image.
