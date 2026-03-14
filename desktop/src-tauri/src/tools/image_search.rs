@@ -170,6 +170,21 @@ pub async fn image_download(query: &str, count: usize, dest_dir: &str) -> Result
         }
     }
 
+    // hbubli SearXNG — rate-limited, so only use as final fallback
+    if candidates.len() < want {
+        match scrape_searxng_images(&client, query, want).await {
+            Ok(urls) => {
+                info!("SearXNG(hbubli): {} URLs", urls.len());
+                source_report.push(format!("SearXNG:{}", urls.len()));
+                for u in urls { if !candidates.contains(&u) { candidates.push(u); } }
+            }
+            Err(e) => {
+                warn!("SearXNG scrape failed: {}", e);
+                source_report.push("SearXNG:0".to_string());
+            }
+        }
+    }
+
     info!("Total candidates: {} ({})", candidates.len(), source_report.join(", "));
 
     if candidates.is_empty() {
@@ -391,6 +406,51 @@ async fn scrape_qwant_images(client: &reqwest::Client, query: &str, max: usize) 
             if let Some(url) = item["media"].as_str() {
                 if url.starts_with("http") {
                     urls.push(url.to_string());
+                }
+            }
+        }
+    }
+    Ok(urls)
+}
+
+/// Scrape hbubli.cc SearXNG instance — aggregates many engines, clean JSON API.
+/// Called last in the fallback chain; SearXNG instances are rate-limited.
+async fn scrape_searxng_images(client: &reqwest::Client, query: &str, max: usize) -> Result<Vec<String>> {
+    let encoded = urlencoded(query);
+    // format=json returns structured JSON; safesearch=0 disables filtering
+    let url = format!(
+        "https://search.hbubli.cc/search?q={}&category=images&format=json&safesearch=0&pageno=1",
+        encoded
+    );
+
+    let resp = client
+        .get(&url)
+        .header("Accept", "application/json, text/html, */*; q=0.8")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .header("Referer", "https://search.hbubli.cc/")
+        .send().await
+        .map_err(|e| anyhow::anyhow!("SearXNG request failed: {}", e))?;
+
+    if resp.status() == 429 {
+        return Err(anyhow::anyhow!("SearXNG rate-limited (429)"));
+    }
+    if !resp.status().is_success() {
+        return Ok(vec![]);
+    }
+
+    let data: serde_json::Value = resp.json().await
+        .map_err(|e| anyhow::anyhow!("SearXNG JSON parse failed: {}", e))?;
+
+    let mut urls = Vec::new();
+    if let Some(results) = data["results"].as_array() {
+        for r in results {
+            if urls.len() >= max { break; }
+            // SearXNG image results have img_src with the original image URL
+            let img = r["img_src"].as_str()
+                .or_else(|| r["url"].as_str());
+            if let Some(u) = img {
+                if u.starts_with("http") {
+                    urls.push(u.to_string());
                 }
             }
         }
