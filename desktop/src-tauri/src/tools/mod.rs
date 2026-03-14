@@ -241,6 +241,18 @@ pub fn tool_schemas() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "browser_scroll",
+            "description": "Scroll the page. Direction: 'up', 'down', 'top', 'bottom', or a CSS selector to scroll to.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "target": { "type": "string" },
+                    "pixels": { "type": "integer" }
+                },
+                "required": ["target"]
+            }
+        }),
+        json!({
             "name": "browser_get_url",
             "description": "Get current tab URL, title, and ID.",
             "input_schema": { "type": "object", "properties": {} }
@@ -396,6 +408,13 @@ pub async fn dispatch(
                 .ok_or_else(|| anyhow::anyhow!("browser_fill: missing 'value'"))?;
             let submit = input["submit"].as_bool().unwrap_or(false);
             browser.fill(selector, value, submit).await
+        }
+        "browser_scroll" => {
+            let target = input["target"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("browser_scroll: missing 'target'"))?;
+            let pixels = input["pixels"].as_i64().unwrap_or(500);
+            browser.scroll(target, pixels).await
         }
         "browser_get_url" => browser.get_url().await,
         "image_download" => {

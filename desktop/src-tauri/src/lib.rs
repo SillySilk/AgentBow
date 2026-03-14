@@ -1,10 +1,9 @@
-mod anthropic;
 mod auth;
 mod local_llm;
-mod router;
 mod server;
 mod state;
 mod tools;
+mod types;
 
 use state::{AppState, Config};
 use tauri::{
@@ -44,13 +43,7 @@ pub fn run() {
     // Capture values needed in tray handlers
     let ws_port = config.ws_port;
     let workspace = config.workspace_root.to_string_lossy().to_string();
-    let model_display = {
-        let m = &config.model;
-        if m.contains("opus") { "Claude Opus".to_string() }
-        else if m.contains("sonnet") { "Claude Sonnet".to_string() }
-        else if m.contains("haiku") { "Claude Haiku".to_string() }
-        else { m.clone() }
-    };
+    let model_display = config.lm_studio_model.clone();
 
     let app_state = AppState::new(config.clone());
 

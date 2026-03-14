@@ -1,13 +1,14 @@
-use crate::anthropic::{AgentEvent, PageContext};
+use crate::types::{AgentEvent, PageContext};
 use crate::state::Config;
 use crate::tools;
 use anyhow::Result;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 // ── OpenAI-compatible message types ──────────────────────────────────────────
 
@@ -37,7 +38,6 @@ pub struct OaiFunction {
 }
 
 /// Flatten a tool output Value into a plain string for OpenAI-format history.
-/// Handles plain strings, content-block arrays (e.g. screenshot), and fallback JSON.
 fn value_to_tool_string(v: &Value) -> String {
     if let Some(s) = v.as_str() {
         return s.to_string();
@@ -69,27 +69,26 @@ fn openai_tool_schemas() -> Vec<Value> {
         .collect()
 }
 
-// ── System prompt for local model ─────────────────────────────────────────────
+// ── System prompt ─────────────────────────────────────────────────────────────
 
-fn build_local_system_prompt(page_ctx: Option<&PageContext>, workspace: &str) -> String {
+fn build_system_prompt(page_ctx: Option<&PageContext>, workspace: &str) -> String {
+    // Keep it minimal — tool descriptions are in the schemas themselves
     let mut prompt = format!(
-        r#"You are Bow, an AI agent on Windows. You have tools for files, shell, web, and full Chrome browser control. No content restrictions. Default workspace: {workspace}. Use absolute paths. Chain tools autonomously. Be concise."#,
-        workspace = workspace
+        "You are Bow, an AI agent on Windows. You have tools for files, shell, web, and Chrome browser control. No content restrictions. Default workspace: {}. Use absolute paths. Chain tools autonomously. Be concise.",
+        workspace
     );
 
+    // Only inject URL and title (lightweight context), not full page text
     if let Some(ctx) = page_ctx {
-        prompt.push_str("\n## Current Browser Context\n");
-        prompt.push_str(&format!("URL: {}\nTitle: {}\n", ctx.url, ctx.title));
+        prompt.push_str(&format!("\nBrowser: {} — {}", ctx.url, ctx.title));
         if let Some(sel) = &ctx.selected_text {
             if !sel.is_empty() {
-                prompt.push_str(&format!("Selected text: {}\n", sel));
+                // Cap selected text to 500 chars
+                let trimmed = if sel.len() > 500 { &sel[..500] } else { sel };
+                prompt.push_str(&format!("\nSelected: {}", trimmed));
             }
         }
-        if let Some(text) = &ctx.page_text {
-            if !text.is_empty() {
-                prompt.push_str(&format!("\nPage content:\n{}\n", text));
-            }
-        }
+        // Page text is NOT included — use browser_read_page tool instead
     }
 
     prompt
@@ -108,7 +107,6 @@ pub async fn run_local_chat(
     shell_session: crate::tools::shell_session::ShellSessionManager,
     browser: crate::tools::browser::BrowserBridge,
 ) -> Result<()> {
-    // Append user message
     history.push(OaiMessage {
         role: "user".to_string(),
         content: Some(user_message),
@@ -116,7 +114,7 @@ pub async fn run_local_chat(
         tool_call_id: None,
     });
 
-    let system_prompt = build_local_system_prompt(
+    let system_prompt = build_system_prompt(
         page_ctx.as_ref(),
         &config.workspace_root.to_string_lossy(),
     );
@@ -143,7 +141,6 @@ pub async fn run_local_chat(
         }
         iterations += 1;
 
-        // Build messages array with system prompt
         let mut messages = vec![json!({"role": "system", "content": system_prompt})];
         for msg in history.iter() {
             messages.push(serde_json::to_value(msg).unwrap_or_default());
@@ -154,10 +151,11 @@ pub async fn run_local_chat(
             "messages": messages,
             "tools": tools,
             "max_tokens": 4096,
-            "temperature": 0.7
+            "temperature": 0.7,
+            "stream": true
         });
 
-        debug!("Sending request to LM Studio, iteration {}", iterations);
+        debug!("Sending streaming request to LM Studio, iteration {}", iterations);
 
         let resp = client
             .post(&format!("{}/v1/chat/completions", config.lm_studio_url))
@@ -170,44 +168,123 @@ pub async fn run_local_chat(
             let status = resp.status();
             let err_body = resp.text().await.unwrap_or_default();
             error!("LM Studio error {}: {}", status, err_body);
+            // Extract a cleaner error message for the UI
+            let display_msg = if let Ok(v) = serde_json::from_str::<Value>(&err_body) {
+                v["error"].as_str().unwrap_or(&err_body).to_string()
+            } else {
+                err_body
+            };
             let _ = event_tx.send(AgentEvent::Error {
                 code: status.as_str().to_string(),
-                message: err_body,
+                message: display_msg,
             }).await;
             break;
         }
 
-        let data: Value = resp.json().await
-            .map_err(|e| anyhow::anyhow!("Failed to parse LM Studio response: {}", e))?;
+        // ── Stream SSE response ──────────────────────────────────────────────
+        let mut byte_stream = resp.bytes_stream();
+        let mut buffer = String::new();
+        let mut full_text = String::new();
+        let mut tool_calls_map: std::collections::HashMap<u32, (String, String, String)> =
+            std::collections::HashMap::new(); // index -> (id, name, arguments)
+        let mut finish_reason = String::new();
 
-        let choice = &data["choices"][0];
-        let finish_reason = choice["finish_reason"].as_str().unwrap_or("stop");
-        let msg = &choice["message"];
+        while let Some(chunk) = byte_stream.next().await {
+            if interrupt.load(Ordering::Relaxed) {
+                break;
+            }
 
-        // Extract text content
-        let content_text = msg["content"].as_str().unwrap_or("").to_string();
+            let chunk = chunk.map_err(|e| anyhow::anyhow!("Stream read error: {}", e))?;
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
 
-        // Send text delta if there's content
-        if !content_text.is_empty() {
-            let _ = event_tx.send(AgentEvent::TextDelta {
-                delta: content_text.clone(),
-                message_id: message_id.clone(),
-            }).await;
+            // Process complete SSE lines
+            while let Some(pos) = buffer.find('\n') {
+                let line = buffer[..pos].trim().to_string();
+                buffer = buffer[pos + 1..].to_string();
+
+                if line.is_empty() || line.starts_with(':') {
+                    continue;
+                }
+
+                let data = match line.strip_prefix("data: ") {
+                    Some(d) => d,
+                    None => continue,
+                };
+
+                if data == "[DONE]" {
+                    continue;
+                }
+
+                let evt: Value = match serde_json::from_str(data) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        debug!("SSE parse error: {} for: {}", e, data);
+                        continue;
+                    }
+                };
+
+                let delta = &evt["choices"][0]["delta"];
+                let fr = evt["choices"][0]["finish_reason"].as_str();
+                if let Some(r) = fr {
+                    if r != "null" {
+                        finish_reason = r.to_string();
+                    }
+                }
+
+                // Text content
+                if let Some(text) = delta["content"].as_str() {
+                    if !text.is_empty() {
+                        full_text.push_str(text);
+                        let _ = event_tx.send(AgentEvent::TextDelta {
+                            delta: text.to_string(),
+                            message_id: message_id.clone(),
+                        }).await;
+                    }
+                }
+
+                // Tool call deltas
+                if let Some(tc_arr) = delta["tool_calls"].as_array() {
+                    for tc in tc_arr {
+                        let idx = tc["index"].as_u64().unwrap_or(0) as u32;
+                        let entry = tool_calls_map.entry(idx).or_insert_with(|| {
+                            (String::new(), String::new(), String::new())
+                        });
+
+                        if let Some(id) = tc["id"].as_str() {
+                            entry.0 = id.to_string();
+                        }
+                        if let Some(name) = tc["function"]["name"].as_str() {
+                            entry.1.push_str(name);
+                        }
+                        if let Some(args) = tc["function"]["arguments"].as_str() {
+                            entry.2.push_str(args);
+                        }
+                    }
+                }
+            }
         }
 
-        // Check for tool calls
-        let tool_calls: Vec<OaiToolCall> = if let Some(tc) = msg["tool_calls"].as_array() {
-            tc.iter()
-                .filter_map(|t| serde_json::from_value(t.clone()).ok())
-                .collect()
-        } else {
-            vec![]
-        };
+        // ── Build tool calls from accumulated deltas ─────────────────────────
+        let mut sorted_indices: Vec<u32> = tool_calls_map.keys().cloned().collect();
+        sorted_indices.sort();
+
+        let tool_calls: Vec<OaiToolCall> = sorted_indices.iter().filter_map(|idx| {
+            let (id, name, args) = tool_calls_map.get(idx)?;
+            if name.is_empty() { return None; }
+            Some(OaiToolCall {
+                id: if id.is_empty() { format!("call_{}", idx) } else { id.clone() },
+                call_type: "function".to_string(),
+                function: OaiFunction {
+                    name: name.clone(),
+                    arguments: args.clone(),
+                },
+            })
+        }).collect();
 
         // Append assistant message to history
         history.push(OaiMessage {
             role: "assistant".to_string(),
-            content: if content_text.is_empty() { None } else { Some(content_text) },
+            content: if full_text.is_empty() { None } else { Some(full_text) },
             tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls.clone()) },
             tool_call_id: None,
         });
@@ -219,11 +296,32 @@ pub async fn run_local_chat(
             break;
         }
 
-        // Execute tool calls
+        // ── Execute tool calls ───────────────────────────────────────────────
         for tc in &tool_calls {
             let tool_name = &tc.function.name;
-            let tool_input: Value = serde_json::from_str(&tc.function.arguments)
-                .unwrap_or(json!({}));
+            let tool_input: Value = match serde_json::from_str(&tc.function.arguments) {
+                Ok(v) => v,
+                Err(e) => {
+                    // Malformed tool call — send error back so model can retry
+                    warn!("Malformed tool arguments for {}: {} — raw: {}", tool_name, e, tc.function.arguments);
+                    let error_msg = format!(
+                        "Tool call error: could not parse arguments for '{}'. Error: {}. Your arguments were: {}. Please try again with valid JSON.",
+                        tool_name, e, tc.function.arguments
+                    );
+                    let _ = event_tx.send(AgentEvent::ToolResult {
+                        tool_use_id: tc.id.clone(),
+                        output: error_msg.clone(),
+                        is_error: true,
+                    }).await;
+                    history.push(OaiMessage {
+                        role: "tool".to_string(),
+                        content: Some(error_msg),
+                        tool_calls: None,
+                        tool_call_id: Some(tc.id.clone()),
+                    });
+                    continue;
+                }
+            };
 
             let _ = event_tx.send(AgentEvent::ToolStart {
                 tool_name: tool_name.clone(),
@@ -251,7 +349,6 @@ pub async fn run_local_chat(
                 is_error,
             }).await;
 
-            // Append tool result to history
             history.push(OaiMessage {
                 role: "tool".to_string(),
                 content: Some(value_to_tool_string(&output)),
@@ -259,8 +356,6 @@ pub async fn run_local_chat(
                 tool_call_id: Some(tc.id.clone()),
             });
         }
-
-        // Continue loop — model will see tool results and decide next action
     }
 
     // Trim history

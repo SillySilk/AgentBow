@@ -1,7 +1,6 @@
-use crate::anthropic::{self, AgentEvent, AnthropicMessage, PageContext};
-use crate::auth;
 use crate::local_llm::{self, OaiMessage};
-use crate::router;
+use crate::types::{AgentEvent, PageContext};
+use crate::auth;
 use crate::state::AppState;
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
@@ -32,7 +31,6 @@ enum InboundMsg {
 pub async fn start(state: AppState) -> Result<()> {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], state.config.ws_port));
 
-    // Use SO_REUSEADDR so we can bind even if stale connections linger from a killed instance
     let socket = socket2::Socket::new(
         socket2::Domain::IPV4,
         socket2::Type::STREAM,
@@ -84,14 +82,11 @@ async fn handle_connection(
     let browser = crate::tools::browser::BrowserBridge::new(out_tx.clone());
 
     let mut authenticated = false;
-    let mut claude_history: Vec<AnthropicMessage> = Vec::new();
-    let mut local_history: Vec<OaiMessage> = Vec::new();
+    let mut history: Vec<OaiMessage> = Vec::new();
     let mut page_ctx: Option<PageContext> = None;
     let interrupt_flag = Arc::new(AtomicBool::new(false));
 
-    // Channels for history returned from background tasks
-    let (claude_hist_tx, mut claude_hist_rx) = mpsc::channel::<Vec<AnthropicMessage>>(4);
-    let (local_hist_tx, mut local_hist_rx) = mpsc::channel::<Vec<OaiMessage>>(4);
+    let (hist_tx, mut hist_rx) = mpsc::channel::<Vec<OaiMessage>>(4);
 
     loop {
         tokio::select! {
@@ -107,9 +102,6 @@ async fn handle_connection(
                     _ => continue,
                 };
 
-                // Parse to Value first so we can handle browser_result (which
-                // has spread fields rather than a nested object) before routing
-                // to the typed InboundMsg enum.
                 let raw: Value = match serde_json::from_str(&text) {
                     Ok(v) => v,
                     Err(e) => {
@@ -118,7 +110,6 @@ async fn handle_connection(
                     }
                 };
 
-                // Silently ignore keepalive pings from the extension
                 if raw["type"].as_str() == Some("ping") {
                     continue;
                 }
@@ -165,72 +156,39 @@ async fn handle_connection(
                         }
 
                         interrupt_flag.store(false, Ordering::Relaxed);
-
-                        let use_local = router::should_use_local(&content);
                         info!("Processing: {}...", &content[..content.len().min(60)]);
 
                         let config = config.clone();
                         let ctx_snapshot = page_ctx.clone();
                         let interrupt = interrupt_flag.clone();
                         let out = out_tx.clone();
+                        let hist_snapshot = history.clone();
+                        let htx = hist_tx.clone();
+                        let shell_session_clone = shell_session.clone();
+                        let browser_clone = browser.clone();
 
-                        if use_local {
-                            let hist_snapshot = local_history.clone();
-                            let htx = local_hist_tx.clone();
-                            let shell_session_local = shell_session.clone();
-                            let browser_local = browser.clone();
+                        tokio::spawn(async move {
+                            let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(128);
 
-                            tokio::spawn(async move {
-                                let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(128);
-
-                                let out_fwd = out.clone();
-                                let fwd = tokio::spawn(async move {
-                                    while let Some(evt) = event_rx.recv().await {
-                                        send_json(&out_fwd, agent_event_to_json(evt)).await;
-                                    }
-                                });
-
-                                let mut hist = hist_snapshot;
-                                if let Err(e) = local_llm::run_local_chat(
-                                    config, &mut hist, content, message_id,
-                                    ctx_snapshot, interrupt, event_tx, shell_session_local,
-                                    browser_local,
-                                ).await {
-                                    error!("local_llm: {}", e);
+                            let out_fwd = out.clone();
+                            let fwd = tokio::spawn(async move {
+                                while let Some(evt) = event_rx.recv().await {
+                                    send_json(&out_fwd, agent_event_to_json(evt)).await;
                                 }
-
-                                fwd.await.ok();
-                                let _ = htx.send(hist).await;
                             });
-                        } else {
-                            let hist_snapshot = claude_history.clone();
-                            let htx = claude_hist_tx.clone();
-                            let shell_session_clone = shell_session.clone();
-                            let browser_claude = browser.clone();
 
-                            tokio::spawn(async move {
-                                let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(128);
+                            let mut hist = hist_snapshot;
+                            if let Err(e) = local_llm::run_local_chat(
+                                config, &mut hist, content, message_id,
+                                ctx_snapshot, interrupt, event_tx, shell_session_clone,
+                                browser_clone,
+                            ).await {
+                                error!("local_llm: {}", e);
+                            }
 
-                                let out_fwd = out.clone();
-                                let fwd = tokio::spawn(async move {
-                                    while let Some(evt) = event_rx.recv().await {
-                                        send_json(&out_fwd, agent_event_to_json(evt)).await;
-                                    }
-                                });
-
-                                let mut hist = hist_snapshot;
-                                if let Err(e) = anthropic::run_chat(
-                                    config, &mut hist, content, message_id,
-                                    ctx_snapshot, interrupt, event_tx, shell_session_clone,
-                                    browser_claude,
-                                ).await {
-                                    error!("anthropic: {}", e);
-                                }
-
-                                fwd.await.ok();
-                                let _ = htx.send(hist).await;
-                            });
-                        }
+                            fwd.await.ok();
+                            let _ = htx.send(hist).await;
+                        });
                     }
 
                     InboundMsg::Interrupt { session_id: _ } => {
@@ -239,12 +197,8 @@ async fn handle_connection(
                 }
             }
 
-            Some(h) = claude_hist_rx.recv() => {
-                claude_history = h;
-            }
-
-            Some(h) = local_hist_rx.recv() => {
-                local_history = h;
+            Some(h) = hist_rx.recv() => {
+                history = h;
             }
         }
     }

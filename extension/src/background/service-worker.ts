@@ -318,6 +318,26 @@ async function handleBrowserCmd(msg: any) {
       });
       result = { result: results2?.[0]?.result ?? "no result" };
     }
+    else if (cmd === "scroll") {
+      const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!tabs[0]?.id) throw new Error("No active tab");
+      const results2 = await chrome.scripting.executeScript({
+        target: { tabId: tabs[0].id },
+        func: (target: string, pixels: number) => {
+          if (target === "top") { window.scrollTo(0, 0); return "Scrolled to top"; }
+          if (target === "bottom") { window.scrollTo(0, document.body.scrollHeight); return "Scrolled to bottom"; }
+          if (target === "up") { window.scrollBy(0, -pixels); return "Scrolled up " + pixels + "px"; }
+          if (target === "down") { window.scrollBy(0, pixels); return "Scrolled down " + pixels + "px"; }
+          // CSS selector — scroll element into view
+          const el = document.querySelector(target);
+          if (!el) return "ERROR: Element not found: " + target;
+          el.scrollIntoView({ behavior: "smooth", block: "center" });
+          return "Scrolled to: " + target;
+        },
+        args: [msg.target, msg.pixels || 500],
+      });
+      result = { result: results2?.[0]?.result ?? "no result" };
+    }
     else if (cmd === "get_url") {
       const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
       if (!tabs[0]) throw new Error("No active tab");

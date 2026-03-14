@@ -264,6 +264,16 @@ impl BrowserBridge {
         Ok(json!(result["result"]))
     }
 
+    /// Scroll the page: "up", "down", "top", "bottom", or a CSS selector.
+    pub async fn scroll(&self, target: &str, pixels: i64) -> Result<Value> {
+        let cmd = json!({
+            "type": "browser_cmd", "cmd": "scroll",
+            "target": target, "pixels": pixels
+        });
+        let result = self.send_and_wait(cmd).await?;
+        Ok(json!(result["result"]))
+    }
+
     /// Get the current tab's URL and title.
     pub async fn get_url(&self) -> Result<Value> {
         let cmd = json!({ "type": "browser_cmd", "cmd": "get_url" });
