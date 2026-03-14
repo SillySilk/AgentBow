@@ -227,6 +227,14 @@ pub async fn image_download(query: &str, count: usize, dest_dir: &str, log_dir: 
     }
     log.push(format!("Total candidates: {}", candidates.len()));
 
+    // Filter out known paid/auth-gated CDNs that always return 400/403
+    let before = candidates.len();
+    candidates.retain(|u| !is_paywalled_url(u));
+    let filtered = before - candidates.len();
+    if filtered > 0 {
+        log.push(format!("Filtered {} paid CDN URLs (Getty, iStock, Shutterstock, Alamy)", filtered));
+    }
+
     if candidates.is_empty() {
         log.push("FATAL: no candidates — all scrapers returned 0 URLs".to_string());
         let log_note = log.flush();
@@ -407,8 +415,10 @@ async fn scrape_duckduckgo_images(client: &reqwest::Client, query: &str, max: us
     );
     let resp = match client.get(&api_url)
         .header("Referer", "https://duckduckgo.com/")
-        .header("Accept", "application/json, */*; q=0.01")
-        .header("Cookie", "kp=-2; ay=b")
+        .header("Accept", "application/json, text/javascript, */*; q=0.01")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .header("X-Requested-With", "XMLHttpRequest")
+        .header("Cookie", "kp=-2; ay=b; p=-2")
         .send().await
     {
         Err(e) => return ScrapeResult::err("DDG", format!("api request: {}", e)),
@@ -478,8 +488,11 @@ async fn scrape_qwant_images(client: &reqwest::Client, query: &str, max: usize) 
         encoded
     );
     let result = client.get(&url)
-        .header("Accept", "application/json")
+        .header("Accept", "application/json, */*; q=0.8")
+        .header("Accept-Language", "en-US,en;q=0.9")
         .header("Referer", "https://www.qwant.com/")
+        .header("Origin", "https://www.qwant.com")
+        .header("DNT", "1")
         .send().await;
 
     match result {
@@ -523,9 +536,13 @@ async fn scrape_searxng_images(client: &reqwest::Client, query: &str, max: usize
             ScrapeResult::err("SearXNG", "rate-limited (429)".to_string()),
         Ok(r) if !r.status().is_success() =>
             ScrapeResult::err("SearXNG", format!("HTTP {}", r.status())),
-        Ok(r) => match r.json::<serde_json::Value>().await {
-            Err(e) => ScrapeResult::err("SearXNG", format!("json: {}", e)),
-            Ok(data) => {
+        Ok(r) => {
+            let text = match r.text().await {
+                Err(e) => return ScrapeResult::err("SearXNG", format!("read: {}", e)),
+                Ok(t) => t,
+            };
+            // Try JSON first (format=json supported)
+            if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
                 let mut urls = Vec::new();
                 if let Some(results) = data["results"].as_array() {
                     for r in results {
@@ -536,8 +553,13 @@ async fn scrape_searxng_images(client: &reqwest::Client, query: &str, max: usize
                         }
                     }
                 }
-                let raw = data.to_string();
-                ScrapeResult::ok("SearXNG", urls, &raw)
+                ScrapeResult::ok("SearXNG", urls, &text)
+            } else {
+                // Instance returned HTML — scrape img src attributes as fallback
+                let mut urls = Vec::new();
+                extract_between(&text, "data-src=\"http", "\"", max, &mut urls);
+                for u in urls.iter_mut() { if !u.starts_with("http") { *u = format!("http{}", u); } }
+                ScrapeResult::ok("SearXNG", urls, &text)
             }
         }
     }
@@ -650,6 +672,21 @@ fn extract_vqd(html: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Returns true for stock-photo CDNs that require auth and always 400/403.
+fn is_paywalled_url(url: &str) -> bool {
+    const BLOCKED: &[&str] = &[
+        "media.gettyimages.com",
+        "media.istockphoto.com",
+        "shutterstock.com/image",
+        "alamy.com/",
+        "stock.adobe.com",
+        "dreamstime.com/",
+        "depositphotos.com/",
+        "123rf.com/",
+    ];
+    BLOCKED.iter().any(|b| url.contains(b))
 }
 
 fn content_type_to_ext(ct: &str) -> Option<&'static str> {
