@@ -106,6 +106,11 @@ async fn handle_connection(
                     }
                 };
 
+                // Silently ignore keepalive pings from the extension
+                if raw["type"].as_str() == Some("ping") {
+                    continue;
+                }
+
                 if raw["type"].as_str() == Some("browser_result") {
                     if let Some(request_id) = raw["request_id"].as_str() {
                         let mut pending = browser.pending.lock().await;
