@@ -4,6 +4,7 @@ use serde_json::json;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+use tracing::{debug, info, warn};
 
 #[derive(Deserialize)]
 struct LmStudioResponse {
@@ -22,7 +23,6 @@ struct LmStudioMessage {
 }
 
 /// Send a local image file to LM Studio's vision model for analysis.
-/// Returns the model's description of the image.
 pub async fn image_verify(
     image_path: &str,
     prompt: &str,
@@ -34,12 +34,10 @@ pub async fn image_verify(
         return Err(anyhow::anyhow!("Image file not found: {}", image_path));
     }
 
-    // Read and base64-encode the image
     let image_bytes = std::fs::read(path)
         .map_err(|e| anyhow::anyhow!("Failed to read image '{}': {}", image_path, e))?;
     let b64 = base64_encode(&image_bytes);
 
-    // Detect mime type from extension
     let mime = match path.extension().and_then(|e| e.to_str()) {
         Some("png") => "image/png",
         Some("gif") => "image/gif",
@@ -85,7 +83,6 @@ pub async fn image_verify(
     let choice = data.choices.first()
         .ok_or_else(|| anyhow::anyhow!("LM Studio returned no choices"))?;
 
-    // Use content if present, fall back to reasoning_content
     let result = choice.message.content.as_deref().unwrap_or("");
     let reasoning = choice.message.reasoning_content.as_deref().unwrap_or("");
 
@@ -99,59 +96,112 @@ pub async fn image_verify(
 }
 
 /// Download images matching `query` into `dest_dir`, up to `count` files.
-/// Scrapes Bing Images for URLs, then downloads each one.
+/// Scrapes Bing, DuckDuckGo, Yandex, and Qwant with safe search disabled.
 pub async fn image_download(query: &str, count: usize, dest_dir: &str) -> Result<String> {
     std::fs::create_dir_all(dest_dir)
         .map_err(|e| anyhow::anyhow!("Failed to create dest_dir '{}': {}", dest_dir, e))?;
 
     let client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {}", e))?;
 
-    // Try all sources, merging unique URLs until we have enough candidates
-    let want = count * 3;
+    // Gather candidates from all sources sequentially, stopping when we have enough
+    let want = count * 4; // collect a large pool so failed downloads have fallbacks
     let mut candidates: Vec<String> = Vec::new();
+    let mut source_report: Vec<String> = Vec::new();
 
-    let sources: Vec<(&str, std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<String>>> + Send>>)> = vec![
-        ("Bing",    Box::pin(scrape_bing_images(&client, query, want))),
-        ("DDG",     Box::pin(scrape_duckduckgo_images(&client, query, want))),
-        ("Yandex",  Box::pin(scrape_yandex_images(&client, query, want))),
-        ("Qwant",   Box::pin(scrape_qwant_images(&client, query, want))),
-    ];
+    let sources: &[(&str, &dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<String>>> + Send>>)] = &[];
+    let _ = sources; // unused — we call directly below for lifetime simplicity
 
-    for (_name, fut) in sources {
-        if candidates.len() >= want { break; }
-        if let Ok(urls) = fut.await {
-            for u in urls {
-                if !candidates.contains(&u) { candidates.push(u); }
+    // Bing
+    match scrape_bing_images(&client, query, want).await {
+        Ok(urls) => {
+            info!("Bing: {} URLs", urls.len());
+            source_report.push(format!("Bing:{}", urls.len()));
+            for u in urls { if !candidates.contains(&u) { candidates.push(u); } }
+        }
+        Err(e) => {
+            warn!("Bing scrape failed: {}", e);
+            source_report.push("Bing:0".to_string());
+        }
+    }
+
+    if candidates.len() < want {
+        match scrape_duckduckgo_images(&client, query, want).await {
+            Ok(urls) => {
+                info!("DDG: {} URLs", urls.len());
+                source_report.push(format!("DDG:{}", urls.len()));
+                for u in urls { if !candidates.contains(&u) { candidates.push(u); } }
+            }
+            Err(e) => {
+                warn!("DDG scrape failed: {}", e);
+                source_report.push("DDG:0".to_string());
             }
         }
     }
 
+    if candidates.len() < want {
+        match scrape_yandex_images(&client, query, want).await {
+            Ok(urls) => {
+                info!("Yandex: {} URLs", urls.len());
+                source_report.push(format!("Yandex:{}", urls.len()));
+                for u in urls { if !candidates.contains(&u) { candidates.push(u); } }
+            }
+            Err(e) => {
+                warn!("Yandex scrape failed: {}", e);
+                source_report.push("Yandex:0".to_string());
+            }
+        }
+    }
+
+    if candidates.len() < want {
+        match scrape_qwant_images(&client, query, want).await {
+            Ok(urls) => {
+                info!("Qwant: {} URLs", urls.len());
+                source_report.push(format!("Qwant:{}", urls.len()));
+                for u in urls { if !candidates.contains(&u) { candidates.push(u); } }
+            }
+            Err(e) => {
+                warn!("Qwant scrape failed: {}", e);
+                source_report.push("Qwant:0".to_string());
+            }
+        }
+    }
+
+    info!("Total candidates: {} ({})", candidates.len(), source_report.join(", "));
+
     if candidates.is_empty() {
-        return Err(anyhow::anyhow!("No images found for '{}' from any source", query));
+        return Err(anyhow::anyhow!(
+            "No images found for '{}'. Sources: {}",
+            query,
+            source_report.join(", ")
+        ));
     }
 
     let sanitized = sanitize_filename(query);
     let dest_base = dest_dir.trim_end_matches('\\').to_string();
 
-    // Download up to `count` images concurrently (8 at a time)
+    // Download concurrently (8 at a time), trying all candidates until we reach count
     let sem = Arc::new(Semaphore::new(8));
     let client = Arc::new(client);
     let mut tasks = tokio::task::JoinSet::new();
 
-    for (i, url) in candidates.iter().enumerate().take(count * 2) {
-        let ext = url_to_ext(url);
-        let filename = format!("{}_{:03}.{}", sanitized, i + 1, ext);
-        let path = format!("{}\\{}", dest_base, filename);
+    for (i, url) in candidates.iter().enumerate() {
         let url = url.clone();
         let client = client.clone();
         let sem = sem.clone();
+        let sanitized = sanitized.clone();
+        let dest_base = dest_base.clone();
+        let idx = i;
         tasks.spawn(async move {
             let _permit = sem.acquire().await.ok()?;
-            download_image_url(&client, &url, &path).await.ok()?;
+            let (bytes, ext) = download_image_bytes(&client, &url).await.ok()?;
+            let filename = format!("{}_{:03}.{}", sanitized, idx + 1, ext);
+            let path = format!("{}\\{}", dest_base, filename);
+            std::fs::write(&path, &bytes).ok()?;
+            debug!("Saved: {}", path);
             Some(path)
         });
     }
@@ -169,51 +219,53 @@ pub async fn image_download(query: &str, count: usize, dest_dir: &str) -> Result
     downloaded.sort();
 
     if downloaded.is_empty() {
-        return Err(anyhow::anyhow!("All downloads failed for '{}'", query));
+        return Err(anyhow::anyhow!(
+            "All downloads failed for '{}'. Had {} candidate URLs. Sources: {}",
+            query,
+            candidates.len(),
+            source_report.join(", ")
+        ));
     }
 
-    let files_list = downloaded.join("\n");
     Ok(format!(
-        "Downloaded {}/{} images to {}\nFiles:\n{}",
+        "Downloaded {}/{} images to {}\nSources: {}\nFiles:\n{}",
         downloaded.len(),
         count,
         dest_dir,
-        files_list
+        source_report.join(", "),
+        downloaded.join("\n")
     ))
 }
 
-async fn scrape_bing_images(
-    client: &reqwest::Client,
-    query: &str,
-    max: usize,
-) -> Result<Vec<String>> {
-    let encoded = query.replace(' ', "+");
+// ── Scrapers ──────────────────────────────────────────────────────────────────
+
+async fn scrape_bing_images(client: &reqwest::Client, query: &str, max: usize) -> Result<Vec<String>> {
+    let encoded = urlencoded(query);
+    // adlt=off in BOTH the URL param and cookie to maximally disable safe search
     let url = format!(
-        "https://www.bing.com/images/search?q={}&count=50&first=1&safeSearch=Off",
+        "https://www.bing.com/images/search?q={}&count=50&first=1&safeSearch=Off&adlt=off",
         encoded
     );
 
     let resp = client
         .get(&url)
-        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-        .header("Accept-Language", "en-US,en;q=0.5")
-        .header("Cookie", "SRCHHPGUSR=ADLT=OFF; adlt=off")
+        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .header("Referer", "https://www.bing.com/")
+        // SRCHHPGUSR cookie with ADLT=OFF disables adult content filtering
+        // SUID+MSCC suppress consent/region redirects
+        .header("Cookie", "SRCHHPGUSR=ADLT=OFF; adlt=off; SUID=M; MSCC=NR; _EDGE_S=ui=en-us; _EDGE_V=1")
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("Bing Images request failed: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Bing request failed: {}", e))?;
 
-    let html = resp
-        .text()
-        .await
+    let html = resp.text().await
         .map_err(|e| anyhow::anyhow!("Failed to read Bing response: {}", e))?;
 
     let mut urls: Vec<String> = Vec::new();
-
-    // Bing encodes image metadata in data-m attributes with HTML-entity quotes:
-    // data-m="{&quot;murl&quot;:&quot;https://...&quot;,...}"
+    // Bing encodes image URLs as HTML entities in data-m attributes
     extract_between(&html, "&quot;murl&quot;:&quot;", "&quot;", max, &mut urls);
-
-    // Fallback: plain JSON inside <script> blocks
+    // Fallback: plain JSON inside script blocks
     if urls.is_empty() {
         extract_between(&html, "\"murl\":\"", "\"", max, &mut urls);
     }
@@ -221,72 +273,48 @@ async fn scrape_bing_images(
     Ok(urls)
 }
 
-/// Extract substrings between `needle` and `end_marker` from `haystack`.
-fn extract_between(haystack: &str, needle: &str, end_marker: &str, max: usize, out: &mut Vec<String>) {
-    let mut pos = 0;
-    while out.len() < max {
-        match haystack[pos..].find(needle) {
-            None => break,
-            Some(rel) => {
-                let start = pos + rel + needle.len();
-                match haystack[start..].find(end_marker) {
-                    None => break,
-                    Some(end_rel) => {
-                        let candidate = &haystack[start..start + end_rel];
-                        if candidate.starts_with("http") && !candidate.contains(' ') {
-                            out.push(candidate.to_string());
-                        }
-                        pos = start + end_rel + end_marker.len();
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Scrape DuckDuckGo Images (unofficial i.js API — no API key needed).
-async fn scrape_duckduckgo_images(
-    client: &reqwest::Client,
-    query: &str,
-    max: usize,
-) -> Result<Vec<String>> {
-    // Step 1: get VQD token from the search page
-    let encoded = query.replace(' ', "+");
-    // kp=-2 disables safe search
+async fn scrape_duckduckgo_images(client: &reqwest::Client, query: &str, max: usize) -> Result<Vec<String>> {
+    let encoded = urlencoded(query);
+    // kp=-2 disables safe search on DDG
     let page_url = format!("https://duckduckgo.com/?q={}&iax=images&ia=images&kp=-2", encoded);
+
     let html = client
         .get(&page_url)
         .header("Accept-Language", "en-US,en;q=0.9")
-        .header("Cookie", "p=-2")
-        .send().await?.text().await?;
+        // kp=-2 cookie is the correct cookie name for DDG safe search preference
+        .header("Cookie", "kp=-2; ay=b")
+        .send().await
+        .map_err(|e| anyhow::anyhow!("DDG page request failed: {}", e))?
+        .text().await
+        .map_err(|e| anyhow::anyhow!("DDG page read failed: {}", e))?;
 
-    // VQD looks like: vqd=4-XXXXXXXXXX or vqd=4-XXXX-XXXX
-    let vqd = html
-        .find("vqd=")
-        .and_then(|pos| {
-            let rest = &html[pos + 4..];
-            let end = rest.find(|c: char| c == '&' || c == '"' || c == '\'').unwrap_or(rest.len().min(64));
-            Some(rest[..end].trim_matches('\'').trim_matches('"').to_string())
-        })
-        .ok_or_else(|| anyhow::anyhow!("DDG: vqd token not found"))?;
+    // Extract VQD token — try both single and double quoted forms
+    let vqd = extract_vqd(&html)
+        .ok_or_else(|| anyhow::anyhow!("DDG: vqd token not found in page"))?;
 
-    // Step 2: fetch image JSON
-    // p=-2 = safe search off
+    debug!("DDG vqd: {}", vqd);
+
+    // i.js API — p=-2 is the API param for safe search off
     let api_url = format!(
         "https://duckduckgo.com/i.js?q={}&vqd={}&o=json&l=us-en&s=0&f=,,,,,&p=-2",
         encoded, vqd
     );
+
     let resp = client
         .get(&api_url)
         .header("Referer", "https://duckduckgo.com/")
         .header("Accept", "application/json, text/javascript, */*; q=0.01")
-        .send().await?;
+        .header("Cookie", "kp=-2; ay=b")
+        .send().await
+        .map_err(|e| anyhow::anyhow!("DDG i.js request failed: {}", e))?;
 
     if !resp.status().is_success() {
         return Ok(vec![]);
     }
 
-    let data: serde_json::Value = resp.json().await?;
+    let data: serde_json::Value = resp.json().await
+        .map_err(|e| anyhow::anyhow!("DDG JSON parse failed: {}", e))?;
+
     let mut urls = Vec::new();
     if let Some(results) = data["results"].as_array() {
         for r in results {
@@ -301,29 +329,30 @@ async fn scrape_duckduckgo_images(
     Ok(urls)
 }
 
-/// Scrape Yandex Images — great coverage for people/faces, especially non-English subjects.
-async fn scrape_yandex_images(
-    client: &reqwest::Client,
-    query: &str,
-    max: usize,
-) -> Result<Vec<String>> {
-    let encoded = query.replace(' ', "+");
+async fn scrape_yandex_images(client: &reqwest::Client, query: &str, max: usize) -> Result<Vec<String>> {
+    let encoded = urlencoded(query);
     // filter=0 disables safe search; numdoc=50 requests more results
     let url = format!(
-        "https://yandex.com/images/search?text={}&nomisspell=1&numdoc=50&filter=0",
+        "https://yandex.com/images/search?text={}&nomisspell=1&numdoc=50&filter=0&itype=photo",
         encoded
     );
 
     let html = client
         .get(&url)
-        .header("Accept-Language", "en-US,en;q=0.9")
-        .header("Cookie", "safesearch=0; yp=1999999999.sp.ssp%3D0")
-        .send().await?.text().await?;
+        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+        .header("Accept-Language", "en-US,en;q=0.5")
+        .header("Referer", "https://yandex.com/")
+        // safesearch=0 disables filtering; yp cookie value encodes safe search preference
+        .header("Cookie", "safesearch=0; yp=1999999999.sp.ssp%3D0; _yasc=off")
+        .send().await
+        .map_err(|e| anyhow::anyhow!("Yandex request failed: {}", e))?
+        .text().await
+        .map_err(|e| anyhow::anyhow!("Failed to read Yandex response: {}", e))?;
 
     let mut urls = Vec::new();
-    // Yandex embeds original image URLs as "img_href":"https://..."
+    // Primary: Yandex embeds original image URLs as "img_href":"https://..."
     extract_between(&html, "\"img_href\":\"", "\"", max, &mut urls);
-    // Fallback: "url":"https://..." pattern in JSON blobs
+    // Secondary: "url":"https://..." pattern in JSON blobs
     if urls.is_empty() {
         extract_between(&html, "\"url\":\"https://", "\"", max, &mut urls);
         for u in urls.iter_mut() {
@@ -333,14 +362,9 @@ async fn scrape_yandex_images(
     Ok(urls)
 }
 
-/// Scrape Qwant Images — returns clean JSON, no API key needed.
-async fn scrape_qwant_images(
-    client: &reqwest::Client,
-    query: &str,
-    max: usize,
-) -> Result<Vec<String>> {
-    let encoded = query.replace(' ', "%20");
-    // safesearch=0 disables filtering
+async fn scrape_qwant_images(client: &reqwest::Client, query: &str, max: usize) -> Result<Vec<String>> {
+    let encoded = urlencoded(query);
+    // safesearch=0 disables filtering; tgp=2 = general (not kids)
     let url = format!(
         "https://api.qwant.com/v3/search/images?q={}&count=50&offset=0&safesearch=0&locale=en_US&tgp=2",
         encoded
@@ -350,19 +374,20 @@ async fn scrape_qwant_images(
         .get(&url)
         .header("Accept", "application/json")
         .header("Referer", "https://www.qwant.com/")
-        .send().await?;
+        .send().await
+        .map_err(|e| anyhow::anyhow!("Qwant request failed: {}", e))?;
 
     if !resp.status().is_success() {
         return Ok(vec![]);
     }
 
-    let data: serde_json::Value = resp.json().await?;
-    let mut urls = Vec::new();
+    let data: serde_json::Value = resp.json().await
+        .map_err(|e| anyhow::anyhow!("Qwant JSON parse failed: {}", e))?;
 
+    let mut urls = Vec::new();
     if let Some(items) = data["data"]["result"]["items"].as_array() {
         for item in items {
             if urls.len() >= max { break; }
-            // "media" is the full-size image URL
             if let Some(url) = item["media"].as_str() {
                 if url.starts_with("http") {
                     urls.push(url.to_string());
@@ -373,51 +398,132 @@ async fn scrape_qwant_images(
     Ok(urls)
 }
 
-async fn download_image_url(
-    client: &reqwest::Client,
-    url: &str,
-    path: &str,
-) -> Result<()> {
+// ── Download ──────────────────────────────────────────────────────────────────
+
+/// Download an image URL, returning (bytes, extension).
+/// Uses Content-Type header for extension; validates magic bytes.
+async fn download_image_bytes(client: &reqwest::Client, url: &str) -> Result<(Vec<u8>, &'static str)> {
     let resp = client
         .get(url)
-        .header("Referer", "https://www.bing.com/")
+        .header("Referer", "https://www.google.com/")
+        .header("Accept", "image/webp,image/apng,image/*,*/*;q=0.8")
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("Image download request failed: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Request failed: {}", e))?;
 
     if !resp.status().is_success() {
-        return Err(anyhow::anyhow!("HTTP {} for {}", resp.status(), url));
+        return Err(anyhow::anyhow!("HTTP {}", resp.status()));
     }
 
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to read image bytes: {}", e))?;
+    // Determine extension from Content-Type before consuming body
+    let ct_ext = resp.headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|ct| content_type_to_ext(ct));
 
-    if bytes.len() < 1000 {
-        return Err(anyhow::anyhow!(
-            "Response too small ({} bytes), likely not a real image",
-            bytes.len()
-        ));
-    }
+    let bytes = resp.bytes().await
+        .map_err(|e| anyhow::anyhow!("Failed to read bytes: {}", e))?
+        .to_vec();
 
-    std::fs::write(path, &bytes)
-        .map_err(|e| anyhow::anyhow!("Failed to write image to '{}': {}", path, e))?;
+    // Validate magic bytes to confirm it's a real image
+    let ext = validate_image_bytes(&bytes, ct_ext, url)?;
 
-    Ok(())
+    Ok((bytes, ext))
 }
 
-fn url_to_ext(url: &str) -> &'static str {
-    let lower = url.to_lowercase();
-    if lower.contains(".png") {
-        "png"
-    } else if lower.contains(".webp") {
-        "webp"
-    } else if lower.contains(".gif") {
-        "gif"
-    } else {
-        "jpg"
+/// Check magic bytes and return the correct extension, or error if not a real image.
+fn validate_image_bytes(bytes: &[u8], ct_ext: Option<&'static str>, url: &str) -> Result<&'static str> {
+    if bytes.len() < 512 {
+        return Err(anyhow::anyhow!("Too small ({} bytes): {}", bytes.len(), url));
     }
+
+    // Check magic bytes
+    let ext = if bytes.starts_with(b"\xFF\xD8\xFF") {
+        "jpg"
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "png"
+    } else if bytes.starts_with(b"GIF8") {
+        "gif"
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        "webp"
+    } else {
+        // If magic bytes don't match a known format, reject (catches HTML error pages, etc.)
+        return Err(anyhow::anyhow!(
+            "Not a recognised image (magic: {:02X?}): {}",
+            &bytes[..bytes.len().min(4)],
+            url
+        ));
+    };
+
+    // Prefer Content-Type ext if it agrees; otherwise trust magic bytes
+    let _ = ct_ext;
+    Ok(ext)
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Percent-encode a query string for use in URLs (spaces → %20, etc.)
+fn urlencoded(s: &str) -> String {
+    s.chars()
+        .flat_map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
+                vec![c]
+            } else if c == ' ' {
+                vec!['%', '2', '0']
+            } else {
+                let b = c as u32;
+                format!("%{:02X}", b).chars().collect()
+            }
+        })
+        .collect()
+}
+
+/// Extract substrings between `needle` and `end_marker`.
+fn extract_between(haystack: &str, needle: &str, end_marker: &str, max: usize, out: &mut Vec<String>) {
+    let mut pos = 0;
+    while out.len() < max {
+        match haystack[pos..].find(needle) {
+            None => break,
+            Some(rel) => {
+                let start = pos + rel + needle.len();
+                match haystack[start..].find(end_marker) {
+                    None => break,
+                    Some(end_rel) => {
+                        let candidate = &haystack[start..start + end_rel];
+                        if candidate.starts_with("http") && !candidate.contains(' ') && candidate.len() > 12 {
+                            out.push(candidate.to_string());
+                        }
+                        pos = start + end_rel + end_marker.len();
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Extract DuckDuckGo VQD token from page HTML.
+fn extract_vqd(html: &str) -> Option<String> {
+    // Try both quoted and unquoted forms: vqd='...' vqd="..." vqd=...&
+    for needle in &["vqd='", "vqd=\"", "vqd="] {
+        if let Some(pos) = html.find(needle) {
+            let rest = &html[pos + needle.len()..];
+            let end = rest.find(|c: char| c == '\'' || c == '"' || c == '&' || c == ' ' || c == '\n')
+                .unwrap_or_else(|| rest.len().min(80));
+            let token = rest[..end].trim_matches(|c| c == '\'' || c == '"').to_string();
+            if !token.is_empty() && token.len() > 3 {
+                return Some(token);
+            }
+        }
+    }
+    None
+}
+
+fn content_type_to_ext(ct: &str) -> Option<&'static str> {
+    if ct.contains("jpeg") || ct.contains("jpg") { Some("jpg") }
+    else if ct.contains("png") { Some("png") }
+    else if ct.contains("gif") { Some("gif") }
+    else if ct.contains("webp") { Some("webp") }
+    else { None }
 }
 
 fn sanitize_filename(name: &str) -> String {
