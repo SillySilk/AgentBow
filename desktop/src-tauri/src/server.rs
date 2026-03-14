@@ -31,7 +31,19 @@ enum InboundMsg {
 
 pub async fn start(state: AppState) -> Result<()> {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], state.config.ws_port));
-    let listener = TcpListener::bind(&addr).await?;
+
+    // Use SO_REUSEADDR so we can bind even if stale connections linger from a killed instance
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(128)?;
+    socket.set_nonblocking(true)?;
+    let std_listener: std::net::TcpListener = socket.into();
+    let listener = TcpListener::from_std(std_listener)?;
     info!("WebSocket server listening on ws://{}", addr);
 
     let config = Arc::new(state.config);
@@ -155,22 +167,7 @@ async fn handle_connection(
                         interrupt_flag.store(false, Ordering::Relaxed);
 
                         let use_local = router::should_use_local(&content);
-                        let backend = if use_local { "local" } else { "claude" };
-                        info!("Routing to {} for: {}...", backend, &content[..content.len().min(60)]);
-
-                        // Notify user which backend is handling their request
-                        let routing_msg = if use_local {
-                            "[Using local AI for this task]\n\n"
-                        } else {
-                            ""
-                        };
-                        if !routing_msg.is_empty() {
-                            send_json(&out_tx, json!({
-                                "type": "text_delta",
-                                "delta": routing_msg,
-                                "message_id": message_id
-                            })).await;
-                        }
+                        info!("Processing: {}...", &content[..content.len().min(60)]);
 
                         let config = config.clone();
                         let ctx_snapshot = page_ctx.clone();

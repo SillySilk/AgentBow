@@ -5,7 +5,7 @@ use std::io::Write as IoWrite;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 // ── LM Studio types ───────────────────────────────────────────────────────────
 
@@ -38,8 +38,9 @@ struct ScrapeResult {
 impl ScrapeResult {
     fn ok(source: &'static str, urls: Vec<String>, raw: &str) -> Self {
         let hint = if urls.is_empty() {
-            // Grab first 600 chars of raw response as a scraping-failure hint
-            Some(raw.chars().take(600).collect::<String>().replace('\n', " "))
+            // Skip HTML <head> (first ~800 chars) and grab body content for useful debugging
+            let snippet: String = raw.chars().skip(800).take(1200).collect();
+            Some(snippet.replace('\n', " "))
         } else {
             None
         };
@@ -53,7 +54,7 @@ impl ScrapeResult {
             format!("  {:8} ERROR: {}", self.source, e)
         } else if self.urls.is_empty() {
             let hint = self.debug_hint.as_deref().unwrap_or("(no response)");
-            format!("  {:8} 0 URLs — hint: {:.120}", self.source, hint)
+            format!("  {:8} 0 URLs — hint: {:.500}", self.source, hint)
         } else {
             format!("  {:8} {} URLs", self.source, self.urls.len())
         }
@@ -198,6 +199,7 @@ pub async fn image_download(query: &str, count: usize, dest_dir: &str, log_dir: 
     log.push(format!("dest_dir: {}", dest_dir));
 
     let client = reqwest::Client::builder()
+        .cookie_store(true)  // DDG requires session cookies from page request to carry into i.js API
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                      (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
         .timeout(std::time::Duration::from_secs(30))
@@ -215,6 +217,7 @@ pub async fn image_download(query: &str, count: usize, dest_dir: &str, log_dir: 
         scrape_bing_images(&client, query, want).await,
         scrape_duckduckgo_images(&client, query, want).await,
         scrape_yandex_images(&client, query, want).await,
+        scrape_brave_images(&client, query, want).await,
         scrape_qwant_images(&client, query, want).await,
         scrape_searxng_images(&client, query, want).await,
     ];
@@ -253,6 +256,11 @@ pub async fn image_download(query: &str, count: usize, dest_dir: &str, log_dir: 
     let sem = Arc::new(Semaphore::new(3));
     let client = Arc::new(client);
     let mut tasks = tokio::task::JoinSet::new();
+
+    // Decode HTML entities in URLs (Bing embeds &amp; instead of & in some URLs)
+    let candidates: Vec<String> = candidates.into_iter()
+        .map(|u| u.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\""))
+        .collect();
 
     for (i, url) in candidates.iter().enumerate() {
         let url = url.clone();
@@ -343,14 +351,14 @@ pub async fn image_download(query: &str, count: usize, dest_dir: &str, log_dir: 
 async fn scrape_bing_images(client: &reqwest::Client, query: &str, max: usize) -> ScrapeResult {
     let encoded = urlencoded(query);
     let url = format!(
-        "https://www.bing.com/images/search?q={}&count=50&first=1&safeSearch=Off&adlt=off",
+        "https://www.bing.com/images/search?q={}&count=50&first=1&safeSearch=Off&adlt=off&mkt=en-US",
         encoded
     );
     let result = client.get(&url)
         .header("Accept", "text/html,application/xhtml+xml,*/*;q=0.8")
         .header("Accept-Language", "en-US,en;q=0.9")
         .header("Referer", "https://www.bing.com/")
-        .header("Cookie", "SRCHHPGUSR=ADLT=OFF; adlt=off; SUID=M; MSCC=NR; _EDGE_S=ui=en-us")
+        .header("Cookie", "SRCHHPGUSR=SRCHLANG=en&ADLT=OFF&NNT=10&NRSLT=50; adlt=off; SUID=M; MSCC=NR; _EDGE_S=ui=en-us")
         .send().await;
 
     match result {
@@ -383,11 +391,22 @@ async fn scrape_bing_images(client: &reqwest::Client, query: &str, max: usize) -
 
 async fn scrape_duckduckgo_images(client: &reqwest::Client, query: &str, max: usize) -> ScrapeResult {
     let encoded = urlencoded(query);
+
+    // Step 1: Pre-seed safe search OFF in cookie store by visiting DDG with kp=-2
+    // This causes DDG to set the safe search preference cookie in our cookie jar
+    let _ = client.get("https://duckduckgo.com/?kp=-2")
+        .header("Accept", "text/html,*/*;q=0.8")
+        .send().await;
+
+    // Step 2: Now do the actual image search — cookies carry the safe search pref
     let page_url = format!("https://duckduckgo.com/?q={}&iax=images&ia=images&kp=-2", encoded);
 
     let html = match client.get(&page_url)
+        .header("Accept", "text/html,application/xhtml+xml,*/*;q=0.8")
         .header("Accept-Language", "en-US,en;q=0.9")
-        .header("Cookie", "kp=-2; ay=b")
+        .header("Sec-Fetch-Dest", "document")
+        .header("Sec-Fetch-Mode", "navigate")
+        .header("Sec-Fetch-Site", "none")
         .send().await
     {
         Err(e) => return ScrapeResult::err("DDG", format!("page request: {}", e)),
@@ -413,12 +432,15 @@ async fn scrape_duckduckgo_images(client: &reqwest::Client, query: &str, max: us
         "https://duckduckgo.com/i.js?q={}&vqd={}&o=json&l=us-en&s=0&f=,,,,,&p=-2",
         encoded, vqd
     );
+    info!("DDG vqd={}", vqd);
     let resp = match client.get(&api_url)
-        .header("Referer", "https://duckduckgo.com/")
+        .header("Referer", &page_url)
         .header("Accept", "application/json, text/javascript, */*; q=0.01")
         .header("Accept-Language", "en-US,en;q=0.9")
         .header("X-Requested-With", "XMLHttpRequest")
-        .header("Cookie", "kp=-2; ay=b; p=-2")
+        .header("Sec-Fetch-Dest", "empty")
+        .header("Sec-Fetch-Mode", "cors")
+        .header("Sec-Fetch-Site", "same-origin")
         .send().await
     {
         Err(e) => return ScrapeResult::err("DDG", format!("api request: {}", e)),
@@ -468,13 +490,42 @@ async fn scrape_yandex_images(client: &reqwest::Client, query: &str, max: usize)
             Err(e) => ScrapeResult::err("Yandex", format!("read: {}", e)),
             Ok(html) => {
                 let mut urls = Vec::new();
+
+                // JS layout: img_href in data-bem JSON
                 extract_between(&html, "\"img_href\":\"", "\"", max, &mut urls);
+
+                // No-JS layout: extract img_url= from result link hrefs
+                // These contain URL-encoded original image URLs like:
+                //   href="/images/search?...&img_url=https%3A%2F%2Fexample.com%2Fimage.jpg&..."
                 if urls.is_empty() {
-                    extract_between(&html, "\"url\":\"https://", "\"", max, &mut urls);
-                    for u in urls.iter_mut() {
-                        if !u.starts_with("http") { *u = format!("https://{}", u); }
+                    let mut encoded_urls = Vec::new();
+                    extract_between(&html, "img_url=http", "&", max, &mut encoded_urls);
+                    for u in &encoded_urls {
+                        let full = format!("http{}", u);
+                        let decoded = urldecode(&full);
+                        if decoded.len() > 12 { urls.push(decoded); }
                     }
                 }
+
+                // Thumbnails on avatars.mds.yandex.net
+                if urls.is_empty() {
+                    let mut thumb_urls = Vec::new();
+                    extract_between(&html, "src=\"//avatars.mds.yandex.net/", "\"", max, &mut thumb_urls);
+                    for u in &thumb_urls {
+                        urls.push(format!("https://avatars.mds.yandex.net/{}", u));
+                    }
+                }
+                // im0-tub style thumbs
+                if urls.is_empty() {
+                    let mut thumb_urls = Vec::new();
+                    extract_between(&html, "src=\"//im", "\"", max, &mut thumb_urls);
+                    for u in &thumb_urls {
+                        if u.contains(".yandex.net/") || u.contains(".yandex.ru/") {
+                            urls.push(format!("https://im{}", u));
+                        }
+                    }
+                }
+
                 ScrapeResult::ok("Yandex", urls, &html)
             }
         }
@@ -488,11 +539,15 @@ async fn scrape_qwant_images(client: &reqwest::Client, query: &str, max: usize) 
         encoded
     );
     let result = client.get(&url)
-        .header("Accept", "application/json, */*; q=0.8")
+        .header("Accept", "application/json, text/javascript, */*; q=0.01")
         .header("Accept-Language", "en-US,en;q=0.9")
         .header("Referer", "https://www.qwant.com/")
         .header("Origin", "https://www.qwant.com")
         .header("DNT", "1")
+        .header("Sec-Fetch-Dest", "empty")
+        .header("Sec-Fetch-Mode", "cors")
+        .header("Sec-Fetch-Site", "same-origin")
+        .header("X-Requested-With", "XMLHttpRequest")
         .send().await;
 
     match result {
@@ -565,6 +620,44 @@ async fn scrape_searxng_images(client: &reqwest::Client, query: &str, max: usize
     }
 }
 
+async fn scrape_brave_images(client: &reqwest::Client, query: &str, max: usize) -> ScrapeResult {
+    let encoded = urlencoded(query);
+    let url = format!(
+        "https://search.brave.com/images?q={}&safesearch=off&source=web",
+        encoded
+    );
+    let result = client.get(&url)
+        .header("Accept", "text/html,application/xhtml+xml,*/*;q=0.8")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .header("Cookie", "safesearch=off")
+        .send().await;
+
+    match result {
+        Err(e) => ScrapeResult::err("Brave", e.to_string()),
+        Ok(r) if !r.status().is_success() =>
+            ScrapeResult::err("Brave", format!("HTTP {}", r.status())),
+        Ok(r) => match r.text().await {
+            Err(e) => ScrapeResult::err("Brave", format!("read: {}", e)),
+            Ok(html) => {
+                let mut urls = Vec::new();
+                // Brave proxies all images via imgs.search.brave.com
+                // Extract from href="..." and src="..." — use href=" as needle
+                // so the candidate starts with "https://" (passes extract_between filter)
+                let mut all_hrefs = Vec::new();
+                extract_between(&html, "href=\"", "\"", max * 3, &mut all_hrefs);
+                extract_between(&html, "src=\"", "\"", max * 3, &mut all_hrefs);
+                for u in &all_hrefs {
+                    if u.contains("imgs.search.brave.com/") && !urls.contains(u) {
+                        urls.push(u.clone());
+                    }
+                    if urls.len() >= max { break; }
+                }
+                ScrapeResult::ok("Brave", urls, &html)
+            }
+        }
+    }
+}
+
 // ── Download ──────────────────────────────────────────────────────────────────
 
 const MAX_IMAGE_BYTES: usize = 6 * 1024 * 1024; // 6 MB
@@ -574,8 +667,17 @@ const MAX_IMAGE_BYTES: usize = 6 * 1024 * 1024; // 6 MB
 async fn download_image_bytes(client: &reqwest::Client, url: &str) -> Result<(Vec<u8>, &'static str)> {
     use futures_util::StreamExt;
 
+    // Use a domain-appropriate Referer — Reddit images 403 without reddit.com as referer
+    let referer = if url.contains("redd.it") || url.contains("reddit.com") {
+        "https://www.reddit.com/"
+    } else if url.contains("bing.") || url.contains("bing.net") {
+        "https://www.bing.com/"
+    } else {
+        "https://www.google.com/"
+    };
+
     let resp = client.get(url)
-        .header("Referer", "https://www.google.com/")
+        .header("Referer", referer)
         .header("Accept", "image/jpeg,image/png,image/gif,image/*;q=0.8")
         .send().await
         .map_err(|e| anyhow::anyhow!("request: {}", e))?;
@@ -626,6 +728,30 @@ fn validate_image_bytes(bytes: &[u8], _ct_ext: Option<&'static str>, url: &str) 
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn urldecode(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let hex: String = chars.by_ref().take(2).collect();
+            if hex.len() == 2 {
+                if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                    result.push(byte as char);
+                } else {
+                    result.push('%');
+                    result.push_str(&hex);
+                }
+            } else {
+                result.push('%');
+                result.push_str(&hex);
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
 
 fn urlencoded(s: &str) -> String {
     s.chars().flat_map(|c| {

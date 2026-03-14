@@ -144,4 +144,134 @@ impl BrowserBridge {
         let final_url = result["url"].as_str().unwrap_or(url).to_string();
         Ok(json!(format!("Navigated to {}", final_url)))
     }
+
+    /// List all open browser tabs across all windows.
+    pub async fn tab_list(&self) -> Result<Value> {
+        let cmd = json!({ "type": "browser_cmd", "cmd": "tab_list" });
+        let result = self.send_and_wait(cmd).await?;
+        Ok(result["tabs"].clone())
+    }
+
+    /// Create a new browser tab, optionally navigating to a URL.
+    pub async fn tab_new(&self, url: Option<&str>, active: bool) -> Result<Value> {
+        let cmd = json!({
+            "type": "browser_cmd", "cmd": "tab_new",
+            "url": url.unwrap_or("about:blank"),
+            "active": active,
+        });
+        let result = self.send_and_wait(cmd).await?;
+        Ok(json!({
+            "id": result["id"],
+            "url": result["url"],
+            "title": result["title"]
+        }))
+    }
+
+    /// Close one or more browser tabs by their IDs.
+    pub async fn tab_close(&self, tab_ids: Vec<i64>) -> Result<Value> {
+        let cmd = json!({ "type": "browser_cmd", "cmd": "tab_close", "tab_ids": tab_ids });
+        let result = self.send_and_wait(cmd).await?;
+        Ok(json!(format!("Closed tabs: {:?}", result["closed"])))
+    }
+
+    /// Switch to a tab by its ID.
+    pub async fn tab_switch(&self, tab_id: i64, window_id: Option<i64>) -> Result<Value> {
+        let mut cmd = json!({ "type": "browser_cmd", "cmd": "tab_switch", "tab_id": tab_id });
+        if let Some(wid) = window_id {
+            cmd["window_id"] = json!(wid);
+        }
+        let result = self.send_and_wait(cmd).await?;
+        Ok(json!({
+            "id": result["id"],
+            "url": result["url"],
+            "title": result["title"]
+        }))
+    }
+
+    /// Navigate back in the active tab's history.
+    pub async fn back(&self) -> Result<Value> {
+        let cmd = json!({ "type": "browser_cmd", "cmd": "back" });
+        let result = self.send_and_wait(cmd).await?;
+        Ok(json!({ "url": result["url"], "title": result["title"] }))
+    }
+
+    /// Navigate forward in the active tab's history.
+    pub async fn forward(&self) -> Result<Value> {
+        let cmd = json!({ "type": "browser_cmd", "cmd": "forward" });
+        let result = self.send_and_wait(cmd).await?;
+        Ok(json!({ "url": result["url"], "title": result["title"] }))
+    }
+
+    /// Reload the active tab, optionally bypassing cache.
+    pub async fn reload(&self, bypass_cache: bool) -> Result<Value> {
+        let cmd = json!({ "type": "browser_cmd", "cmd": "reload", "bypass_cache": bypass_cache });
+        let result = self.send_and_wait(cmd).await?;
+        Ok(json!({ "url": result["url"], "title": result["title"] }))
+    }
+
+    /// Get cookies for a URL.
+    pub async fn get_cookies(&self, url: &str) -> Result<Value> {
+        let cmd = json!({ "type": "browser_cmd", "cmd": "get_cookies", "url": url });
+        let result = self.send_and_wait(cmd).await?;
+        Ok(result["cookies"].clone())
+    }
+
+    /// Set a cookie.
+    pub async fn set_cookie(&self, params: &Value) -> Result<Value> {
+        let mut cmd = params.clone();
+        cmd["type"] = json!("browser_cmd");
+        cmd["cmd"] = json!("set_cookie");
+        self.send_and_wait(cmd).await?;
+        Ok(json!("Cookie set"))
+    }
+
+    /// Delete cookies for a URL, optionally filtering by name.
+    pub async fn delete_cookies(&self, url: &str, name: Option<&str>) -> Result<Value> {
+        let mut cmd = json!({ "type": "browser_cmd", "cmd": "delete_cookies", "url": url });
+        if let Some(n) = name {
+            cmd["name"] = json!(n);
+        }
+        let result = self.send_and_wait(cmd).await?;
+        let count = result["deleted"].as_u64().unwrap_or(0);
+        Ok(json!(format!("Deleted {} cookie(s)", count)))
+    }
+
+    /// Read the current page content in different modes: "text", "html", or "links".
+    pub async fn read_page(&self, mode: &str) -> Result<Value> {
+        let cmd = json!({ "type": "browser_cmd", "cmd": "read_page", "mode": mode });
+        let result = self.send_and_wait(cmd).await?;
+        Ok(json!({
+            "url": result["url"],
+            "title": result["title"],
+            "content": result["content"]
+        }))
+    }
+
+    /// Click an element by CSS selector.
+    pub async fn click(&self, selector: &str) -> Result<Value> {
+        let cmd = json!({ "type": "browser_cmd", "cmd": "click", "selector": selector });
+        let result = self.send_and_wait(cmd).await?;
+        Ok(json!(result["result"]))
+    }
+
+    /// Fill a form field by CSS selector.
+    pub async fn fill(&self, selector: &str, value: &str, submit: bool) -> Result<Value> {
+        let cmd = json!({
+            "type": "browser_cmd", "cmd": "fill",
+            "selector": selector, "value": value, "submit": submit
+        });
+        let result = self.send_and_wait(cmd).await?;
+        Ok(json!(result["result"]))
+    }
+
+    /// Get the current tab's URL and title.
+    pub async fn get_url(&self) -> Result<Value> {
+        let cmd = json!({ "type": "browser_cmd", "cmd": "get_url" });
+        let result = self.send_and_wait(cmd).await?;
+        Ok(json!({
+            "url": result["url"],
+            "title": result["title"],
+            "id": result["id"]
+        }))
+    }
 }

@@ -142,6 +142,187 @@ async function handleBrowserCmd(msg: any) {
       const updatedTab = await chrome.tabs.get(tabId);
       result = { url: updatedTab.url };
     }
+    else if (cmd === "tab_list") {
+      const allTabs = await chrome.tabs.query({});
+      result = {
+        tabs: allTabs.map(t => ({
+          id: t.id, title: t.title, url: t.url,
+          active: t.active, windowId: t.windowId, index: t.index,
+          pinned: t.pinned, audible: t.audible, muted: t.mutedInfo?.muted,
+        })),
+      };
+    }
+    else if (cmd === "tab_new") {
+      const newTab = await chrome.tabs.create({
+        url: msg.url || "about:blank",
+        active: msg.active !== false,
+      });
+      if (msg.url && msg.url !== "about:blank") {
+        // Wait for load
+        await new Promise<void>((resolve) => {
+          const listener = (updatedTabId: number, changeInfo: chrome.tabs.TabChangeInfo) => {
+            if (updatedTabId === newTab.id && changeInfo.status === "complete") {
+              chrome.tabs.onUpdated.removeListener(listener);
+              resolve();
+            }
+          };
+          chrome.tabs.onUpdated.addListener(listener);
+          setTimeout(() => { chrome.tabs.onUpdated.removeListener(listener); resolve(); }, 10000);
+        });
+      }
+      const created = await chrome.tabs.get(newTab.id!);
+      result = { id: created.id, url: created.url, title: created.title };
+    }
+    else if (cmd === "tab_close") {
+      const tabIds: number[] = Array.isArray(msg.tab_ids) ? msg.tab_ids : [msg.tab_id];
+      await chrome.tabs.remove(tabIds);
+      result = { closed: tabIds };
+    }
+    else if (cmd === "tab_switch") {
+      await chrome.tabs.update(msg.tab_id, { active: true });
+      if (msg.window_id !== undefined) {
+        await chrome.windows.update(msg.window_id, { focused: true });
+      }
+      const switched = await chrome.tabs.get(msg.tab_id);
+      result = { id: switched.id, url: switched.url, title: switched.title };
+    }
+    else if (cmd === "back") {
+      const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!tabs[0]?.id) throw new Error("No active tab");
+      await chrome.tabs.goBack(tabs[0].id);
+      // Wait for load
+      await new Promise(r => setTimeout(r, 500));
+      const tab = await chrome.tabs.get(tabs[0].id);
+      result = { url: tab.url, title: tab.title };
+    }
+    else if (cmd === "forward") {
+      const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!tabs[0]?.id) throw new Error("No active tab");
+      await chrome.tabs.goForward(tabs[0].id);
+      await new Promise(r => setTimeout(r, 500));
+      const tab = await chrome.tabs.get(tabs[0].id);
+      result = { url: tab.url, title: tab.title };
+    }
+    else if (cmd === "reload") {
+      const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!tabs[0]?.id) throw new Error("No active tab");
+      const tabId = tabs[0].id;
+      await chrome.tabs.reload(tabId, { bypassCache: !!msg.bypass_cache });
+      await new Promise<void>((resolve) => {
+        const listener = (updatedTabId: number, changeInfo: chrome.tabs.TabChangeInfo) => {
+          if (updatedTabId === tabId && changeInfo.status === "complete") {
+            chrome.tabs.onUpdated.removeListener(listener);
+            resolve();
+          }
+        };
+        chrome.tabs.onUpdated.addListener(listener);
+        setTimeout(() => { chrome.tabs.onUpdated.removeListener(listener); resolve(); }, 10000);
+      });
+      const tab = await chrome.tabs.get(tabId);
+      result = { url: tab.url, title: tab.title };
+    }
+    else if (cmd === "get_cookies") {
+      const cookies = await chrome.cookies.getAll({ url: msg.url });
+      result = {
+        cookies: cookies.map(c => ({
+          name: c.name, value: c.value, domain: c.domain, path: c.path,
+          secure: c.secure, httpOnly: c.httpOnly,
+          expirationDate: c.expirationDate, sameSite: c.sameSite,
+        })),
+      };
+    }
+    else if (cmd === "set_cookie") {
+      const cookie = await chrome.cookies.set({
+        url: msg.url,
+        name: msg.name,
+        value: msg.value,
+        domain: msg.domain,
+        path: msg.path || "/",
+        secure: msg.secure,
+        httpOnly: msg.httpOnly,
+        sameSite: msg.sameSite || "lax",
+        expirationDate: msg.expirationDate,
+      });
+      result = { cookie };
+    }
+    else if (cmd === "delete_cookies") {
+      const cookies = await chrome.cookies.getAll({ url: msg.url });
+      const nameFilter = msg.name;
+      const toDelete = nameFilter ? cookies.filter(c => c.name === nameFilter) : cookies;
+      for (const c of toDelete) {
+        const protocol = c.secure ? "https" : "http";
+        await chrome.cookies.remove({ url: `${protocol}://${c.domain}${c.path}`, name: c.name });
+      }
+      result = { deleted: toDelete.length };
+    }
+    else if (cmd === "read_page") {
+      const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!tabs[0]?.id) throw new Error("No active tab");
+      const mode = msg.mode || "text"; // "text", "html", or "links"
+      const results2 = await chrome.scripting.executeScript({
+        target: { tabId: tabs[0].id },
+        func: (m: string) => {
+          if (m === "html") return document.documentElement.outerHTML;
+          if (m === "links") {
+            return JSON.stringify(
+              Array.from(document.querySelectorAll("a[href]")).map(a => ({
+                text: (a as HTMLAnchorElement).innerText.trim().slice(0, 100),
+                href: (a as HTMLAnchorElement).href,
+              })).filter(l => l.text && l.href)
+            );
+          }
+          // "text" mode — semantic content
+          const clone = document.body.cloneNode(true) as HTMLElement;
+          clone.querySelectorAll("script,style,nav,footer,header,aside,iframe,noscript,svg").forEach(el => el.remove());
+          return clone.innerText.replace(/\n{3,}/g, "\n\n").trim().slice(0, 50000);
+        },
+        args: [mode],
+      });
+      result = { content: results2?.[0]?.result ?? "", url: tabs[0].url, title: tabs[0].title };
+    }
+    else if (cmd === "click") {
+      const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!tabs[0]?.id) throw new Error("No active tab");
+      const results2 = await chrome.scripting.executeScript({
+        target: { tabId: tabs[0].id },
+        func: (selector: string) => {
+          const el = document.querySelector(selector) as HTMLElement | null;
+          if (!el) return "ERROR: Element not found: " + selector;
+          el.click();
+          return "Clicked: " + selector;
+        },
+        args: [msg.selector],
+      });
+      result = { result: results2?.[0]?.result ?? "no result" };
+    }
+    else if (cmd === "fill") {
+      const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!tabs[0]?.id) throw new Error("No active tab");
+      const results2 = await chrome.scripting.executeScript({
+        target: { tabId: tabs[0].id },
+        func: (selector: string, value: string, submit: boolean) => {
+          const el = document.querySelector(selector) as HTMLInputElement | HTMLTextAreaElement | null;
+          if (!el) return "ERROR: Element not found: " + selector;
+          el.focus();
+          el.value = value;
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+          if (submit) {
+            const form = el.closest("form");
+            if (form) form.submit();
+            else return "Filled but no form found to submit";
+          }
+          return "Filled: " + selector;
+        },
+        args: [msg.selector, msg.value, !!msg.submit],
+      });
+      result = { result: results2?.[0]?.result ?? "no result" };
+    }
+    else if (cmd === "get_url") {
+      const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!tabs[0]) throw new Error("No active tab");
+      result = { url: tabs[0].url, title: tabs[0].title, id: tabs[0].id };
+    }
 
     ws?.send(JSON.stringify({ type: "browser_result", request_id, ...result }));
   } catch (e: any) {

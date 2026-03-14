@@ -12,148 +12,248 @@ pub fn tool_schemas() -> Vec<Value> {
     vec![
         json!({
             "name": "file_read",
-            "description": "Read the contents of a file at an absolute path on the Windows filesystem.",
+            "description": "Read a file at an absolute Windows path.",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Absolute Windows path to read, e.g. C:\\AI\\workspace\\notes.md"
-                    }
+                    "path": { "type": "string" }
                 },
                 "required": ["path"]
             }
         }),
         json!({
             "name": "file_write",
-            "description": "Write content to a file at an absolute path. Creates parent directories if needed.",
+            "description": "Write content to a file. Creates parent dirs if needed.",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Absolute Windows path to write"
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "Content to write to the file"
-                    }
+                    "path": { "type": "string" },
+                    "content": { "type": "string" }
                 },
                 "required": ["path", "content"]
             }
         }),
         json!({
             "name": "file_list",
-            "description": "List files and directories at a given path. Use before downloading to see what already exists.",
+            "description": "List files and directories at a path.",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "dir": { "type": "string", "description": "Absolute Windows path to list, e.g. C:\\AI\\workspace" }
+                    "dir": { "type": "string" }
                 },
                 "required": ["dir"]
             }
         }),
         json!({
             "name": "shell_exec",
-            "description": "Execute a PowerShell command on the local Windows machine. Returns stdout and stderr. 30 second timeout. Use for file downloads (Invoke-WebRequest), system info, running scripts, etc.",
+            "description": "Run a PowerShell command. Returns stdout/stderr. 120s timeout.",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "PowerShell command to execute"
-                    }
+                    "command": { "type": "string" }
                 },
                 "required": ["command"]
             }
         }),
         json!({
             "name": "web_search",
-            "description": "Search the web using Tavily. Returns a summary answer and top results with URLs. Use for text-based research, news, facts, articles. Also useful for finding image URLs on pages.",
+            "description": "Search the web via Tavily. Returns summary and top results.",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Search query"
-                    }
+                    "query": { "type": "string" }
                 },
                 "required": ["query"]
             }
         }),
         json!({
             "name": "image_verify",
-            "description": "Analyze a local image file using local vision AI (no cloud, no censorship). Send a downloaded image for verification — identify people, describe contents, check quality. Use after downloading images to confirm they match what was expected. The image must already be saved to disk.",
+            "description": "Analyze a local image with vision AI. Identify people, describe contents.",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "image_path": {
-                        "type": "string",
-                        "description": "Absolute path to the image file on disk"
-                    },
-                    "prompt": {
-                        "type": "string",
-                        "description": "What to ask about the image, e.g. 'Is this a photo of Kristen Stewart? Describe what you see.'"
-                    }
+                    "image_path": { "type": "string" },
+                    "prompt": { "type": "string" }
                 },
                 "required": ["image_path", "prompt"]
             }
         }),
         json!({
             "name": "browser_screenshot",
-            "description": "Capture a screenshot of the current browser tab. Returns a visual image of what the browser is showing right now. Use this to see the page before interacting with it.",
-            "input_schema": {
-                "type": "object",
-                "properties": {},
-                "required": []
-            }
+            "description": "Capture screenshot of current browser tab.",
+            "input_schema": { "type": "object", "properties": {} }
         }),
         json!({
             "name": "browser_exec_js",
-            "description": "Execute JavaScript in the active browser tab and return the result. Use for clicking elements (document.querySelector('.btn').click()), reading DOM values, filling forms, scrolling, etc.",
+            "description": "Execute JavaScript in the active browser tab.",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "js": {
-                        "type": "string",
-                        "description": "JavaScript code to execute in the page context"
-                    }
+                    "js": { "type": "string" }
                 },
                 "required": ["js"]
             }
         }),
         json!({
             "name": "browser_navigate",
-            "description": "Navigate the active browser tab to a URL. Waits for the page to finish loading before returning.",
+            "description": "Navigate active tab to a URL. Waits for load.",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "url": {
-                        "type": "string",
-                        "description": "URL to navigate to"
-                    }
+                    "url": { "type": "string" }
                 },
                 "required": ["url"]
             }
         }),
         json!({
-            "name": "image_download",
-            "description": "Download images from the web matching a search query. Saves files to disk and returns the list of downloaded paths. Use this instead of shell_exec for downloading images.",
+            "name": "browser_tab_list",
+            "description": "List all open browser tabs with ID, title, URL.",
+            "input_schema": { "type": "object", "properties": {} }
+        }),
+        json!({
+            "name": "browser_tab_new",
+            "description": "Open a new browser tab, optionally at a URL.",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Search query, e.g. 'Eva Green actress'"
-                    },
-                    "count": {
-                        "type": "integer",
-                        "description": "Number of images to download (default 10, max 50)"
-                    },
-                    "dest_dir": {
-                        "type": "string",
-                        "description": "Absolute Windows path to save images, e.g. C:\\AI\\workspace\\eva_green"
-                    }
+                    "url": { "type": "string" },
+                    "active": { "type": "boolean" }
+                }
+            }
+        }),
+        json!({
+            "name": "browser_tab_close",
+            "description": "Close browser tabs by ID.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "tab_ids": { "type": "array", "items": { "type": "integer" } }
+                },
+                "required": ["tab_ids"]
+            }
+        }),
+        json!({
+            "name": "browser_tab_switch",
+            "description": "Switch to a browser tab by ID.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "tab_id": { "type": "integer" },
+                    "window_id": { "type": "integer" }
+                },
+                "required": ["tab_id"]
+            }
+        }),
+        json!({
+            "name": "browser_back",
+            "description": "Go back in browser history.",
+            "input_schema": { "type": "object", "properties": {} }
+        }),
+        json!({
+            "name": "browser_forward",
+            "description": "Go forward in browser history.",
+            "input_schema": { "type": "object", "properties": {} }
+        }),
+        json!({
+            "name": "browser_reload",
+            "description": "Reload the active browser tab.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "bypass_cache": { "type": "boolean" }
+                }
+            }
+        }),
+        json!({
+            "name": "browser_get_cookies",
+            "description": "Get cookies for a URL.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string" }
+                },
+                "required": ["url"]
+            }
+        }),
+        json!({
+            "name": "browser_set_cookie",
+            "description": "Set a browser cookie.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string" },
+                    "name": { "type": "string" },
+                    "value": { "type": "string" },
+                    "domain": { "type": "string" },
+                    "path": { "type": "string" },
+                    "secure": { "type": "boolean" },
+                    "httpOnly": { "type": "boolean" },
+                    "sameSite": { "type": "string" },
+                    "expirationDate": { "type": "number" }
+                },
+                "required": ["url", "name", "value"]
+            }
+        }),
+        json!({
+            "name": "browser_delete_cookies",
+            "description": "Delete cookies for a URL, optionally by name.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string" },
+                    "name": { "type": "string" }
+                },
+                "required": ["url"]
+            }
+        }),
+        json!({
+            "name": "browser_read_page",
+            "description": "Read page content. Mode: 'text', 'html', or 'links'.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "mode": { "type": "string" }
+                }
+            }
+        }),
+        json!({
+            "name": "browser_click",
+            "description": "Click an element by CSS selector.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "selector": { "type": "string" }
+                },
+                "required": ["selector"]
+            }
+        }),
+        json!({
+            "name": "browser_fill",
+            "description": "Fill a form field by CSS selector. Fires input/change events.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "selector": { "type": "string" },
+                    "value": { "type": "string" },
+                    "submit": { "type": "boolean" }
+                },
+                "required": ["selector", "value"]
+            }
+        }),
+        json!({
+            "name": "browser_get_url",
+            "description": "Get current tab URL, title, and ID.",
+            "input_schema": { "type": "object", "properties": {} }
+        }),
+        json!({
+            "name": "image_download",
+            "description": "Download images matching a search query to disk.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "count": { "type": "integer" },
+                    "dest_dir": { "type": "string" }
                 },
                 "required": ["query", "dest_dir"]
             }
@@ -233,6 +333,71 @@ pub async fn dispatch(
                 .ok_or_else(|| anyhow::anyhow!("browser_navigate: missing 'url'"))?;
             browser.navigate(url).await
         }
+        "browser_tab_list" => browser.tab_list().await,
+        "browser_tab_new" => {
+            let url = input["url"].as_str();
+            let active = input["active"].as_bool().unwrap_or(true);
+            browser.tab_new(url, active).await
+        }
+        "browser_tab_close" => {
+            let tab_ids: Vec<i64> = input["tab_ids"]
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("browser_tab_close: missing 'tab_ids'"))?
+                .iter()
+                .filter_map(|v| v.as_i64())
+                .collect();
+            browser.tab_close(tab_ids).await
+        }
+        "browser_tab_switch" => {
+            let tab_id = input["tab_id"]
+                .as_i64()
+                .ok_or_else(|| anyhow::anyhow!("browser_tab_switch: missing 'tab_id'"))?;
+            let window_id = input["window_id"].as_i64();
+            browser.tab_switch(tab_id, window_id).await
+        }
+        "browser_back" => browser.back().await,
+        "browser_forward" => browser.forward().await,
+        "browser_reload" => {
+            let bypass = input["bypass_cache"].as_bool().unwrap_or(false);
+            browser.reload(bypass).await
+        }
+        "browser_get_cookies" => {
+            let url = input["url"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("browser_get_cookies: missing 'url'"))?;
+            browser.get_cookies(url).await
+        }
+        "browser_set_cookie" => {
+            browser.set_cookie(input).await
+        }
+        "browser_delete_cookies" => {
+            let url = input["url"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("browser_delete_cookies: missing 'url'"))?;
+            let name = input["name"].as_str();
+            browser.delete_cookies(url, name).await
+        }
+        "browser_read_page" => {
+            let mode = input["mode"].as_str().unwrap_or("text");
+            browser.read_page(mode).await
+        }
+        "browser_click" => {
+            let selector = input["selector"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("browser_click: missing 'selector'"))?;
+            browser.click(selector).await
+        }
+        "browser_fill" => {
+            let selector = input["selector"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("browser_fill: missing 'selector'"))?;
+            let value = input["value"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("browser_fill: missing 'value'"))?;
+            let submit = input["submit"].as_bool().unwrap_or(false);
+            browser.fill(selector, value, submit).await
+        }
+        "browser_get_url" => browser.get_url().await,
         "image_download" => {
             let query = input["query"]
                 .as_str()
