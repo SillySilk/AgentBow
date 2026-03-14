@@ -1,0 +1,12 @@
+Bow failed to start:
+
+GOOGLE_API_KEY must be set in .env
+
+Edit C:\AI\agent Bow\desktop\.env and ensure all keys are set.
+Unable to find type [System.Windows.Forms.MessageBox].
+At line:1 char:1
++ [System.Windows.Forms.MessageBox]::Show('Bow failed to start:
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : InvalidOperation: (System.Windows.Forms.MessageBox:TypeName) [], RuntimeException
+    + FullyQualifiedErrorId : TypeNotFound
+ 
