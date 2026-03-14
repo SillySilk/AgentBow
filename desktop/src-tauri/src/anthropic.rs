@@ -314,7 +314,7 @@ async fn stream_response(
                 .await;
 
             let (output, is_error) =
-                match tools::dispatch(&tool_name, &tool_input, &config.tavily_api_key, &config.lm_studio_url, &config.lm_studio_model, shell_session, browser).await {
+                match tools::dispatch(&tool_name, &tool_input, &config.tavily_api_key, &config.lm_studio_url, &config.lm_studio_model, &config.workspace_root.to_string_lossy(), shell_session, browser).await {
                     Ok(result) => (result, false),
                     Err(e) => (json!(e.to_string()), true),
                 };

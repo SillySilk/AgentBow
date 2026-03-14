@@ -167,6 +167,7 @@ pub async fn dispatch(
     tavily_api_key: &str,
     lm_studio_url: &str,
     lm_studio_model: &str,
+    workspace_root: &str,
     shell_session: &shell_session::ShellSessionManager,
     browser: &browser::BrowserBridge,
 ) -> Result<Value> {
@@ -240,7 +241,8 @@ pub async fn dispatch(
             let dest_dir = input["dest_dir"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("image_download: missing 'dest_dir'"))?;
-            let s = image_search::image_download(query, count, dest_dir).await?;
+            let log_dir = format!("{}\\logs", workspace_root.trim_end_matches(['\\', '/']));
+            let s = image_search::image_download(query, count, dest_dir, &log_dir).await?;
             Ok(json!(s))
         }
         _ => Err(anyhow::anyhow!("Unknown tool: {}", tool_name)),

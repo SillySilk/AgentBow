@@ -87,13 +87,13 @@ fn build_local_system_prompt(page_ctx: Option<&PageContext>, workspace: &str) ->
 ## Image downloading
 Use the image_download tool — it handles all scraping and downloading internally.
 - Call: image_download(query="person name actress", count=40, dest_dir="C:\\AI\\workspace\\person_name")
-- The tool writes a detailed log to <dest_dir>\\__bow_log.txt — ALWAYS check it after a run
+- The tool writes a detailed log to {workspace}\\logs\\bow_downloads.log — ALWAYS check it after a run
 - After downloading, use image_verify on individual files to check content
 - Do NOT use shell_exec for image downloading
 
 ## Error diagnosis workflow
 After any failed or partial image_download:
-1. file_read("<dest_dir>\\__bow_log.txt") to see which scrapers worked, which returned 0 URLs, and the exact reason each download failed
+1. file_read("{workspace}\\logs\\bow_downloads.log") to see which scrapers worked, which returned 0 URLs, and the exact reason each download failed
 2. Patterns to look for: HTTP 403 = hotlink protection, "not an image" = scraper returning HTML instead of images, "too small" = thumbnails, "vqd not found" = DDG token extraction failed
 3. Report findings to the user and suggest retrying with a different query if needed
 
@@ -266,6 +266,7 @@ pub async fn run_local_chat(
                 &config.tavily_api_key,
                 &config.lm_studio_url,
                 &config.lm_studio_model,
+                &config.workspace_root.to_string_lossy(),
                 &shell_session,
                 &browser,
             ).await {

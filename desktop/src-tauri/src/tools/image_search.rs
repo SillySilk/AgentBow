@@ -68,9 +68,11 @@ struct SessionLog {
 }
 
 impl SessionLog {
-    fn new(dest_dir: &str, query: &str) -> Self {
-        let path = format!("{}\\__bow_log.txt",
-            dest_dir.trim_end_matches(['\\', '/']));
+    fn new(log_dir: &str, query: &str) -> Self {
+        // Ensure logs directory exists; if it fails we'll surface the error in flush()
+        let _ = std::fs::create_dir_all(log_dir);
+        let path = format!("{}\\bow_downloads.log",
+            log_dir.trim_end_matches(['\\', '/']));
         let mut log = Self { path, lines: Vec::new() };
         log.push(format!("=== bow image_download [ts:{}] ===", unix_ts()));
         log.push(format!("query: {:?}", query));
@@ -80,14 +82,25 @@ impl SessionLog {
         info!("{}", line);
         self.lines.push(line);
     }
-    fn flush(&self) {
-        if let Ok(mut f) = std::fs::OpenOptions::new()
+    /// Write log to disk. Returns a warning string if the write fails so the
+    /// caller can surface it — no more silent failures.
+    fn flush(&self) -> String {
+        match std::fs::OpenOptions::new()
             .create(true).append(true).open(&self.path)
         {
-            for l in &self.lines {
-                let _ = writeln!(f, "{}", l);
+            Err(e) => format!("(log write failed: {} — path: {})", e, self.path),
+            Ok(mut f) => {
+                let mut ok = true;
+                for l in &self.lines {
+                    if writeln!(f, "{}", l).is_err() { ok = false; break; }
+                }
+                let _ = writeln!(f, "");
+                if ok {
+                    format!("Log: {}", self.path)
+                } else {
+                    format!("(log partially written — path: {})", self.path)
+                }
             }
-            let _ = writeln!(f, "");
         }
     }
 }
@@ -176,12 +189,13 @@ pub async fn image_verify(
 // ── image_download ────────────────────────────────────────────────────────────
 
 /// Download images matching `query` into `dest_dir`, up to `count` files.
-/// Writes a detailed session log to `{dest_dir}\\__bow_log.txt`.
-pub async fn image_download(query: &str, count: usize, dest_dir: &str) -> Result<String> {
+/// Writes a session log to `{log_dir}\\bow_downloads.log`.
+pub async fn image_download(query: &str, count: usize, dest_dir: &str, log_dir: &str) -> Result<String> {
     std::fs::create_dir_all(dest_dir)
         .map_err(|e| anyhow::anyhow!("Failed to create dest_dir '{}': {}", dest_dir, e))?;
 
-    let mut log = SessionLog::new(dest_dir, query);
+    let mut log = SessionLog::new(log_dir, query);
+    log.push(format!("dest_dir: {}", dest_dir));
 
     let client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
@@ -215,9 +229,9 @@ pub async fn image_download(query: &str, count: usize, dest_dir: &str) -> Result
 
     if candidates.is_empty() {
         log.push("FATAL: no candidates — all scrapers returned 0 URLs".to_string());
-        log.flush();
+        let log_note = log.flush();
         return Err(anyhow::anyhow!(
-            "No images found for {:?}. Check log: {}", query, log.path
+            "No images found for {:?}. {}", query, log_note
         ));
     }
 
@@ -301,17 +315,17 @@ pub async fn image_download(query: &str, count: usize, dest_dir: &str) -> Result
         }
     }
 
-    log.flush();
+    let log_note = log.flush();
 
     if downloaded.is_empty() {
         return Err(anyhow::anyhow!(
-            "All downloads failed for {:?}. See log: {}", query, log.path
+            "All downloads failed for {:?}. {}", query, log_note
         ));
     }
 
     Ok(format!(
-        "Downloaded {}/{} images to {}\nLog: {}\nFiles:\n{}",
-        downloaded.len(), count, dest_dir, log.path,
+        "Downloaded {}/{} images to {}\n{}\nFiles:\n{}",
+        downloaded.len(), count, dest_dir, log_note,
         downloaded.join("\n")
     ))
 }
