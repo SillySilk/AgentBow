@@ -110,13 +110,21 @@ pub async fn image_download(query: &str, count: usize, dest_dir: &str) -> Result
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {}", e))?;
 
-    // Try sources in order until we have enough candidates
+    // Try all sources, merging unique URLs until we have enough candidates
     let want = count * 3;
-    let mut candidates = scrape_bing_images(&client, query, want).await.unwrap_or_default();
+    let mut candidates: Vec<String> = Vec::new();
 
-    if candidates.len() < count {
-        if let Ok(ddg) = scrape_duckduckgo_images(&client, query, want).await {
-            for u in ddg {
+    let sources: Vec<(&str, std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<String>>> + Send>>)> = vec![
+        ("Bing",    Box::pin(scrape_bing_images(&client, query, want))),
+        ("DDG",     Box::pin(scrape_duckduckgo_images(&client, query, want))),
+        ("Yandex",  Box::pin(scrape_yandex_images(&client, query, want))),
+        ("Qwant",   Box::pin(scrape_qwant_images(&client, query, want))),
+    ];
+
+    for (_name, fut) in sources {
+        if candidates.len() >= want { break; }
+        if let Ok(urls) = fut.await {
+            for u in urls {
                 if !candidates.contains(&u) { candidates.push(u); }
             }
         }
@@ -181,7 +189,7 @@ async fn scrape_bing_images(
 ) -> Result<Vec<String>> {
     let encoded = query.replace(' ', "+");
     let url = format!(
-        "https://www.bing.com/images/search?q={}&count=50&first=1",
+        "https://www.bing.com/images/search?q={}&count=50&first=1&safeSearch=Off",
         encoded
     );
 
@@ -189,6 +197,7 @@ async fn scrape_bing_images(
         .get(&url)
         .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
         .header("Accept-Language", "en-US,en;q=0.5")
+        .header("Cookie", "SRCHHPGUSR=ADLT=OFF; adlt=off")
         .send()
         .await
         .map_err(|e| anyhow::anyhow!("Bing Images request failed: {}", e))?;
@@ -243,10 +252,12 @@ async fn scrape_duckduckgo_images(
 ) -> Result<Vec<String>> {
     // Step 1: get VQD token from the search page
     let encoded = query.replace(' ', "+");
-    let page_url = format!("https://duckduckgo.com/?q={}&iax=images&ia=images", encoded);
+    // kp=-2 disables safe search
+    let page_url = format!("https://duckduckgo.com/?q={}&iax=images&ia=images&kp=-2", encoded);
     let html = client
         .get(&page_url)
         .header("Accept-Language", "en-US,en;q=0.9")
+        .header("Cookie", "p=-2")
         .send().await?.text().await?;
 
     // VQD looks like: vqd=4-XXXXXXXXXX or vqd=4-XXXX-XXXX
@@ -260,8 +271,9 @@ async fn scrape_duckduckgo_images(
         .ok_or_else(|| anyhow::anyhow!("DDG: vqd token not found"))?;
 
     // Step 2: fetch image JSON
+    // p=-2 = safe search off
     let api_url = format!(
-        "https://duckduckgo.com/i.js?q={}&vqd={}&o=json&l=us-en&s=0&f=,,,,,&p=1",
+        "https://duckduckgo.com/i.js?q={}&vqd={}&o=json&l=us-en&s=0&f=,,,,,&p=-2",
         encoded, vqd
     );
     let resp = client
@@ -280,6 +292,78 @@ async fn scrape_duckduckgo_images(
         for r in results {
             if urls.len() >= max { break; }
             if let Some(url) = r["image"].as_str() {
+                if url.starts_with("http") {
+                    urls.push(url.to_string());
+                }
+            }
+        }
+    }
+    Ok(urls)
+}
+
+/// Scrape Yandex Images — great coverage for people/faces, especially non-English subjects.
+async fn scrape_yandex_images(
+    client: &reqwest::Client,
+    query: &str,
+    max: usize,
+) -> Result<Vec<String>> {
+    let encoded = query.replace(' ', "+");
+    // filter=0 disables safe search; numdoc=50 requests more results
+    let url = format!(
+        "https://yandex.com/images/search?text={}&nomisspell=1&numdoc=50&filter=0",
+        encoded
+    );
+
+    let html = client
+        .get(&url)
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .header("Cookie", "safesearch=0; yp=1999999999.sp.ssp%3D0")
+        .send().await?.text().await?;
+
+    let mut urls = Vec::new();
+    // Yandex embeds original image URLs as "img_href":"https://..."
+    extract_between(&html, "\"img_href\":\"", "\"", max, &mut urls);
+    // Fallback: "url":"https://..." pattern in JSON blobs
+    if urls.is_empty() {
+        extract_between(&html, "\"url\":\"https://", "\"", max, &mut urls);
+        for u in urls.iter_mut() {
+            if !u.starts_with("http") { *u = format!("https://{}", u); }
+        }
+    }
+    Ok(urls)
+}
+
+/// Scrape Qwant Images — returns clean JSON, no API key needed.
+async fn scrape_qwant_images(
+    client: &reqwest::Client,
+    query: &str,
+    max: usize,
+) -> Result<Vec<String>> {
+    let encoded = query.replace(' ', "%20");
+    // safesearch=0 disables filtering
+    let url = format!(
+        "https://api.qwant.com/v3/search/images?q={}&count=50&offset=0&safesearch=0&locale=en_US&tgp=2",
+        encoded
+    );
+
+    let resp = client
+        .get(&url)
+        .header("Accept", "application/json")
+        .header("Referer", "https://www.qwant.com/")
+        .send().await?;
+
+    if !resp.status().is_success() {
+        return Ok(vec![]);
+    }
+
+    let data: serde_json::Value = resp.json().await?;
+    let mut urls = Vec::new();
+
+    if let Some(items) = data["data"]["result"]["items"].as_array() {
+        for item in items {
+            if urls.len() >= max { break; }
+            // "media" is the full-size image URL
+            if let Some(url) = item["media"].as_str() {
                 if url.starts_with("http") {
                     urls.push(url.to_string());
                 }
