@@ -5,18 +5,13 @@ edition = "2021"
 
 [lib]
 name = "bow_desktop_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [[bin]]
 name = "bow-desktop"
 path = "src/main.rs"
 
-[build-dependencies]
-tauri-build = { version = "2", features = [] }
-
 [dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
-tauri-plugin-shell = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.21"
 reqwest = { version = "0.12", features = ["json", "stream", "cookies"] }
@@ -34,8 +29,10 @@ urlencoding = "2"
 rmcp = { version = "1.7", features = ["client", "transport-child-process"] }
 base64 = "0.22"
 dom_smoothie = "0.18"
-image = "0.25"
+image = { version = "0.25", features = ["png"] }
 image_hasher = "3.1"
 axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.6", features = ["fs", "trace"] }
 tower = "0.5"
+tray-icon = "0.19"
+tao = "0.30"
