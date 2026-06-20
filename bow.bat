@@ -7,11 +7,12 @@ pushd "%~dp0desktop\src-tauri"
 cargo build || goto :err
 REM Copy built web assets next to the exe so release runs find them.
 if not exist "target\debug\web" mkdir "target\debug\web"
-xcopy /E /I /Y "..\webapp\dist\*" "target\debug\web\" >nul
+xcopy /E /I /Y "..\webapp\dist\*" "target\debug\web\" >nul || goto :err
 start "" "target\debug\bow-desktop.exe"
 popd
 exit /b 0
 :err
 echo Build failed.
+pause
 popd
 exit /b 1

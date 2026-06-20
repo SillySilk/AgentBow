@@ -5,26 +5,43 @@ export default function App() {
   const [wsPort, setWsPort] = useState<number | "unavailable" | null>(null);
 
   useEffect(() => {
-    fetch("/api/config")
-      .then((r) => r.json())
-      .then((cfg) => setWsPort(cfg.ws_port ?? null))
-      .catch(() => setWsPort("unavailable"));
-  }, []);
+    let ws: WebSocket | null = null;
 
-  useEffect(() => {
-    const wsUrl = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`;
-    const ws = new WebSocket(wsUrl);
-    ws.onopen = () => {
-      ws.send(JSON.stringify({ type: "auth", token: "dev", session_id: crypto.randomUUID() }));
+    fetch("/api/config")
+      .then((r) => {
+        if (!r.ok) throw new Error(`config fetch failed: ${r.status}`);
+        return r.json();
+      })
+      .then((cfg) => {
+        setWsPort(cfg.ws_port ?? null);
+
+        const token: string = cfg.token;
+        if (!token) {
+          setStatus("auth error: no token in /api/config");
+          return;
+        }
+
+        const wsUrl = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`;
+        ws = new WebSocket(wsUrl);
+        ws.onopen = () => {
+          ws!.send(JSON.stringify({ type: "auth", token, session_id: crypto.randomUUID() }));
+        };
+        ws.onmessage = (e) => {
+          const m = JSON.parse(e.data);
+          if (m.type === "auth_ok") setStatus("connected");
+          else if (m.type === "auth_error") setStatus("auth error: " + (m.message ?? ""));
+        };
+        ws.onclose = () => setStatus("disconnected");
+        ws.onerror = () => setStatus("error");
+      })
+      .catch((err) => {
+        setWsPort("unavailable");
+        setStatus("config fetch error: " + err.message);
+      });
+
+    return () => {
+      if (ws) ws.close();
     };
-    ws.onmessage = (e) => {
-      const m = JSON.parse(e.data);
-      if (m.type === "auth_ok") setStatus("connected");
-      else if (m.type === "auth_error") setStatus("auth error: " + (m.message ?? ""));
-    };
-    ws.onclose = () => setStatus("disconnected");
-    ws.onerror = () => setStatus("error");
-    return () => ws.close();
   }, []);
 
   return (

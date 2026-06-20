@@ -26,8 +26,14 @@ async fn ws_upgrade(State(s): State<HttpState>, ws: WebSocketUpgrade) -> Respons
     })
 }
 
+async fn config_handler(State(s): State<HttpState>) -> Json<serde_json::Value> {
+    Json(json!({
+        "ws_port": s.app.config.ws_port,
+        "token": s.app.config.bow_secret,
+    }))
+}
+
 pub fn build_router(state: AppState, mcp: McpManager, web_dir: PathBuf) -> Router {
-    let ws_port = state.config.ws_port;
     let http_state = HttpState { app: state, mcp };
 
     let index = web_dir.join("index.html");
@@ -36,10 +42,7 @@ pub fn build_router(state: AppState, mcp: McpManager, web_dir: PathBuf) -> Route
 
     Router::new()
         .route("/api/health", get(|| async { "ok" }))
-        .route(
-            "/api/config",
-            get(move || async move { Json(json!({ "ws_port": ws_port })) }),
-        )
+        .route("/api/config", get(config_handler))
         .route("/ws", get(ws_upgrade))
         .fallback_service(static_service)
         .with_state(http_state)
@@ -57,11 +60,11 @@ mod tests {
             .route("/api/health", axum::routing::get(|| async { "ok" }))
     }
 
-    fn config_router(ws_port: u16) -> axum::Router {
+    fn config_router(ws_port: u16, token: &'static str) -> axum::Router {
         axum::Router::new().route(
             "/api/config",
             axum::routing::get(move || async move {
-                axum::Json(serde_json::json!({ "ws_port": ws_port }))
+                axum::Json(serde_json::json!({ "ws_port": ws_port, "token": token }))
             }),
         )
     }
@@ -82,8 +85,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn config_returns_ws_port() {
-        let app = config_router(9357);
+    async fn config_returns_ws_port_and_token() {
+        let app = config_router(9357, "test-secret");
         let res = app
             .oneshot(
                 Request::builder()
@@ -99,5 +102,6 @@ mod tests {
             .unwrap();
         let text = std::str::from_utf8(&body).unwrap();
         assert!(text.contains("\"ws_port\":9357"), "body was: {}", text);
+        assert!(text.contains("\"token\":\"test-secret\""), "body was: {}", text);
     }
 }

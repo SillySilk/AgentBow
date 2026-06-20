@@ -108,9 +108,18 @@ There is no browser extension — Bow runs as a standalone local web app.
 | Shell | `shell_exec` — **persistent** PowerShell session (cwd, `$env:`, and `$vars` carry across calls; per-command timeout auto-respawns a hung shell) |
 | Web | `web_search`, `web_search_deep`, `searxng_search`, `jina_read`, `search_evaluate` |
 | Images | `image_download` (Bing/DDG/Yandex/Brave/Qwant/SearXNG), `image_verify` (vision; transcodes WebP→PNG), `image_dedupe` (pHash near-dup quarantine), `image_stats` (folder report), `image_resize` (non-destructive resize/convert for training sets), `image_autotag` (writes kohya `.txt` captions via the local vision model) |
-| Browser | `browser_navigate`, `browser_click`, `browser_fill`, `browser_read_page`, `browser_screenshot`, `browser_analyze_page`, tabs, cookies, bookmarks, history, `browser_exec_js` |
+| Browser | `browser_navigate`, `browser_click`, `browser_fill`, `browser_read_page`, `browser_screenshot`, `browser_analyze_page`, tabs, cookies, bookmarks, history, `browser_exec_js` — **INACTIVE in this build** (see note below) |
 | Planning | `plan_create`, `plan_step_start/done/fail`, `verify_step`, `task_complete` |
 | Memory | `memory_store`, `memory_retrieve` (SQLite FTS5 + optional embeddings) |
+
+> **Browser-control tools — INACTIVE in this build**
+> The `browser_*` tools and `browser_exec_js` are present in the tool schema but
+> do not function in the current release. They previously relied on a Chrome
+> extension ("browser bridge") that relayed commands from the Rust backend to the
+> active tab; that extension has been removed. Browser control will be reconnected
+> to a backend-controlled headless/headed browser in **Phase 3**. Until then,
+> calling any `browser_*` tool will return an error and will not interact with
+> any browser.
 
 ### Image-training workflow
 
@@ -191,6 +200,7 @@ Bow is an intentionally unrestricted local agent. Be aware:
   (`tools/mod.rs`), but it is otherwise unsandboxed.
 - Saved logins are read from `credentials.json` in plaintext and typed into
   forms. Consider moving these to Windows Credential Manager / DPAPI.
-- `browser_exec_js` runs arbitrary JS in the active tab via the browser bridge.
+- `browser_exec_js` (inactive until Phase 3) will run arbitrary JS in the active
+  tab when browser control is reconnected.
 
 Run Bow only with models and tasks you trust.

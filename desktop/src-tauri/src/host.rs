@@ -39,7 +39,7 @@ pub fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("bow_desktop=debug".parse().unwrap()),
+                .add_directive("bow_desktop_lib=debug".parse().unwrap()),
         )
         .init();
 
