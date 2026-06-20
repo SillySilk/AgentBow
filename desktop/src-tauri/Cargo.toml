@@ -36,3 +36,6 @@ base64 = "0.22"
 dom_smoothie = "0.18"
 image = "0.25"
 image_hasher = "3.1"
+axum = { version = "0.7", features = ["ws"] }
+tower-http = { version = "0.6", features = ["fs", "trace"] }
+tower = "0.5"

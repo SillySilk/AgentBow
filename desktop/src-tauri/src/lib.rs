@@ -1,4 +1,5 @@
 mod auth;
+mod http;
 mod local_llm;
 mod server;
 mod state;
