@@ -2,6 +2,15 @@ import { useEffect, useState } from "react";
 
 export default function App() {
   const [status, setStatus] = useState("connecting…");
+  const [wsPort, setWsPort] = useState<number | "unavailable" | null>(null);
+
+  useEffect(() => {
+    fetch("/api/config")
+      .then((r) => r.json())
+      .then((cfg) => setWsPort(cfg.ws_port ?? null))
+      .catch(() => setWsPort("unavailable"));
+  }, []);
+
   useEffect(() => {
     const wsUrl = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`;
     const ws = new WebSocket(wsUrl);
@@ -17,10 +26,12 @@ export default function App() {
     ws.onerror = () => setStatus("error");
     return () => ws.close();
   }, []);
+
   return (
     <div style={{ fontFamily: "system-ui", padding: 24, background: "#1a1a2e", color: "#a8b2d8", minHeight: "100vh" }}>
       <h1 style={{ color: "#e94560" }}>Bow Image Studio</h1>
       <p>Backend: {status}</p>
+      <p>Server port: {wsPort === null ? "loading…" : wsPort === "unavailable" ? "config unavailable" : wsPort}</p>
     </div>
   );
 }
