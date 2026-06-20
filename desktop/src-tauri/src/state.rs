@@ -10,6 +10,13 @@ pub struct Config {
     pub workspace_root: PathBuf,
     pub lm_studio_url: String,
     pub lm_studio_model: String,
+    pub searxng_url: String,
+    /// "low" | "medium" | "high" — passed as reasoning_effort in chat completions.
+    /// Leave unset to omit the field (model default).
+    pub reasoning_effort: Option<String>,
+    /// Token budget for reasoning. Passed as reasoning_tokens in chat completions.
+    /// Leave unset to omit the field (model default).
+    pub reasoning_tokens: Option<u32>,
 }
 
 impl Config {
@@ -37,6 +44,24 @@ impl Config {
             .unwrap_or_else(|_| "http://localhost:1234".to_string());
         let lm_studio_model = std::env::var("LM_STUDIO_MODEL")
             .unwrap_or_else(|_| "qwen3.5-9b".to_string());
+        let searxng_url = std::env::var("SEARXNG_URL")
+            .unwrap_or_else(|_| "http://localhost:8888".to_string());
+
+        let reasoning_effort = std::env::var("LM_STUDIO_REASONING_EFFORT").ok().and_then(|v| {
+            match v.to_lowercase().as_str() {
+                "low" | "medium" | "high" => Some(v.to_lowercase()),
+                other => {
+                    eprintln!("LM_STUDIO_REASONING_EFFORT: invalid value '{}' (use low/medium/high) — ignored", other);
+                    None
+                }
+            }
+        });
+
+        let reasoning_tokens = std::env::var("LM_STUDIO_REASONING_TOKENS").ok().and_then(|v| {
+            v.parse::<u32>().map_err(|_| {
+                eprintln!("LM_STUDIO_REASONING_TOKENS: '{}' is not a valid u32 — ignored", v);
+            }).ok()
+        });
 
         Ok(Config {
             tavily_api_key,
@@ -45,6 +70,9 @@ impl Config {
             workspace_root,
             lm_studio_url,
             lm_studio_model,
+            searxng_url,
+            reasoning_effort,
+            reasoning_tokens,
         })
     }
 }

@@ -10,7 +10,8 @@
     "scripting",
     "storage",
     "alarms",
-    "cookies"
+    "cookies",
+    "bookmarks"
   ],
   "host_permissions": ["<all_urls>"],
   "background": {

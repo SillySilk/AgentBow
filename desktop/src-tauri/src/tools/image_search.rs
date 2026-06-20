@@ -1,4 +1,5 @@
 use anyhow::Result;
+use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::json;
 use std::io::Write as IoWrite;
@@ -126,17 +127,26 @@ pub async fn image_verify(
         return Err(anyhow::anyhow!("Image file not found: {}", image_path));
     }
 
-    let image_bytes = std::fs::read(path)
+    let mut image_bytes = std::fs::read(path)
         .map_err(|e| anyhow::anyhow!("Failed to read image '{}': {}", image_path, e))?;
 
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    let mut ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+
+    // Most local vision models reject WebP. Transcode it to PNG in-memory so the
+    // image can still be verified instead of being skipped.
     if ext == "webp" {
-        return Ok(format!(
-            "[image_verify skipped: {} is WebP — not supported by most local vision models. \
-             Re-download as JPEG/PNG if you need to verify this image.]",
-            image_path
-        ));
+        if let Ok(img) = image::load_from_memory(&image_bytes) {
+            let mut buf = Vec::new();
+            if img
+                .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+                .is_ok()
+            {
+                image_bytes = buf;
+                ext = "png".to_string();
+            }
+        }
     }
+
     const MAX_VERIFY_BYTES: usize = 4 * 1024 * 1024;
     if image_bytes.len() > MAX_VERIFY_BYTES {
         return Ok(format!(
@@ -147,7 +157,7 @@ pub async fn image_verify(
         ));
     }
 
-    let b64 = base64_encode(&image_bytes);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&image_bytes);
     let mime = match ext.as_str() {
         "png" => "image/png",
         "gif" => "image/gif",
@@ -155,13 +165,26 @@ pub async fn image_verify(
     };
     let data_uri = format!("data:{};base64,{}", mime, b64);
 
+    call_vision_model(&data_uri, prompt, lm_studio_url, model, 300).await
+}
+
+/// POST a vision request (text prompt + one image as a data URI) to LM Studio's
+/// OpenAI-compatible endpoint and return the model's text. Falls back to the
+/// reasoning channel if a reasoning model returned no plain content.
+async fn call_vision_model(
+    data_uri: &str,
+    prompt: &str,
+    lm_studio_url: &str,
+    model: &str,
+    max_tokens: u32,
+) -> Result<String> {
     let body = json!({
         "model": model,
         "messages": [{ "role": "user", "content": [
             { "type": "text", "text": prompt },
             { "type": "image_url", "image_url": { "url": data_uri } }
         ]}],
-        "max_tokens": 300
+        "max_tokens": max_tokens
     });
 
     let client = reqwest::Client::new();
@@ -185,6 +208,164 @@ pub async fn image_verify(
     if result.is_empty() && !reasoning.is_empty() { Ok(reasoning.to_string()) }
     else if !result.is_empty() { Ok(result.to_string()) }
     else { Ok("(no response from vision model)".to_string()) }
+}
+
+// ── image_autotag ──────────────────────────────────────────────────────────────
+
+/// Caption every image in a folder for LoRA/SD training, writing a `<name>.txt`
+/// sidecar next to each one (the kohya caption convention).
+///
+/// `style` is "tags" (comma-separated booru-style tags) or "caption" (one
+/// sentence). `trigger`, if non-empty, is prepended to every line — the standard
+/// way to bind a concept to a token. Images are downscaled before tagging (full
+/// resolution isn't needed and it speeds up inference). Existing `.txt` files are
+/// skipped unless `overwrite` is set.
+pub async fn image_autotag(
+    dir: &str,
+    style: &str,
+    trigger: &str,
+    recursive: bool,
+    overwrite: bool,
+    lm_studio_url: &str,
+    model: &str,
+) -> Result<String> {
+    let root = Path::new(dir);
+    if !root.is_dir() {
+        return Err(anyhow::anyhow!("image_autotag: '{}' is not a directory", dir));
+    }
+
+    let tags_mode = !style.eq_ignore_ascii_case("caption");
+    let prompt = if tags_mode {
+        "List 15-25 short descriptive tags for this image as a single comma-separated line. \
+         Cover the subject, appearance, hair, clothing, expression, pose, background, and art style. \
+         Output ONLY the comma-separated tags — no preamble, no numbering, no sentences."
+    } else {
+        "Write one concise descriptive sentence captioning this image (subject, appearance, setting). \
+         Output only the caption, no preamble."
+    };
+
+    let mut paths = Vec::new();
+    crate::tools::image_curate::collect_images(root, recursive, &mut paths);
+    if paths.is_empty() {
+        return Ok(format!("No images found in {}", dir));
+    }
+
+    let mut tagged = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+    let mut sample: Option<String> = None;
+
+    for path in &paths {
+        let sidecar = path.with_extension("txt");
+        if sidecar.exists() && !overwrite {
+            skipped += 1;
+            continue;
+        }
+
+        let data_uri = match load_resize_data_uri(path, 1024) {
+            Ok(u) => u,
+            Err(_) => { failed += 1; continue; }
+        };
+
+        // Per-image timeout so one slow/hung inference can't stall the batch.
+        let call = call_vision_model(&data_uri, prompt, lm_studio_url, model, 200);
+        let raw = match tokio::time::timeout(std::time::Duration::from_secs(120), call).await {
+            Ok(Ok(text)) => text,
+            _ => { failed += 1; continue; }
+        };
+
+        let line = clean_caption(&raw, trigger, tags_mode);
+        if line.is_empty() || raw.starts_with("(no response") {
+            failed += 1;
+            continue;
+        }
+
+        if std::fs::write(&sidecar, &line).is_ok() {
+            tagged += 1;
+            if sample.is_none() {
+                sample = Some(format!("{} → {}", file_stem(path), line));
+            }
+        } else {
+            failed += 1;
+        }
+    }
+
+    let mut report = format!(
+        "Auto-tagged {} image(s) in {}{} ({} style).\n  written: {}  skipped (existing): {}  failed: {}",
+        paths.len(), dir, if recursive { " (recursive)" } else { "" },
+        if tags_mode { "tags" } else { "caption" },
+        tagged, skipped, failed
+    );
+    if let Some(s) = sample {
+        report.push_str(&format!("\n  e.g. {}", s));
+    }
+    Ok(report)
+}
+
+/// Load an image, downscale so its longest side is at most `max_dim`, and return
+/// a PNG data URI suitable for an OpenAI-style image_url field.
+fn load_resize_data_uri(path: &Path, max_dim: u32) -> Result<String> {
+    let img = image::open(path).map_err(|e| anyhow::anyhow!("decode failed: {}", e))?;
+    let (w, h) = {
+        use image::GenericImageView;
+        img.dimensions()
+    };
+    let img = if w.max(h) > max_dim {
+        img.resize(max_dim, max_dim, image::imageops::FilterType::Lanczos3)
+    } else {
+        img
+    };
+    let mut buf = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+        .map_err(|e| anyhow::anyhow!("encode failed: {}", e))?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
+    Ok(format!("data:image/png;base64,{}", b64))
+}
+
+/// Normalise raw model output into a single caption line and prepend the trigger.
+fn clean_caption(raw: &str, trigger: &str, tags_mode: bool) -> String {
+    let mut text = raw.trim().to_string();
+
+    // Drop a common leading label like "Tags:" / "Caption:".
+    for prefix in ["tags:", "caption:", "answer:"] {
+        if text.to_lowercase().starts_with(prefix) {
+            text = text[prefix.len()..].trim().to_string();
+        }
+    }
+    // Strip surrounding quotes/backticks.
+    text = text.trim_matches(|c| c == '"' || c == '\'' || c == '`').to_string();
+
+    let body = if tags_mode {
+        // Flatten any newlines/bullets into comma-separated tags, then tidy.
+        let joined = text
+            .lines()
+            .map(|l| l.trim().trim_start_matches(['-', '*', '•']).trim())
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ");
+        joined
+            .split(',')
+            .map(|t| t.trim())
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        // Caption: collapse to a single line.
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    };
+
+    let trigger = trigger.trim();
+    if trigger.is_empty() {
+        body
+    } else if body.is_empty() {
+        trigger.to_string()
+    } else {
+        format!("{}, {}", trigger, body)
+    }
+}
+
+fn file_stem(p: &Path) -> String {
+    p.file_stem().and_then(|s| s.to_str()).unwrap_or("?").to_string()
 }
 
 // ── image_download ────────────────────────────────────────────────────────────
@@ -349,7 +530,7 @@ pub async fn image_download(query: &str, count: usize, dest_dir: &str, log_dir: 
 // ── Scrapers ──────────────────────────────────────────────────────────────────
 
 async fn scrape_bing_images(client: &reqwest::Client, query: &str, max: usize) -> ScrapeResult {
-    let encoded = urlencoded(query);
+    let encoded = urlencoding::encode(query);
     let url = format!(
         "https://www.bing.com/images/search?q={}&count=50&first=1&safeSearch=Off&adlt=off&mkt=en-US",
         encoded
@@ -390,7 +571,7 @@ async fn scrape_bing_images(client: &reqwest::Client, query: &str, max: usize) -
 }
 
 async fn scrape_duckduckgo_images(client: &reqwest::Client, query: &str, max: usize) -> ScrapeResult {
-    let encoded = urlencoded(query);
+    let encoded = urlencoding::encode(query);
 
     // Step 1: Pre-seed safe search OFF in cookie store by visiting DDG with kp=-2
     // This causes DDG to set the safe search preference cookie in our cookie jar
@@ -470,7 +651,7 @@ async fn scrape_duckduckgo_images(client: &reqwest::Client, query: &str, max: us
 }
 
 async fn scrape_yandex_images(client: &reqwest::Client, query: &str, max: usize) -> ScrapeResult {
-    let encoded = urlencoded(query);
+    let encoded = urlencoding::encode(query);
     let url = format!(
         "https://yandex.com/images/search?text={}&nomisspell=1&numdoc=50&filter=0&itype=photo",
         encoded
@@ -502,7 +683,9 @@ async fn scrape_yandex_images(client: &reqwest::Client, query: &str, max: usize)
                     extract_between(&html, "img_url=http", "&", max, &mut encoded_urls);
                     for u in &encoded_urls {
                         let full = format!("http{}", u);
-                        let decoded = urldecode(&full);
+                        let decoded = urlencoding::decode(&full)
+                            .map(|c| c.into_owned())
+                            .unwrap_or(full);
                         if decoded.len() > 12 { urls.push(decoded); }
                     }
                 }
@@ -533,7 +716,7 @@ async fn scrape_yandex_images(client: &reqwest::Client, query: &str, max: usize)
 }
 
 async fn scrape_qwant_images(client: &reqwest::Client, query: &str, max: usize) -> ScrapeResult {
-    let encoded = urlencoded(query);
+    let encoded = urlencoding::encode(query);
     let url = format!(
         "https://api.qwant.com/v3/search/images?q={}&count=50&offset=0&safesearch=0&locale=en_US&tgp=2",
         encoded
@@ -574,7 +757,7 @@ async fn scrape_qwant_images(client: &reqwest::Client, query: &str, max: usize) 
 }
 
 async fn scrape_searxng_images(client: &reqwest::Client, query: &str, max: usize) -> ScrapeResult {
-    let encoded = urlencoded(query);
+    let encoded = urlencoding::encode(query);
     let url = format!(
         "https://search.hbubli.cc/search?q={}&category=images&format=json&safesearch=0&pageno=1",
         encoded
@@ -621,7 +804,7 @@ async fn scrape_searxng_images(client: &reqwest::Client, query: &str, max: usize
 }
 
 async fn scrape_brave_images(client: &reqwest::Client, query: &str, max: usize) -> ScrapeResult {
-    let encoded = urlencoded(query);
+    let encoded = urlencoding::encode(query);
     let url = format!(
         "https://search.brave.com/images?q={}&safesearch=off&source=web",
         encoded
@@ -729,42 +912,6 @@ fn validate_image_bytes(bytes: &[u8], _ct_ext: Option<&'static str>, url: &str) 
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn urldecode(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '%' {
-            let hex: String = chars.by_ref().take(2).collect();
-            if hex.len() == 2 {
-                if let Ok(byte) = u8::from_str_radix(&hex, 16) {
-                    result.push(byte as char);
-                } else {
-                    result.push('%');
-                    result.push_str(&hex);
-                }
-            } else {
-                result.push('%');
-                result.push_str(&hex);
-            }
-        } else {
-            result.push(c);
-        }
-    }
-    result
-}
-
-fn urlencoded(s: &str) -> String {
-    s.chars().flat_map(|c| {
-        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
-            vec![c]
-        } else if c == ' ' {
-            vec!['%', '2', '0']
-        } else {
-            format!("%{:02X}", c as u32).chars().collect()
-        }
-    }).collect()
-}
-
 fn extract_between(haystack: &str, needle: &str, end_marker: &str, max: usize, out: &mut Vec<String>) {
     let mut pos = 0;
     while out.len() < max {
@@ -831,18 +978,56 @@ fn sanitize_filename(name: &str) -> String {
         .to_string()
 }
 
-fn base64_encode(data: &[u8]) -> String {
-    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut r = String::with_capacity((data.len() + 2) / 3 * 4);
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
-        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
-        let t = (b0 << 16) | (b1 << 8) | b2;
-        r.push(CHARS[((t >> 18) & 0x3F) as usize] as char);
-        r.push(CHARS[((t >> 12) & 0x3F) as usize] as char);
-        r.push(if chunk.len() > 1 { CHARS[((t >> 6) & 0x3F) as usize] as char } else { '=' });
-        r.push(if chunk.len() > 2 { CHARS[(t & 0x3F) as usize] as char } else { '=' });
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn clean_tags_flattens_and_prepends_trigger() {
+        let raw = "Tags: red hair, blue eyes\n- smiling\n- school uniform";
+        let out = clean_caption(raw, "alice", true);
+        assert_eq!(out, "alice, red hair, blue eyes, smiling, school uniform");
     }
-    r
+
+    #[test]
+    fn clean_tags_dedupes_whitespace_and_commas() {
+        let out = clean_caption("a,,  b , ,c", "", true);
+        assert_eq!(out, "a, b, c");
+    }
+
+    #[test]
+    fn clean_caption_collapses_to_one_line() {
+        let raw = "\"A woman with\n   red hair.\"";
+        let out = clean_caption(raw, "", false);
+        assert_eq!(out, "A woman with red hair.");
+    }
+
+    #[test]
+    fn clean_caption_prepends_trigger_for_caption() {
+        let out = clean_caption("standing in a field", "bob", false);
+        assert_eq!(out, "bob, standing in a field");
+    }
+
+    #[test]
+    fn load_resize_produces_png_data_uri_and_downscales() {
+        use image::{Rgb, RgbImage};
+        let dir = std::env::temp_dir().join(format!("bow_autotag_{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("big.png");
+        RgbImage::from_pixel(2000, 1000, Rgb([10, 20, 30])).save(&p).unwrap();
+
+        let uri = load_resize_data_uri(Path::new(&p), 1024).unwrap();
+        assert!(uri.starts_with("data:image/png;base64,"), "uri: {}", &uri[..40.min(uri.len())]);
+
+        // Decode the embedded PNG and confirm the longest side was capped.
+        let b64 = uri.strip_prefix("data:image/png;base64,").unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+        let decoded = image::load_from_memory(&bytes).unwrap();
+        use image::GenericImageView;
+        assert_eq!(decoded.dimensions(), (1024, 512));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
+

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::io::Write;
 use std::path::Path;
 use std::fs;
 
@@ -27,6 +28,42 @@ pub fn file_list(dir: &str) -> Result<String> {
     }
     lines.sort();
     Ok(format!("{} ({} entries):\n{}", dir, lines.len(), lines.join("\n")))
+}
+
+pub async fn file_download(url: &str, dest_path: &str) -> Result<String> {
+    let p = Path::new(dest_path);
+    if let Some(parent) = p.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("Failed to create directories for '{}': {}", dest_path, e))?;
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .build()?;
+
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("file_download: request failed for '{}': {}", url, e))?;
+
+    if !resp.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "file_download: server returned {} for '{}'", resp.status(), url
+        ));
+    }
+
+    let bytes = resp.bytes().await
+        .map_err(|e| anyhow::anyhow!("file_download: failed to read body: {}", e))?;
+
+    let mut file = fs::File::create(p)
+        .map_err(|e| anyhow::anyhow!("file_download: could not create '{}': {}", dest_path, e))?;
+    file.write_all(&bytes)
+        .map_err(|e| anyhow::anyhow!("file_download: write failed for '{}': {}", dest_path, e))?;
+
+    Ok(format!("Downloaded {} bytes → {}", bytes.len(), dest_path))
 }
 
 pub fn file_write(path: &str, content: &str) -> Result<String> {

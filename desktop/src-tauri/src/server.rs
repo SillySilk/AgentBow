@@ -47,12 +47,19 @@ pub async fn start(state: AppState) -> Result<()> {
     let config = Arc::new(state.config);
     let shell_session = state.shell_session;
 
+    // Connect to configured MCP servers once, up front. Shared across all
+    // WebSocket connections (single-user desktop app).
+    let mcp = crate::tools::mcp::McpManager::load(
+        &config.workspace_root.to_string_lossy(),
+    ).await;
+
     while let Ok((stream, peer)) = listener.accept().await {
         info!("New connection from {}", peer);
         let config = config.clone();
         let shell_session = shell_session.clone();
+        let mcp = mcp.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, config, shell_session).await {
+            if let Err(e) = handle_connection(stream, config, shell_session, mcp).await {
                 error!("Connection error from {}: {}", peer, e);
             }
         });
@@ -65,6 +72,7 @@ async fn handle_connection(
     stream: TcpStream,
     config: Arc<crate::state::Config>,
     shell_session: crate::tools::shell_session::ShellSessionManager,
+    mcp: crate::tools::mcp::McpManager,
 ) -> Result<()> {
     let ws_stream = tokio_tungstenite::accept_async(stream).await?;
     let (mut ws_sink, mut ws_source) = ws_stream.split();
@@ -85,6 +93,10 @@ async fn handle_connection(
     let mut history: Vec<OaiMessage> = Vec::new();
     let mut page_ctx: Option<PageContext> = None;
     let interrupt_flag = Arc::new(AtomicBool::new(false));
+    // Guards against two agent runs racing on the same `history`. Each run
+    // snapshots history and writes it back on completion; concurrent runs would
+    // silently clobber each other (last writer wins).
+    let busy = Arc::new(AtomicBool::new(false));
 
     let (hist_tx, mut hist_rx) = mpsc::channel::<Vec<OaiMessage>>(4);
 
@@ -155,8 +167,15 @@ async fn handle_connection(
                             continue;
                         }
 
+                        // Reject a second message while one is still running —
+                        // concurrent runs would corrupt the shared history.
+                        if busy.swap(true, Ordering::SeqCst) {
+                            send_json(&out_tx, json!({"type":"error","code":"busy","message":"Still working on the previous message — interrupt it first or wait for it to finish."})).await;
+                            continue;
+                        }
+
                         interrupt_flag.store(false, Ordering::Relaxed);
-                        info!("Processing: {}...", &content[..content.len().min(60)]);
+                        info!("Processing: {}...", crate::util::char_prefix(&content, 60));
 
                         let config = config.clone();
                         let ctx_snapshot = page_ctx.clone();
@@ -166,6 +185,8 @@ async fn handle_connection(
                         let htx = hist_tx.clone();
                         let shell_session_clone = shell_session.clone();
                         let browser_clone = browser.clone();
+                        let mcp_clone = mcp.clone();
+                        let busy_clone = busy.clone();
 
                         tokio::spawn(async move {
                             let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(128);
@@ -181,13 +202,15 @@ async fn handle_connection(
                             if let Err(e) = local_llm::run_local_chat(
                                 config, &mut hist, content, message_id,
                                 ctx_snapshot, interrupt, event_tx, shell_session_clone,
-                                browser_clone,
+                                browser_clone, mcp_clone,
                             ).await {
                                 error!("local_llm: {}", e);
                             }
 
                             fwd.await.ok();
                             let _ = htx.send(hist).await;
+                            // Release the guard so the next message can run.
+                            busy_clone.store(false, Ordering::SeqCst);
                         });
                     }
 

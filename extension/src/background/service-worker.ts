@@ -343,6 +343,24 @@ async function handleBrowserCmd(msg: any) {
       if (!tabs[0]) throw new Error("No active tab");
       result = { url: tabs[0].url, title: tabs[0].title, id: tabs[0].id };
     }
+    else if (cmd === "get_bookmarks") {
+      const tree = await chrome.bookmarks.getTree();
+      const flat: { title: string; url: string; folder: string }[] = [];
+      const walk = (nodes: chrome.bookmarks.BookmarkTreeNode[], folder: string) => {
+        for (const node of nodes) {
+          if (node.url) {
+            flat.push({ title: node.title, url: node.url, folder });
+          } else if (node.children) {
+            walk(node.children, folder ? `${folder}/${node.title}` : node.title);
+          }
+        }
+      };
+      // Skip the invisible root node, start from its children
+      for (const root of tree) {
+        if (root.children) walk(root.children, "");
+      }
+      result = { bookmarks: flat, total: flat.length };
+    }
 
     ws?.send(JSON.stringify({ type: "browser_result", request_id, ...result }));
   } catch (e: any) {

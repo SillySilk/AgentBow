@@ -4,6 +4,7 @@ mod server;
 mod state;
 mod tools;
 mod types;
+mod util;
 
 use state::{AppState, Config};
 use tauri::{

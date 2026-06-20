@@ -1,0 +1,40 @@
+{
+  "_comment": "Bow MCP server config. Claude-Desktop-compatible schema. Bow connects to every server where \"disabled\" is false at startup and exposes its tools to the model as mcp__<server>__<tool>. Edit and restart Bow to apply. JSON has no comments, so see README.md for the annotated catalog and which extra servers are worth adding.",
+
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "C:\\AI\\workspace"],
+      "env": {},
+      "disabled": false
+    },
+
+    "sequential-thinking": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"],
+      "env": {},
+      "disabled": false
+    },
+
+    "git": {
+      "command": "uvx",
+      "args": ["mcp-server-git", "--repository", "C:\\AI\\workspace"],
+      "env": {},
+      "disabled": true
+    },
+
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "" },
+      "disabled": true
+    },
+
+    "playwright": {
+      "command": "npx",
+      "args": ["-y", "@playwright/mcp@latest"],
+      "env": {},
+      "disabled": true
+    }
+  }
+}
