@@ -261,7 +261,8 @@ pub async fn run_local_chat(
             std::sync::Arc::new(std::sync::Mutex::new(conn))
         }
     };
-    let tools = openai_tool_schemas(mcp.schemas());
+    let mcp_schemas = mcp.schemas();
+    let tools = openai_tool_schemas(&mcp_schemas);
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))

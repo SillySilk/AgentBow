@@ -47,11 +47,12 @@ pub async fn start(state: AppState) -> Result<()> {
     let config = Arc::new(state.config);
     let shell_session = state.shell_session;
 
-    // Connect to configured MCP servers once, up front. Shared across all
-    // WebSocket connections (single-user desktop app).
-    let mcp = crate::tools::mcp::McpManager::load(
-        &config.workspace_root.to_string_lossy(),
-    ).await;
+    // Connect to configured MCP servers in the background so the WS server
+    // starts accepting connections immediately. The manager handle is shared
+    // across all WebSocket connections and will be populated when ready.
+    let mcp = crate::tools::mcp::McpManager::load_in_background(
+        config.workspace_root.to_string_lossy().to_string(),
+    );
 
     while let Ok((stream, peer)) = listener.accept().await {
         info!("New connection from {}", peer);
