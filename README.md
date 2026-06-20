@@ -1,7 +1,7 @@
 # Bow
 
 A local, privacy-respecting AI agent for Windows. Bow runs your own model in
-**LM Studio** and gives it real tools: files, shell, web search, full Chrome
+**LM Studio** and gives it real tools: files, shell, web search, full browser
 control, image scraping + vision, episodic memory, and — via **MCP** — the
 entire Model Context Protocol ecosystem.
 
@@ -12,30 +12,36 @@ against your local LM Studio server.
 
 ## Architecture
 
-Bow is two pieces that talk over a localhost WebSocket:
+Bow is a standalone Rust binary that serves a built-in web UI and handles all
+agent logic on one local port:
 
 ```
-┌─────────────────────────┐         ws://127.0.0.1:9357        ┌──────────────────────┐
-│  Chrome extension       │ ───────────────────────────────── │  Desktop app (Tauri) │
-│  • side-panel chat UI   │   user messages / agent events     │  • Rust agent loop   │
-│  • page context         │ ◀──────────────────────────────── │  • talks to LM Studio│
-│  • executes browser cmds│   browser commands / results       │  • runs all tools    │
-└─────────────────────────┘                                    └──────────┬───────────┘
-                                                                          │ OpenAI-compatible
-                                                                          ▼ /v1/chat/completions
-                                                                ┌──────────────────────┐
-                                                                │  LM Studio (local)   │
-                                                                └──────────────────────┘
+┌─────────────────────────┐         http://127.0.0.1:9357
+│  Browser (any)          │ ─────────────────────────────┐
+│  • Bow web UI (SPA)     │   REST + WebSocket           │
+│  • chat interface       │ ◀────────────────────────────┤
+└─────────────────────────┘                              │
+                                             ┌───────────┴──────────┐
+                                             │  bow-desktop (Rust)  │
+                                             │  • axum web server   │
+                                             │  • agent loop        │
+                                             │  • talks to LM Studio│
+                                             │  • runs all tools    │
+                                             │  • system tray icon  │
+                                             └───────────┬──────────┘
+                                                         │ OpenAI-compatible
+                                                         ▼ /v1/chat/completions
+                                               ┌──────────────────────┐
+                                               │  LM Studio (local)   │
+                                               └──────────────────────┘
 ```
 
 - **`desktop/src-tauri/`** — the Rust brain. Streaming agent loop with planning,
   self-verification, Reflexion on failure, observation masking, parallel tool
-  dispatch, and SQLite (FTS5) episodic memory. This is where the work happens.
-- **`desktop/src/`** — minimal Tauri/React status window; the app lives in the
-  tray.
-- **`extension/`** — Chrome MV3 extension: the chat sidebar and the bridge that
-  lets the agent drive your real browser (tabs, clicks, forms, cookies,
-  screenshots, bookmarks).
+  dispatch, and SQLite (FTS5) episodic memory. Serves the web UI as static files
+  and exposes REST + WebSocket on `127.0.0.1:9357`.
+- **`desktop/webapp/`** — React/TypeScript chat UI, built to `desktop/webapp/dist`
+  and served directly by the backend.
 
 ### The agent loop (high level)
 
@@ -57,8 +63,8 @@ Bow is two pieces that talk over a localhost WebSocket:
 - **Windows 10/11**
 - **[LM Studio](https://lmstudio.ai/)** running a tool-capable model, server
   started on `http://localhost:1234`. A vision-capable model is needed for
-  `image_verify`/`browser_analyze_page` screenshots.
-- **Rust** (stable) + the Tauri prerequisites, and **Node.js** for the extension.
+  `image_verify` screenshots.
+- **Rust** (stable) and **Node.js** for building.
 - *(Optional)* **Node/npx** and/or **uv/uvx** if you want to run MCP servers.
 
 ### Configure
@@ -68,7 +74,7 @@ are actually read:
 
 | Key | Purpose |
 |---|---|
-| `BOW_SECRET` | Shared secret the extension uses to authenticate. **Required.** |
+| `BOW_SECRET` | Auth token the web UI uses. **Required.** |
 | `LM_STUDIO_URL` | LM Studio server URL (default `http://localhost:1234`). |
 | `LM_STUDIO_MODEL` | Model id as shown in LM Studio. |
 | `LM_STUDIO_REASONING_EFFORT` | `low`/`medium`/`high`, or blank. |
@@ -78,17 +84,19 @@ are actually read:
 | `TAVILY_API_KEY` | For `web_search` / `web_search_deep`. |
 | `SEARXNG_URL` | Local SearXNG instance for `searxng_search` (optional). |
 
-### Build & run
+## Run
 
-```bat
-:: from the project root
-Rebuild All.bat        :: builds desktop + extension
-Launch Bow.bat         :: starts the tray app
-```
+1. Ensure `desktop/.env` is configured (LM Studio URL/model, BOW_SECRET, etc.).
+2. Double-click `bow.bat` in the project root.
+3. Your browser opens to `http://127.0.0.1:9357` (Bow Image Studio).
 
-Then load `extension/dist` as an unpacked extension in Chrome
-(`chrome://extensions` → Developer mode → Load unpacked), open the side panel,
-and paste your `BOW_SECRET` into the extension's settings to connect.
+There is no browser extension — Bow runs as a standalone local web app.
+
+`bow.bat` does the following automatically:
+- Builds the web UI (`npm run build` in `desktop/webapp`)
+- Builds the backend (`cargo build` in `desktop/src-tauri`)
+- Copies built web assets next to the exe (`target/debug/web/`)
+- Launches `bow-desktop.exe` (tray icon appears)
 
 ---
 
@@ -164,7 +172,7 @@ sandboxed extras). Enabled-by-default ones need no API keys.
 | **sequential-thinking** (official) | `npx -y @modelcontextprotocol/server-sequential-thinking` | Structured step-by-step reasoning scratchpad | ✅ on |
 | **git** (official) | `uvx mcp-server-git --repository <dir>` | Local repo: status, diff, log, commit, branches | off (needs uv) |
 | **github** (official) | `npx -y @modelcontextprotocol/server-github` | Remote repos, issues, PRs, code search | off (needs `GITHUB_PERSONAL_ACCESS_TOKEN`) |
-| **playwright** (Microsoft) | `npx -y @playwright/mcp@latest` | Headless browser automation independent of Chrome | off (downloads browsers) |
+| **playwright** (Microsoft) | `npx -y @playwright/mcp@latest` | Headless browser automation | off (downloads browsers) |
 
 Other solid options worth adding for specific needs: **sqlite** (query local
 DBs), **time** (`uvx mcp-server-time`), **fetch** (`uvx mcp-server-fetch`).
@@ -178,12 +186,11 @@ restart Bow.
 
 Bow is an intentionally unrestricted local agent. Be aware:
 
-- The agent can read/write files, run PowerShell, and drive your logged-in
-  browser. Guardrails block a small set of catastrophic shell/path patterns
+- The agent can read/write files, run PowerShell, and drive your browser.
+  Guardrails block a small set of catastrophic shell/path patterns
   (`tools/mod.rs`), but it is otherwise unsandboxed.
 - Saved logins are read from `credentials.json` in plaintext and typed into
   forms. Consider moving these to Windows Credential Manager / DPAPI.
-- `browser_exec_js` runs arbitrary JS in the active tab; the extension has
-  `<all_urls>` host permissions.
+- `browser_exec_js` runs arbitrary JS in the active tab via the browser bridge.
 
 Run Bow only with models and tasks you trust.
