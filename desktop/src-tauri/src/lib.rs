@@ -14,6 +14,7 @@ use tauri::{
     Manager, WindowEvent,
 };
 use tracing::info;
+use axum;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -51,11 +52,22 @@ pub fn run() {
 
     tauri::Builder::default()
         .setup(move |app| {
-            // Start WebSocket server
-            let ws_state = app_state.clone();
+            // Start the axum HTTP+WebSocket server.
+            // build_router wires up /api/health, /api/config, /ws, and the SPA fallback.
+            // The McpManager is loaded in the background inside build_router via
+            // ws_upgrade → run_ws (connections load on first connect).
+            let http_state = app_state.clone();
+            let mcp = crate::tools::mcp::McpManager::load_in_background(
+                http_state.config.workspace_root.to_string_lossy().to_string(),
+            );
             tauri::async_runtime::spawn(async move {
-                if let Err(e) = server::start(ws_state).await {
-                    eprintln!("WebSocket server error: {}", e);
+                let addr = std::net::SocketAddr::from(([127, 0, 0, 1], http_state.config.ws_port));
+                let router = http::build_router(http_state, mcp, std::path::PathBuf::from("web"));
+                let listener = tokio::net::TcpListener::bind(addr).await
+                    .expect("Failed to bind HTTP server");
+                info!("HTTP+WS server listening on http://{}", addr);
+                if let Err(e) = axum::serve(listener, router).await {
+                    eprintln!("HTTP server error: {}", e);
                 }
             });
 

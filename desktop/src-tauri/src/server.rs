@@ -1,16 +1,14 @@
 use crate::local_llm::{self, OaiMessage};
 use crate::types::{AgentEvent, PageContext};
 use crate::auth;
-use crate::state::AppState;
 use anyhow::Result;
+use axum::extract::ws::{Message as WsMessage, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{error, info, warn};
 
 #[derive(Deserialize, Debug)]
@@ -28,55 +26,25 @@ enum InboundMsg {
     Interrupt { session_id: String },
 }
 
-pub async fn start(state: AppState) -> Result<()> {
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], state.config.ws_port));
+/// Classify a raw inbound WS text frame before full deserialization.
+/// Returns None for control frames the loop should skip (ping/browser_result).
+#[derive(Debug, PartialEq)]
+pub enum Inbound { Skip, Process }
 
-    let socket = socket2::Socket::new(
-        socket2::Domain::IPV4,
-        socket2::Type::STREAM,
-        Some(socket2::Protocol::TCP),
-    )?;
-    socket.set_reuse_address(true)?;
-    socket.bind(&addr.into())?;
-    socket.listen(128)?;
-    socket.set_nonblocking(true)?;
-    let std_listener: std::net::TcpListener = socket.into();
-    let listener = TcpListener::from_std(std_listener)?;
-    info!("WebSocket server listening on ws://{}", addr);
-
-    let config = Arc::new(state.config);
-    let shell_session = state.shell_session;
-
-    // Connect to configured MCP servers in the background so the WS server
-    // starts accepting connections immediately. The manager handle is shared
-    // across all WebSocket connections and will be populated when ready.
-    let mcp = crate::tools::mcp::McpManager::load_in_background(
-        config.workspace_root.to_string_lossy().to_string(),
-    );
-
-    while let Ok((stream, peer)) = listener.accept().await {
-        info!("New connection from {}", peer);
-        let config = config.clone();
-        let shell_session = shell_session.clone();
-        let mcp = mcp.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, config, shell_session, mcp).await {
-                error!("Connection error from {}: {}", peer, e);
-            }
-        });
+pub fn classify(raw: &serde_json::Value) -> Inbound {
+    match raw["type"].as_str() {
+        Some("ping") | Some("browser_result") => Inbound::Skip,
+        _ => Inbound::Process,
     }
-
-    Ok(())
 }
 
-async fn handle_connection(
-    stream: TcpStream,
+pub async fn run_ws(
+    socket: WebSocket,
     config: Arc<crate::state::Config>,
     shell_session: crate::tools::shell_session::ShellSessionManager,
     mcp: crate::tools::mcp::McpManager,
 ) -> Result<()> {
-    let ws_stream = tokio_tungstenite::accept_async(stream).await?;
-    let (mut ws_sink, mut ws_source) = ws_stream.split();
+    let (mut ws_sink, mut ws_source) = socket.split();
 
     let (out_tx, mut out_rx) = mpsc::channel::<String>(128);
 
@@ -123,15 +91,14 @@ async fn handle_connection(
                     }
                 };
 
-                if raw["type"].as_str() == Some("ping") {
-                    continue;
-                }
-
-                if raw["type"].as_str() == Some("browser_result") {
-                    if let Some(request_id) = raw["request_id"].as_str() {
-                        let mut pending = browser.pending.lock().await;
-                        if let Some(tx) = pending.remove(request_id) {
-                            let _ = tx.send(raw.clone());
+                if classify(&raw) == Inbound::Skip {
+                    // Handle browser_result pending-resolution before skipping
+                    if raw["type"].as_str() == Some("browser_result") {
+                        if let Some(request_id) = raw["request_id"].as_str() {
+                            let mut pending = browser.pending.lock().await;
+                            if let Some(tx) = pending.remove(request_id) {
+                                let _ = tx.send(raw.clone());
+                            }
                         }
                     }
                     continue;
@@ -249,5 +216,19 @@ fn agent_event_to_json(evt: AgentEvent) -> Value {
 async fn send_json(tx: &mpsc::Sender<String>, value: Value) {
     if let Ok(s) = serde_json::to_string(&value) {
         let _ = tx.send(s).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn ping_is_skipped() {
+        assert_eq!(classify(&json!({"type":"ping"})), Inbound::Skip);
+    }
+    #[test]
+    fn user_message_is_processed() {
+        assert_eq!(classify(&json!({"type":"user_message","content":"hi"})), Inbound::Process);
     }
 }
