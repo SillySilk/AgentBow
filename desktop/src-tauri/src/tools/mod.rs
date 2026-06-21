@@ -1,4 +1,5 @@
 pub mod browser;
+pub mod controlled_browser;
 pub mod file_ops;
 pub mod image_curate;
 pub mod image_search;

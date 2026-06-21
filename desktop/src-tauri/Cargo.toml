@@ -36,3 +36,4 @@ tower-http = { version = "0.6", features = ["fs", "trace"] }
 tower = "0.5"
 tray-icon = "0.19"
 tao = "0.30"
+chromiumoxide = "0.9.1"
