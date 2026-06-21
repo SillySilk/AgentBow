@@ -39,12 +39,17 @@ export function applyEvent(s: ScrapeState, m: ScrapeEventMsg): ScrapeState {
   }
 }
 
+export function isBrowserOpened(m: any): boolean { return m?.type === "browser_opened"; }
+
 interface Store {
   status: string;
   scrape: ScrapeState;
   lastDestDir: string;
+  browserUrl?: string;
   connect: () => void;
   startScrape: (a: { query: string; count: number; destDir: string; sources: string[] }) => void;
+  openBrowser: (url: string) => void;
+  pageScrape: (a: { count: number; destDir: string; scrolls: number }) => void;
   _ws?: WebSocket;
 }
 
@@ -67,6 +72,7 @@ export const useStore = create<Store>((set, get) => ({
         if (m.type === "auth_ok") set({ status: "connected" });
         else if (m.type === "auth_error") set({ status: "auth error: " + (m.message ?? "") });
         else if (m.type === "scrape_event") set((st) => ({ scrape: applyEvent(st.scrape, m) }));
+        else if (isBrowserOpened(m)) set({ browserUrl: m.url });
       };
       ws.onclose = () => set({ status: "disconnected" });
       ws.onerror = () => set({ status: "error" });
@@ -78,5 +84,15 @@ export const useStore = create<Store>((set, get) => ({
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     set({ scrape: { ...initialScrapeState(), running: true, target: a.count }, lastDestDir: a.destDir });
     ws.send(JSON.stringify({ type: "scrape_request", query: a.query, count: a.count, dest_dir: a.destDir, sources: a.sources }));
+  },
+  openBrowser: (url: string) => {
+    const ws = get()._ws;
+    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "browser_open", url }));
+  },
+  pageScrape: ({ count, destDir, scrolls }: { count: number; destDir: string; scrolls: number }) => {
+    const ws = get()._ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    set({ scrape: { ...initialScrapeState(), running: true, target: count }, lastDestDir: destDir });
+    ws.send(JSON.stringify({ type: "page_scrape_request", count, dest_dir: destDir, scrolls }));
   },
 }));

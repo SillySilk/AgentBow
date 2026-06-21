@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { applyEvent, initialScrapeState } from "./store";
+import { applyEvent, initialScrapeState, isBrowserOpened } from "./store";
 
 describe("applyEvent", () => {
   it("accumulates downloaded files and tracks done count", () => {
@@ -17,5 +17,12 @@ describe("applyEvent", () => {
     s = applyEvent(s, { type: "scrape_event", kind: "done", downloaded: ["a"], log_note: "Log: x" });
     expect(s.finished).toBe(true);
     expect(s.running).toBe(false);
+  });
+});
+
+describe("isBrowserOpened", () => {
+  it("detects browser_opened", () => {
+    expect(isBrowserOpened({ type: "browser_opened", url: "https://x" })).toBe(true);
+    expect(isBrowserOpened({ type: "scrape_event", kind: "done", downloaded: [], log_note: "" })).toBe(false);
   });
 });

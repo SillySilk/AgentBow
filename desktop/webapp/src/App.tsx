@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { useStore } from "./store";
 import SearchPanel from "./components/SearchPanel";
+import PageScrapePanel from "./components/PageScrapePanel";
 import ProgressLog from "./components/ProgressLog";
 import CurationGrid from "./components/CurationGrid";
 
@@ -13,6 +14,7 @@ export default function App() {
       <h1 style={{ color: "#e94560", marginTop: 0 }}>Bow Image Studio</h1>
       <p style={{ marginTop: -8, fontSize: 13 }}>Backend: {status}</p>
       <SearchPanel />
+      <PageScrapePanel />
       <ProgressLog />
       <CurationGrid />
     </div>
