@@ -97,7 +97,7 @@ impl ScrapeEvent {
 
 // ── Session log ───────────────────────────────────────────────────────────────
 
-struct SessionLog {
+pub struct SessionLog {
     path: String,
     lines: Vec<String>,
 }
@@ -485,92 +485,7 @@ pub async fn image_download(
     }
 
     // ── Download phase ────────────────────────────────────────────────────────
-    log.push(format!("-- Downloading (target: {}, pool: {}) --", count, candidates.len()));
-    emit(ScrapeEvent::Phase { label: "Downloading".into() });
-
-    let sanitized = sanitize_filename(query);
-    let dest_base = dest_dir.trim_end_matches(['\\', '/']).to_string();
-
-    // 3 concurrent downloads — low enough to not spike RAM
-    let sem = Arc::new(Semaphore::new(3));
-    let client = Arc::new(client);
-    let mut tasks = tokio::task::JoinSet::new();
-
-    // Decode HTML entities in URLs (Bing embeds &amp; instead of & in some URLs)
-    let candidates: Vec<String> = candidates.into_iter()
-        .map(|u| u.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\""))
-        .collect();
-
-    for (i, url) in candidates.iter().enumerate() {
-        let url = url.clone();
-        let client = client.clone();
-        let sem = sem.clone();
-        let sanitized = sanitized.clone();
-        let dest_base = dest_base.clone();
-        tasks.spawn(async move {
-            let _permit = sem.acquire().await.ok()?;
-            match download_image_bytes(&client, &url).await {
-                Ok((bytes, ext)) => {
-                    let path = format!("{}\\{}_{:03}.{}", dest_base, sanitized, i + 1, ext);
-                    match std::fs::write(&path, &bytes) {
-                        Ok(_) => Some((true, url, path, String::new())),
-                        Err(e) => Some((false, url, String::new(), format!("write: {}", e))),
-                    }
-                }
-                Err(e) => Some((false, url, String::new(), e.to_string())),
-            }
-        });
-    }
-
-    let mut downloaded: Vec<String> = Vec::new();
-    let mut failures: Vec<(String, String)> = Vec::new(); // (url, reason)
-
-    while let Some(task_result) = tasks.join_next().await {
-        if let Ok(Some((ok, url, path, reason))) = task_result {
-            if ok {
-                debug!("OK  {}", path);
-                downloaded.push(path);
-                emit(ScrapeEvent::Downloaded { done: downloaded.len(), target: count, path: downloaded.last().cloned().unwrap_or_default() });
-                if downloaded.len() >= count {
-                    tasks.abort_all();
-                    break;
-                }
-            } else {
-                debug!("FAIL {} — {}", url, reason);
-                failures.push((url.clone(), reason.clone()));
-                emit(ScrapeEvent::Failed { url, reason });
-            }
-        }
-    }
-    downloaded.sort();
-
-    // Log download results
-    log.push(format!("Downloaded: {}/{}", downloaded.len(), count));
-    if !failures.is_empty() {
-        log.push(format!("Failed: {} URLs", failures.len()));
-        // Group failures by reason for readability
-        let mut reason_counts: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-        for (_, reason) in &failures {
-            // Normalise reason to a short key (first 60 chars)
-            let key = reason.chars().take(60).collect::<String>();
-            *reason_counts.entry(key).or_insert(0) += 1;
-        }
-        for (reason, count) in &reason_counts {
-            log.push(format!("  x{} — {}", count, reason));
-        }
-        // Log up to 10 specific failed URLs for targeted debugging
-        log.push("  Sample failed URLs:".to_string());
-        for (url, reason) in failures.iter().take(10) {
-            log.push(format!("    [{}] {}", reason.chars().take(40).collect::<String>(), url));
-        }
-    }
-    if !downloaded.is_empty() {
-        log.push("Files:".to_string());
-        for f in &downloaded {
-            log.push(format!("  {}", f));
-        }
-    }
+    let downloaded = download_urls_to_dir(candidates, count, dest_dir, query, &mut log, &progress).await?;
 
     let log_note = log.flush();
 
@@ -1024,6 +939,127 @@ fn is_paywalled_url(url: &str) -> bool {
     BLOCKED.iter().any(|b| url.contains(b))
 }
 
+/// HTML-entity decode, remove paywalled URLs, and order-preserving dedup.
+pub fn filter_candidates(urls: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    urls.into_iter()
+        .map(|u| u.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\""))
+        .filter(|u| !is_paywalled_url(u))
+        .filter(|u| seen.insert(u.clone()))
+        .collect()
+}
+
+/// Download a list of URLs into `dest_dir`, stopping once `count` succeed.
+/// Files are named `<name_hint>_NNN.ext` (name_hint is sanitized).
+/// Emits `Downloaded`/`Failed` events; logs results into `log`.
+/// Returns the sorted list of successfully downloaded file paths.
+pub async fn download_urls_to_dir(
+    urls: Vec<String>,
+    count: usize,
+    dest_dir: &str,
+    name_hint: &str,
+    log: &mut SessionLog,
+    progress: &Option<UnboundedSender<ScrapeEvent>>,
+) -> Result<Vec<String>> {
+    let emit = |e: ScrapeEvent| { if let Some(tx) = progress { let _ = tx.send(e); } };
+
+    log.push(format!("-- Downloading (target: {}, pool: {}) --", count, urls.len()));
+    emit(ScrapeEvent::Phase { label: "Downloading".into() });
+
+    let candidates = filter_candidates(urls);
+
+    let sanitized = sanitize_filename(name_hint);
+    let dest_base = dest_dir.trim_end_matches(['\\', '/']).to_string();
+
+    let client = Arc::new(
+        reqwest::Client::builder()
+            .cookie_store(true)
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                         (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+            .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .build()
+            .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {}", e))?
+    );
+
+    // 3 concurrent downloads — low enough to not spike RAM
+    let sem = Arc::new(Semaphore::new(3));
+    let mut tasks = tokio::task::JoinSet::new();
+
+    for (i, url) in candidates.iter().enumerate() {
+        let url = url.clone();
+        let client = client.clone();
+        let sem = sem.clone();
+        let sanitized = sanitized.clone();
+        let dest_base = dest_base.clone();
+        tasks.spawn(async move {
+            let _permit = sem.acquire().await.ok()?;
+            match download_image_bytes(&client, &url).await {
+                Ok((bytes, ext)) => {
+                    let path = format!("{}\\{}_{:03}.{}", dest_base, sanitized, i + 1, ext);
+                    match std::fs::write(&path, &bytes) {
+                        Ok(_) => Some((true, url, path, String::new())),
+                        Err(e) => Some((false, url, String::new(), format!("write: {}", e))),
+                    }
+                }
+                Err(e) => Some((false, url, String::new(), e.to_string())),
+            }
+        });
+    }
+
+    let mut downloaded: Vec<String> = Vec::new();
+    let mut failures: Vec<(String, String)> = Vec::new(); // (url, reason)
+
+    while let Some(task_result) = tasks.join_next().await {
+        if let Ok(Some((ok, url, path, reason))) = task_result {
+            if ok {
+                debug!("OK  {}", path);
+                downloaded.push(path);
+                emit(ScrapeEvent::Downloaded { done: downloaded.len(), target: count, path: downloaded.last().cloned().unwrap_or_default() });
+                if downloaded.len() >= count {
+                    tasks.abort_all();
+                    break;
+                }
+            } else {
+                debug!("FAIL {} — {}", url, reason);
+                failures.push((url.clone(), reason.clone()));
+                emit(ScrapeEvent::Failed { url, reason });
+            }
+        }
+    }
+    downloaded.sort();
+
+    // Log download results
+    log.push(format!("Downloaded: {}/{}", downloaded.len(), count));
+    if !failures.is_empty() {
+        log.push(format!("Failed: {} URLs", failures.len()));
+        // Group failures by reason for readability
+        let mut reason_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for (_, reason) in &failures {
+            // Normalise reason to a short key (first 60 chars)
+            let key = reason.chars().take(60).collect::<String>();
+            *reason_counts.entry(key).or_insert(0) += 1;
+        }
+        for (reason, count) in &reason_counts {
+            log.push(format!("  x{} — {}", count, reason));
+        }
+        // Log up to 10 specific failed URLs for targeted debugging
+        log.push("  Sample failed URLs:".to_string());
+        for (url, reason) in failures.iter().take(10) {
+            log.push(format!("    [{}] {}", reason.chars().take(40).collect::<String>(), url));
+        }
+    }
+    if !downloaded.is_empty() {
+        log.push("Files:".to_string());
+        for f in &downloaded {
+            log.push(format!("  {}", f));
+        }
+    }
+
+    Ok(downloaded)
+}
+
 fn content_type_to_ext(ct: &str) -> Option<&'static str> {
     if ct.contains("jpeg") || ct.contains("jpg") { Some("jpg") }
     else if ct.contains("png")  { Some("png") }
@@ -1093,6 +1129,24 @@ mod tests {
     fn clean_caption_prepends_trigger_for_caption() {
         let out = clean_caption("standing in a field", "bob", false);
         assert_eq!(out, "bob, standing in a field");
+    }
+
+    #[test]
+    fn filter_candidates_drops_paywalled_and_dedupes() {
+        let out = filter_candidates(vec![
+            "https://e.com/a.jpg".into(),
+            "https://e.com/a.jpg".into(),
+            "https://media.gettyimages.com/x.jpg".into(),
+        ]);
+        assert_eq!(out, vec!["https://e.com/a.jpg".to_string()]);
+    }
+
+    #[test]
+    fn filter_candidates_decodes_html_entities() {
+        let out = filter_candidates(vec![
+            "https://e.com/a?foo=1&amp;bar=2".into(),
+        ]);
+        assert_eq!(out, vec!["https://e.com/a?foo=1&bar=2".to_string()]);
     }
 
     #[test]
