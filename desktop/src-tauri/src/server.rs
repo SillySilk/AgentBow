@@ -24,6 +24,7 @@ enum InboundMsg {
     },
     UserMessage { content: String, message_id: String },
     Interrupt { session_id: String },
+    ScrapeRequest { query: String, count: u32, dest_dir: String },
 }
 
 /// Classify a raw inbound WS text frame before full deserialization.
@@ -185,6 +186,36 @@ pub async fn run_ws(
                     InboundMsg::Interrupt { session_id: _ } => {
                         interrupt_flag.store(true, Ordering::Relaxed);
                     }
+
+                    InboundMsg::ScrapeRequest { query, count, dest_dir } => {
+                        if !authenticated {
+                            send_json(&out_tx, json!({"type":"error","code":"unauthenticated","message":"Must authenticate first"})).await;
+                            continue;
+                        }
+                        let out_tx = out_tx.clone();
+                        let log_dir = format!("{}\\logs", config.workspace_root.to_string_lossy().trim_end_matches(['\\', '/']));
+                        tokio::spawn(async move {
+                            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::tools::image_search::ScrapeEvent>();
+                            // Forward events to the client as they arrive.
+                            let fwd_tx = out_tx.clone();
+                            let forwarder = tokio::spawn(async move {
+                                while let Some(ev) = rx.recv().await {
+                                    let mut v = ev.to_json();
+                                    v["type"] = serde_json::Value::String("scrape_event".into());
+                                    let _ = fwd_tx.send(v.to_string()).await;
+                                }
+                            });
+                            let result = crate::tools::image_search::image_download(
+                                &query, count as usize, &dest_dir, &log_dir, Some(tx),
+                            ).await;
+                            // tx dropped here → forwarder drains and exits.
+                            let _ = forwarder.await;
+                            if let Err(e) = result {
+                                let err = serde_json::json!({"type":"scrape_event","kind":"error","message": e.to_string()});
+                                let _ = out_tx.send(err.to_string()).await;
+                            }
+                        });
+                    }
                 }
             }
 
@@ -230,5 +261,18 @@ mod tests {
     #[test]
     fn user_message_is_processed() {
         assert_eq!(classify(&json!({"type":"user_message","content":"hi"})), Inbound::Process);
+    }
+    #[test]
+    fn scrape_request_parses() {
+        let v = serde_json::json!({"type":"scrape_request","query":"cats","count":15,"dest_dir":"C:\\x"});
+        let parsed: InboundMsg = serde_json::from_value(v).unwrap();
+        match parsed {
+            InboundMsg::ScrapeRequest { query, count, dest_dir } => {
+                assert_eq!(query, "cats");
+                assert_eq!(count, 15);
+                assert_eq!(dest_dir, "C:\\x");
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 }

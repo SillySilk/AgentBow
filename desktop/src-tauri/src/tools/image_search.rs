@@ -68,7 +68,6 @@ use tokio::sync::mpsc::UnboundedSender;
 
 /// Progress events emitted during a streamed `image_download`.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum ScrapeEvent {
     Phase { label: String },
     Source { source: String, count: usize, error: Option<String> },
@@ -78,7 +77,6 @@ pub enum ScrapeEvent {
     Done { downloaded: Vec<String>, log_note: String },
 }
 
-#[allow(dead_code)]
 impl ScrapeEvent {
     pub fn to_json(&self) -> serde_json::Value {
         match self {
