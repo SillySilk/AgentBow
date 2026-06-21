@@ -401,15 +401,30 @@ fn file_stem(p: &Path) -> String {
     p.file_stem().and_then(|s| s.to_str()).unwrap_or("?").to_string()
 }
 
+// ── source_enabled ────────────────────────────────────────────────────────────
+
+/// Returns true when the given source key should run.
+/// `None` or an empty list means "run all". Matching is case-insensitive.
+fn source_enabled(sources: &Option<Vec<String>>, key: &str) -> bool {
+    match sources {
+        None => true,
+        Some(list) if list.is_empty() => true,
+        Some(list) => list.iter().any(|s| s.eq_ignore_ascii_case(key)),
+    }
+}
+
 // ── image_download ────────────────────────────────────────────────────────────
 
 /// Download images matching `query` into `dest_dir`, up to `count` files.
 /// Writes a session log to `{log_dir}\\bow_downloads.log`.
+/// `sources` is `None`/empty → run all scrapers; otherwise only the named ones.
+/// Canonical keys: `bing`, `ddg`, `yandex`, `brave`, `qwant`, `searxng`.
 pub async fn image_download(
     query: &str,
     count: usize,
     dest_dir: &str,
     log_dir: &str,
+    sources: Option<Vec<String>>,
     progress: Option<UnboundedSender<ScrapeEvent>>,
 ) -> Result<String> {
     let emit = |e: ScrapeEvent| { if let Some(tx) = &progress { let _ = tx.send(e); } };
@@ -435,15 +450,13 @@ pub async fn image_download(
     log.push("-- Scraping sources --".to_string());
     emit(ScrapeEvent::Phase { label: "Scraping sources".into() });
 
-    // Run all scrapers; always run all of them so the log captures every source
-    let results: Vec<ScrapeResult> = vec![
-        scrape_bing_images(&client, query, want).await,
-        scrape_duckduckgo_images(&client, query, want).await,
-        scrape_yandex_images(&client, query, want).await,
-        scrape_brave_images(&client, query, want).await,
-        scrape_qwant_images(&client, query, want).await,
-        scrape_searxng_images(&client, query, want).await,
-    ];
+    let mut results: Vec<ScrapeResult> = Vec::new();
+    if source_enabled(&sources, "bing")    { results.push(scrape_bing_images(&client, query, want).await); }
+    if source_enabled(&sources, "ddg")     { results.push(scrape_duckduckgo_images(&client, query, want).await); }
+    if source_enabled(&sources, "yandex")  { results.push(scrape_yandex_images(&client, query, want).await); }
+    if source_enabled(&sources, "brave")   { results.push(scrape_brave_images(&client, query, want).await); }
+    if source_enabled(&sources, "qwant")   { results.push(scrape_qwant_images(&client, query, want).await); }
+    if source_enabled(&sources, "searxng") { results.push(scrape_searxng_images(&client, query, want).await); }
 
     for r in &results {
         log.push(r.log_line());
@@ -1031,6 +1044,14 @@ fn sanitize_filename(name: &str) -> String {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn source_enabled_filters() {
+        assert!(source_enabled(&None, "bing"));
+        assert!(source_enabled(&Some(vec![]), "bing"));
+        assert!(source_enabled(&Some(vec!["bing".into(), "ddg".into()]), "BING"));
+        assert!(!source_enabled(&Some(vec!["ddg".into()]), "bing"));
+    }
 
     #[test]
     fn scrape_event_to_json_shapes() {

@@ -1,6 +1,15 @@
 import { useState } from "react";
 import { useStore } from "../store";
 
+const ALL_SOURCES = [
+  { key: "bing", label: "Bing" },
+  { key: "ddg", label: "DuckDuckGo" },
+  { key: "yandex", label: "Yandex" },
+  { key: "brave", label: "Brave" },
+  { key: "qwant", label: "Qwant" },
+  { key: "searxng", label: "SearXNG" },
+];
+
 export default function SearchPanel() {
   const startScrape = useStore((s) => s.startScrape);
   const status = useStore((s) => s.status);
@@ -8,8 +17,9 @@ export default function SearchPanel() {
   const [query, setQuery] = useState("");
   const [count, setCount] = useState(15);
   const [destDir, setDestDir] = useState("C:\\AI\\workspace\\");
+  const [enabled, setEnabled] = useState<Set<string>>(new Set(ALL_SOURCES.map((s) => s.key)));
 
-  const disabled = running || status !== "connected" || !query.trim() || !destDir.trim();
+  const disabled = running || status !== "connected" || !query.trim() || !destDir.trim() || enabled.size === 0;
   return (
     <div style={{ display: "grid", gap: 8, maxWidth: 560 }}>
       <input placeholder="Search query (e.g. golden retriever puppies)" value={query}
@@ -21,7 +31,16 @@ export default function SearchPanel() {
         <input placeholder="Destination folder" value={destDir}
           onChange={(e) => setDestDir(e.target.value)} style={{ ...inp, flex: 1 }} />
       </div>
-      <button disabled={disabled} onClick={() => startScrape({ query, count, destDir })}
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap", fontSize: 12, color: "#a8b2d8" }}>
+        {ALL_SOURCES.map((s) => (
+          <label key={s.key} style={{ display: "flex", gap: 4, alignItems: "center" }}>
+            <input type="checkbox" checked={enabled.has(s.key)}
+              onChange={(e) => setEnabled((prev) => { const n = new Set(prev); e.target.checked ? n.add(s.key) : n.delete(s.key); return n; })} />
+            {s.label}
+          </label>
+        ))}
+      </div>
+      <button disabled={disabled} onClick={() => startScrape({ query, count, destDir, sources: [...enabled] })}
         style={{ ...btn, opacity: disabled ? 0.5 : 1 }}>
         {running ? "Scraping…" : "Download images"}
       </button>

@@ -44,7 +44,7 @@ interface Store {
   scrape: ScrapeState;
   lastDestDir: string;
   connect: () => void;
-  startScrape: (a: { query: string; count: number; destDir: string }) => void;
+  startScrape: (a: { query: string; count: number; destDir: string; sources: string[] }) => void;
   _ws?: WebSocket;
   _token?: string;
 }
@@ -73,10 +73,10 @@ export const useStore = create<Store>((set, get) => ({
       set({ _ws: ws, _token: token });
     }).catch(() => set({ status: "config unavailable" }));
   },
-  startScrape: ({ query, count, destDir }) => {
+  startScrape: (a: { query: string; count: number; destDir: string; sources: string[] }) => {
     const ws = get()._ws;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    set({ scrape: { ...initialScrapeState(), running: true, target: count }, lastDestDir: destDir });
-    ws.send(JSON.stringify({ type: "scrape_request", query, count, dest_dir: destDir }));
+    set({ scrape: { ...initialScrapeState(), running: true, target: a.count }, lastDestDir: a.destDir });
+    ws.send(JSON.stringify({ type: "scrape_request", query: a.query, count: a.count, dest_dir: a.destDir, sources: a.sources }));
   },
 }));

@@ -24,7 +24,7 @@ enum InboundMsg {
     },
     UserMessage { content: String, message_id: String },
     Interrupt { session_id: String },
-    ScrapeRequest { query: String, count: u32, dest_dir: String },
+    ScrapeRequest { query: String, count: u32, dest_dir: String, #[serde(default)] sources: Option<Vec<String>> },
 }
 
 /// Classify a raw inbound WS text frame before full deserialization.
@@ -187,7 +187,7 @@ pub async fn run_ws(
                         interrupt_flag.store(true, Ordering::Relaxed);
                     }
 
-                    InboundMsg::ScrapeRequest { query, count, dest_dir } => {
+                    InboundMsg::ScrapeRequest { query, count, dest_dir, sources } => {
                         if !authenticated {
                             send_json(&out_tx, json!({"type":"error","code":"unauthenticated","message":"Must authenticate first"})).await;
                             continue;
@@ -206,7 +206,7 @@ pub async fn run_ws(
                                 }
                             });
                             let result = crate::tools::image_search::image_download(
-                                &query, count as usize, &dest_dir, &log_dir, Some(tx),
+                                &query, count as usize, &dest_dir, &log_dir, sources, Some(tx),
                             ).await;
                             // tx dropped here → forwarder drains and exits.
                             let _ = forwarder.await;
@@ -267,10 +267,11 @@ mod tests {
         let v = serde_json::json!({"type":"scrape_request","query":"cats","count":15,"dest_dir":"C:\\x"});
         let parsed: InboundMsg = serde_json::from_value(v).unwrap();
         match parsed {
-            InboundMsg::ScrapeRequest { query, count, dest_dir } => {
+            InboundMsg::ScrapeRequest { query, count, dest_dir, sources } => {
                 assert_eq!(query, "cats");
                 assert_eq!(count, 15);
                 assert_eq!(dest_dir, "C:\\x");
+                assert!(sources.is_none());
             }
             _ => panic!("wrong variant"),
         }
