@@ -44,8 +44,20 @@ pub fn build_router(state: AppState, mcp: McpManager, web_dir: PathBuf) -> Route
         .route("/api/health", get(|| async { "ok" }))
         .route("/api/config", get(config_handler))
         .route("/ws", get(ws_upgrade))
+        .merge(crate::web_api::routes())
         .fallback_service(static_service)
         .with_state(http_state)
+}
+
+#[cfg(test)]
+impl HttpState {
+    pub fn test_state(workspace_root: std::path::PathBuf) -> Self {
+        let config = crate::state::Config::test_default(workspace_root);
+        HttpState {
+            app: crate::state::AppState::new(config),
+            mcp: crate::tools::mcp::McpManager::empty(),
+        }
+    }
 }
 
 #[cfg(test)]

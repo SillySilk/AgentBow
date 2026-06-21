@@ -20,6 +20,21 @@ pub struct Config {
 }
 
 impl Config {
+    #[cfg(test)]
+    pub fn test_default(workspace_root: std::path::PathBuf) -> Self {
+        Config {
+            tavily_api_key: String::new(),
+            bow_secret: "test-secret".to_string(),
+            ws_port: 9357,
+            workspace_root,
+            lm_studio_url: "http://localhost:1234".to_string(),
+            lm_studio_model: "test-model".to_string(),
+            searxng_url: "http://localhost:8888".to_string(),
+            reasoning_effort: None,
+            reasoning_tokens: None,
+        }
+    }
+
     pub fn from_env() -> Result<Self> {
         let candidates = env_candidates();
         for path in &candidates {

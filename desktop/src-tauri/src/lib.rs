@@ -7,5 +7,6 @@ mod state;
 mod tools;
 mod types;
 mod util;
+mod web_api;
 
 pub use host::run;
