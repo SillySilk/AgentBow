@@ -369,6 +369,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tray-icon",
+ "url",
  "urlencoding",
  "uuid",
 ]
