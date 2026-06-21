@@ -103,7 +103,7 @@ pub struct SessionLog {
 }
 
 impl SessionLog {
-    fn new(log_dir: &str, query: &str) -> Self {
+    pub fn new(log_dir: &str, query: &str) -> Self {
         // Ensure logs directory exists; if it fails we'll surface the error in flush()
         let _ = std::fs::create_dir_all(log_dir);
         let path = format!("{}\\bow_downloads.log",
@@ -119,7 +119,7 @@ impl SessionLog {
     }
     /// Write log to disk. Returns a warning string if the write fails so the
     /// caller can surface it — no more silent failures.
-    fn flush(&self) -> String {
+    pub fn flush(&self) -> String {
         match std::fs::OpenOptions::new()
             .create(true).append(true).open(&self.path)
         {

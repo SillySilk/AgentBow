@@ -25,6 +25,8 @@ enum InboundMsg {
     UserMessage { content: String, message_id: String },
     Interrupt { session_id: String },
     ScrapeRequest { query: String, count: u32, dest_dir: String, #[serde(default)] sources: Option<Vec<String>> },
+    BrowserOpen { url: String },
+    PageScrapeRequest { count: u32, dest_dir: String, #[serde(default)] scrolls: u32 },
 }
 
 /// Classify a raw inbound WS text frame before full deserialization.
@@ -217,6 +219,67 @@ pub async fn run_ws(
                             }
                         });
                     }
+
+                    InboundMsg::BrowserOpen { url } => {
+                        if !authenticated {
+                            send_json(&out_tx, json!({"type":"error","code":"unauthenticated","message":"Must authenticate first"})).await;
+                            continue;
+                        }
+                        let cb = controlled_browser.clone();
+                        let out_tx = out_tx.clone();
+                        tokio::spawn(async move {
+                            let msg = match cb.navigate(&url).await {
+                                Ok(_) => serde_json::json!({"type":"browser_opened","url": url}),
+                                Err(e) => serde_json::json!({"type":"scrape_event","kind":"error","message": format!("browser_open: {}", e)}),
+                            };
+                            let _ = out_tx.send(msg.to_string()).await;
+                        });
+                    }
+
+                    InboundMsg::PageScrapeRequest { count, dest_dir, scrolls } => {
+                        if !authenticated {
+                            send_json(&out_tx, json!({"type":"error","code":"unauthenticated","message":"Must authenticate first"})).await;
+                            continue;
+                        }
+                        let cb = controlled_browser.clone();
+                        let out_tx = out_tx.clone();
+                        let workspace = config.workspace_root.clone();
+                        let log_dir = format!("{}\\logs", workspace.to_string_lossy().trim_end_matches(['\\', '/']));
+                        let count = (count as usize).clamp(1, 500);
+                        tokio::spawn(async move {
+                            let dest = match crate::web_api::resolve_within_workspace(&workspace, &dest_dir) {
+                                Some(p) => p.to_string_lossy().to_string(),
+                                None => {
+                                    let _ = out_tx.send(serde_json::json!({"type":"scrape_event","kind":"error","message":"dest_dir outside workspace"}).to_string()).await;
+                                    return;
+                                }
+                            };
+                            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::tools::image_search::ScrapeEvent>();
+                            let fwd = out_tx.clone();
+                            let forwarder = tokio::spawn(async move {
+                                while let Some(ev) = rx.recv().await {
+                                    let mut v = ev.to_json();
+                                    v["type"] = serde_json::Value::String("scrape_event".into());
+                                    let _ = fwd.send(v.to_string()).await;
+                                }
+                            });
+                            let _ = tx.send(crate::tools::image_search::ScrapeEvent::Phase { label: "Scrolling page".into() });
+                            for _ in 0..scrolls {
+                                let _ = cb.scroll("down", 1200).await;
+                                tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+                            }
+                            let _ = tx.send(crate::tools::image_search::ScrapeEvent::Phase { label: "Extracting images".into() });
+                            let urls = cb.extract_image_urls().await.unwrap_or_default();
+                            let _ = tx.send(crate::tools::image_search::ScrapeEvent::Candidates { total: urls.len(), filtered: 0 });
+                            let mut log = crate::tools::image_search::SessionLog::new(&log_dir, "page_scrape");
+                            let result = crate::tools::image_search::download_urls_to_dir(urls, count, &dest, "page", &mut log, &Some(tx.clone())).await;
+                            let log_note = log.flush();
+                            let downloaded = result.unwrap_or_default();
+                            let _ = tx.send(crate::tools::image_search::ScrapeEvent::Done { downloaded, log_note });
+                            drop(tx);
+                            let _ = forwarder.await;
+                        });
+                    }
                 }
             }
 
@@ -273,6 +336,20 @@ mod tests {
                 assert_eq!(count, 15);
                 assert_eq!(dest_dir, "C:\\x");
                 assert!(sources.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn browser_open_and_page_scrape_parse() {
+        let a: InboundMsg = serde_json::from_value(serde_json::json!({"type":"browser_open","url":"https://x"})).unwrap();
+        assert!(matches!(a, InboundMsg::BrowserOpen { .. }));
+        let b: InboundMsg = serde_json::from_value(serde_json::json!({"type":"page_scrape_request","count":20,"dest_dir":"C:\\x","scrolls":3})).unwrap();
+        match b {
+            InboundMsg::PageScrapeRequest { count, scrolls, .. } => {
+                assert_eq!(count, 20);
+                assert_eq!(scrolls, 3);
             }
             _ => panic!("wrong variant"),
         }
