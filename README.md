@@ -101,8 +101,8 @@ There is no browser extension — Bow runs as a standalone local web app.
 ### Using the scraper
 
 The Bow Image Studio web UI (at `http://127.0.0.1:9357`) provides a complete
-image-scraping and curation workflow that does **not** require LM Studio — it
-runs the scrape pipeline directly from the browser.
+image-scraping and curation workflow that does **not** require LM Studio — it is
+triggered from the browser UI; the scrape runs in the local backend.
 
 #### 1. Configure and start a scrape
 
@@ -112,8 +112,9 @@ Fill in the **Search panel** at the top of the page:
 - **Count** — how many images to download (1–200).
 - **Destination folder** — where to save the images.
   **Must be inside your workspace root** (`BOW_WORKSPACE` in `desktop/.env`,
-  default `C:\AI\workspace\`). The REST endpoints reject paths outside the
-  workspace to prevent accidental writes anywhere on disk.
+  default `C:\AI\workspace\`). Both the REST endpoints and the WebSocket scrape
+  path reject destinations outside the workspace to prevent accidental writes
+  anywhere on disk.
 
 Toggle **which image sources** to query using the six checkboxes below the
 inputs:

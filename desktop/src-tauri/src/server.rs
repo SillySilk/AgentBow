@@ -192,6 +192,17 @@ pub async fn run_ws(
                             send_json(&out_tx, json!({"type":"error","code":"unauthenticated","message":"Must authenticate first"})).await;
                             continue;
                         }
+                        // Guard dest_dir to the workspace (Fix 1).
+                        let dest_dir = match crate::web_api::resolve_within_workspace(&config.workspace_root, &dest_dir) {
+                            Some(p) => p.to_string_lossy().to_string(),
+                            None => {
+                                let err = serde_json::json!({"type":"scrape_event","kind":"error","message":"dest_dir is outside the workspace"});
+                                let _ = out_tx.send(err.to_string()).await;
+                                continue;
+                            }
+                        };
+                        // Clamp count to a sane bound (Fix 4).
+                        let count = (count as usize).clamp(1, 500);
                         let out_tx = out_tx.clone();
                         let log_dir = format!("{}\\logs", config.workspace_root.to_string_lossy().trim_end_matches(['\\', '/']));
                         tokio::spawn(async move {
@@ -206,7 +217,7 @@ pub async fn run_ws(
                                 }
                             });
                             let result = crate::tools::image_search::image_download(
-                                &query, count as usize, &dest_dir, &log_dir, sources, Some(tx),
+                                &query, count, &dest_dir, &log_dir, sources, Some(tx),
                             ).await;
                             // tx dropped here → forwarder drains and exits.
                             let _ = forwarder.await;

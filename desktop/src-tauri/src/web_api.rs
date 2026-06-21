@@ -6,6 +6,27 @@ pub fn within_workspace(workspace_root: &Path, candidate: &str) -> Option<PathBu
     if cand.starts_with(&root) { Some(cand) } else { None }
 }
 
+/// Like within_workspace but allows a not-yet-existing path: canonicalizes the
+/// nearest existing ancestor and checks it is inside workspace_root. Returns the
+/// resolved absolute path (root-canonicalized + remaining components) if inside.
+pub fn resolve_within_workspace(workspace_root: &Path, candidate: &str) -> Option<PathBuf> {
+    let root = workspace_root.canonicalize().ok()?;
+    let cand = Path::new(candidate);
+    // Resolve against root if relative.
+    let abs = if cand.is_absolute() { cand.to_path_buf() } else { root.join(cand) };
+    // Walk up to the nearest existing ancestor and canonicalize it.
+    let mut existing = abs.as_path();
+    loop {
+        if existing.exists() { break; }
+        match existing.parent() { Some(p) => existing = p, None => return None }
+    }
+    let existing_canon = existing.canonicalize().ok()?;
+    if !existing_canon.starts_with(&root) { return None; }
+    // Reattach the non-existing tail to the canonical existing prefix.
+    let tail = abs.strip_prefix(existing).ok()?;
+    Some(existing_canon.join(tail))
+}
+
 use crate::http::HttpState;
 use axum::{
     extract::{Query, State},
@@ -18,7 +39,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 #[derive(Deserialize)]
-pub struct DirQuery {
+pub(crate) struct DirQuery {
     pub dir: String,
 }
 
@@ -43,7 +64,7 @@ pub async fn list_images(State(s): State<HttpState>, Query(q): Query<DirQuery>) 
 }
 
 #[derive(Deserialize)]
-pub struct ThumbQuery {
+pub(crate) struct ThumbQuery {
     pub path: String,
     pub w: Option<u32>,
 }
@@ -69,7 +90,7 @@ pub async fn thumb(State(s): State<HttpState>, Query(q): Query<ThumbQuery>) -> R
 }
 
 #[derive(Deserialize)]
-pub struct DeleteBody {
+pub(crate) struct DeleteBody {
     pub paths: Vec<String>,
 }
 
@@ -91,7 +112,7 @@ pub async fn delete_images(State(s): State<HttpState>, Json(b): Json<DeleteBody>
 }
 
 #[derive(Deserialize)]
-pub struct DedupeBody {
+pub(crate) struct DedupeBody {
     pub dir: String,
     pub threshold: Option<u32>,
     pub apply: Option<bool>,
@@ -115,7 +136,7 @@ pub async fn dedupe(State(s): State<HttpState>, Json(b): Json<DedupeBody>) -> Re
 }
 
 #[derive(Deserialize)]
-pub struct OpenBody {
+pub(crate) struct OpenBody {
     pub path: String,
 }
 
@@ -123,7 +144,10 @@ pub async fn open_folder(State(s): State<HttpState>, Json(b): Json<OpenBody>) ->
     let Some(path) = within_workspace(&s.app.config.workspace_root, &b.path) else {
         return (StatusCode::BAD_REQUEST, "path outside workspace").into_response();
     };
-    let _ = std::process::Command::new("explorer.exe").arg(&path).spawn();
+    #[cfg(target_os = "windows")]
+    { let _ = std::process::Command::new("explorer.exe").arg(&path).spawn(); }
+    #[cfg(not(target_os = "windows"))]
+    { let _ = &path; }
     Json(json!({ "ok": true })).into_response()
 }
 
@@ -139,6 +163,20 @@ pub fn routes() -> Router<HttpState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_within_workspace_allows_nonexistent_subdir() {
+        let ws = std::env::temp_dir().join(format!("bow_rws_{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&ws).unwrap();
+        // A relative dest inside the workspace (does not exist yet).
+        let result = resolve_within_workspace(&ws, "images/batch1");
+        assert!(result.is_some(), "expected Some for relative subdir inside workspace");
+        // An absolute path outside the workspace.
+        let outside = std::env::temp_dir().join("some_other_dir");
+        let result2 = resolve_within_workspace(&ws, outside.to_str().unwrap());
+        assert!(result2.is_none(), "expected None for path outside workspace");
+        std::fs::remove_dir_all(&ws).ok();
+    }
 
     #[test]
     fn rejects_path_outside_workspace() {
@@ -191,5 +229,39 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["images"].as_array().unwrap().len(), 1);
         std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[tokio::test]
+    async fn list_images_rejects_path_outside_workspace() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let ws = std::env::temp_dir()
+            .join(format!("bow_ws_rej_{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&ws).unwrap();
+
+        // A path that is definitely outside the workspace.
+        let outside = std::env::temp_dir().join("bow_outside_test_dir");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let state = crate::http::HttpState::test_state(ws.clone());
+        let app = crate::web_api::routes().with_state(state);
+        let uri = format!(
+            "/api/images?dir={}",
+            urlencoding::encode(outside.to_str().unwrap())
+        );
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        std::fs::remove_dir_all(&ws).ok();
+        std::fs::remove_dir_all(&outside).ok();
     }
 }

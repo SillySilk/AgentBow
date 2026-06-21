@@ -46,7 +46,6 @@ interface Store {
   connect: () => void;
   startScrape: (a: { query: string; count: number; destDir: string; sources: string[] }) => void;
   _ws?: WebSocket;
-  _token?: string;
 }
 
 export const useStore = create<Store>((set, get) => ({
@@ -54,11 +53,12 @@ export const useStore = create<Store>((set, get) => ({
   scrape: initialScrapeState(),
   lastDestDir: "",
   connect: () => {
-    const prev = get()._ws;
-    if (prev) { try { prev.close(); } catch {} }
     fetch("/api/config").then(r => r.json()).then(cfg => {
       const token: string = cfg.token ?? "";
       if (!token) { set({ status: "no token in /api/config" }); return; }
+      // Close previous socket atomically, immediately before opening the new one.
+      const prev = get()._ws;
+      if (prev) { try { prev.close(); } catch {} }
       const wsUrl = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`;
       const ws = new WebSocket(wsUrl);
       ws.onopen = () => ws.send(JSON.stringify({ type: "auth", token, session_id: crypto.randomUUID() }));
@@ -70,7 +70,7 @@ export const useStore = create<Store>((set, get) => ({
       };
       ws.onclose = () => set({ status: "disconnected" });
       ws.onerror = () => set({ status: "error" });
-      set({ _ws: ws, _token: token });
+      set({ _ws: ws });
     }).catch(() => set({ status: "config unavailable" }));
   },
   startScrape: (a: { query: string; count: number; destDir: string; sources: string[] }) => {
