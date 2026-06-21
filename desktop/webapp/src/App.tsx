@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { useStore } from "./store";
 import SearchPanel from "./components/SearchPanel";
 import ProgressLog from "./components/ProgressLog";
+import CurationGrid from "./components/CurationGrid";
 
 export default function App() {
   const connect = useStore((s) => s.connect);
@@ -13,6 +14,7 @@ export default function App() {
       <p style={{ marginTop: -8, fontSize: 13 }}>Backend: {status}</p>
       <SearchPanel />
       <ProgressLog />
+      <CurationGrid />
     </div>
   );
 }
