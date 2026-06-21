@@ -748,7 +748,7 @@ pub async fn dispatch(
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("image_download: missing 'dest_dir'"))?;
             let log_dir = format!("{}\\logs", workspace_root.trim_end_matches(['\\', '/']));
-            let s = image_search::image_download(query, count, dest_dir, &log_dir).await?;
+            let s = crate::tools::image_search::image_download(query, count, dest_dir, &log_dir, None).await?;
             Ok(json!(s))
         }
         "image_dedupe" => {

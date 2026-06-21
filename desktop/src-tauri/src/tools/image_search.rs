@@ -62,6 +62,41 @@ impl ScrapeResult {
     }
 }
 
+// ── ScrapeEvent ───────────────────────────────────────────────────────────────
+
+use tokio::sync::mpsc::UnboundedSender;
+
+/// Progress events emitted during a streamed `image_download`.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum ScrapeEvent {
+    Phase { label: String },
+    Source { source: String, count: usize, error: Option<String> },
+    Candidates { total: usize, filtered: usize },
+    Downloaded { done: usize, target: usize, path: String },
+    Failed { url: String, reason: String },
+    Done { downloaded: Vec<String>, log_note: String },
+}
+
+#[allow(dead_code)]
+impl ScrapeEvent {
+    pub fn to_json(&self) -> serde_json::Value {
+        match self {
+            ScrapeEvent::Phase { label } => json!({ "kind": "phase", "label": label }),
+            ScrapeEvent::Source { source, count, error } =>
+                json!({ "kind": "source", "source": source, "count": count, "error": error }),
+            ScrapeEvent::Candidates { total, filtered } =>
+                json!({ "kind": "candidates", "total": total, "filtered": filtered }),
+            ScrapeEvent::Downloaded { done, target, path } =>
+                json!({ "kind": "downloaded", "done": done, "target": target, "path": path }),
+            ScrapeEvent::Failed { url, reason } =>
+                json!({ "kind": "failed", "url": url, "reason": reason }),
+            ScrapeEvent::Done { downloaded, log_note } =>
+                json!({ "kind": "done", "downloaded": downloaded, "log_note": log_note }),
+        }
+    }
+}
+
 // ── Session log ───────────────────────────────────────────────────────────────
 
 struct SessionLog {
@@ -372,7 +407,15 @@ fn file_stem(p: &Path) -> String {
 
 /// Download images matching `query` into `dest_dir`, up to `count` files.
 /// Writes a session log to `{log_dir}\\bow_downloads.log`.
-pub async fn image_download(query: &str, count: usize, dest_dir: &str, log_dir: &str) -> Result<String> {
+pub async fn image_download(
+    query: &str,
+    count: usize,
+    dest_dir: &str,
+    log_dir: &str,
+    progress: Option<UnboundedSender<ScrapeEvent>>,
+) -> Result<String> {
+    let emit = |e: ScrapeEvent| { if let Some(tx) = &progress { let _ = tx.send(e); } };
+
     std::fs::create_dir_all(dest_dir)
         .map_err(|e| anyhow::anyhow!("Failed to create dest_dir '{}': {}", dest_dir, e))?;
 
@@ -392,6 +435,7 @@ pub async fn image_download(query: &str, count: usize, dest_dir: &str, log_dir: 
     let mut candidates: Vec<String> = Vec::new();
 
     log.push("-- Scraping sources --".to_string());
+    emit(ScrapeEvent::Phase { label: "Scraping sources".into() });
 
     // Run all scrapers; always run all of them so the log captures every source
     let results: Vec<ScrapeResult> = vec![
@@ -405,6 +449,7 @@ pub async fn image_download(query: &str, count: usize, dest_dir: &str, log_dir: 
 
     for r in &results {
         log.push(r.log_line());
+        emit(ScrapeEvent::Source { source: r.source.to_string(), count: r.urls.len(), error: r.error.clone() });
         for u in &r.urls {
             if !candidates.contains(u) { candidates.push(u.clone()); }
         }
@@ -418,6 +463,7 @@ pub async fn image_download(query: &str, count: usize, dest_dir: &str, log_dir: 
     if filtered > 0 {
         log.push(format!("Filtered {} paid CDN URLs (Getty, iStock, Shutterstock, Alamy)", filtered));
     }
+    emit(ScrapeEvent::Candidates { total: candidates.len(), filtered });
 
     if candidates.is_empty() {
         log.push("FATAL: no candidates — all scrapers returned 0 URLs".to_string());
@@ -429,6 +475,7 @@ pub async fn image_download(query: &str, count: usize, dest_dir: &str, log_dir: 
 
     // ── Download phase ────────────────────────────────────────────────────────
     log.push(format!("-- Downloading (target: {}, pool: {}) --", count, candidates.len()));
+    emit(ScrapeEvent::Phase { label: "Downloading".into() });
 
     let sanitized = sanitize_filename(query);
     let dest_base = dest_dir.trim_end_matches(['\\', '/']).to_string();
@@ -472,13 +519,15 @@ pub async fn image_download(query: &str, count: usize, dest_dir: &str, log_dir: 
             if ok {
                 debug!("OK  {}", path);
                 downloaded.push(path);
+                emit(ScrapeEvent::Downloaded { done: downloaded.len(), target: count, path: downloaded.last().cloned().unwrap_or_default() });
                 if downloaded.len() >= count {
                     tasks.abort_all();
                     break;
                 }
             } else {
                 debug!("FAIL {} — {}", url, reason);
-                failures.push((url, reason));
+                failures.push((url.clone(), reason.clone()));
+                emit(ScrapeEvent::Failed { url, reason });
             }
         }
     }
@@ -519,6 +568,8 @@ pub async fn image_download(query: &str, count: usize, dest_dir: &str, log_dir: 
             "All downloads failed for {:?}. {}", query, log_note
         ));
     }
+
+    emit(ScrapeEvent::Done { downloaded: downloaded.clone(), log_note: log_note.clone() });
 
     Ok(format!(
         "Downloaded {}/{} images to {}\n{}\nFiles:\n{}",
@@ -982,6 +1033,22 @@ fn sanitize_filename(name: &str) -> String {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn scrape_event_to_json_shapes() {
+        let e = ScrapeEvent::Source { source: "Bing".into(), count: 35, error: None };
+        let v = e.to_json();
+        assert_eq!(v["kind"], "source");
+        assert_eq!(v["source"], "Bing");
+        assert_eq!(v["count"], 35);
+
+        let d = ScrapeEvent::Downloaded { done: 3, target: 15, path: "C:\\x\\a.jpg".into() };
+        let dv = d.to_json();
+        assert_eq!(dv["kind"], "downloaded");
+        assert_eq!(dv["done"], 3);
+        assert_eq!(dv["target"], 15);
+        assert_eq!(dv["path"], "C:\\x\\a.jpg");
+    }
 
     #[test]
     fn clean_tags_flattens_and_prepends_trigger() {
