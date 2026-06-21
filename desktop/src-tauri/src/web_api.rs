@@ -24,6 +24,10 @@ pub fn resolve_within_workspace(workspace_root: &Path, candidate: &str) -> Optio
     if !existing_canon.starts_with(&root) { return None; }
     // Reattach the non-existing tail to the canonical existing prefix.
     let tail = abs.strip_prefix(existing).ok()?;
+    // Reject any tail that contains a parent-dir component to prevent path traversal.
+    if tail.components().any(|c| c == std::path::Component::ParentDir) {
+        return None;
+    }
     Some(existing_canon.join(tail))
 }
 
@@ -175,6 +179,28 @@ mod tests {
         let outside = std::env::temp_dir().join("some_other_dir");
         let result2 = resolve_within_workspace(&ws, outside.to_str().unwrap());
         assert!(result2.is_none(), "expected None for path outside workspace");
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn resolve_within_workspace_rejects_dotdot_traversal() {
+        // Create workspace with an existing subdir to make the traversal plausible.
+        let ws = std::env::temp_dir().join(format!("bow_trav_{}", uuid::Uuid::new_v4().simple()));
+        let images_dir = ws.join("images");
+        std::fs::create_dir_all(&images_dir).unwrap();
+
+        // Construct an absolute traversal candidate: <ws>/images/../../outside
+        // After walking up to the existing `images` dir, the tail would be `../../outside`,
+        // which must be rejected.
+        let traversal = format!("{}/images/../../outside", ws.to_str().unwrap());
+        let result = resolve_within_workspace(&ws, &traversal);
+        assert!(result.is_none(), "expected None for .. traversal that escapes workspace");
+
+        // A legitimate not-yet-existing subdir must still be allowed.
+        let legit = format!("{}/newpics", ws.to_str().unwrap());
+        let result2 = resolve_within_workspace(&ws, &legit);
+        assert!(result2.is_some(), "expected Some for a legitimate nonexistent subdir");
+
         std::fs::remove_dir_all(&ws).ok();
     }
 
