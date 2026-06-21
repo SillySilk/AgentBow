@@ -16,5 +16,6 @@ describe("applyEvent", () => {
     let s = initialScrapeState();
     s = applyEvent(s, { type: "scrape_event", kind: "done", downloaded: ["a"], log_note: "Log: x" });
     expect(s.finished).toBe(true);
+    expect(s.running).toBe(false);
   });
 });
