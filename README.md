@@ -98,6 +98,69 @@ There is no browser extension — Bow runs as a standalone local web app.
 - Copies built web assets next to the exe (`target/debug/web/`)
 - Launches `bow-desktop.exe` (tray icon appears)
 
+### Using the scraper
+
+The Bow Image Studio web UI (at `http://127.0.0.1:9357`) provides a complete
+image-scraping and curation workflow that does **not** require LM Studio — it
+runs the scrape pipeline directly from the browser.
+
+#### 1. Configure and start a scrape
+
+Fill in the **Search panel** at the top of the page:
+
+- **Query** — what to search for (e.g. `golden retriever puppies`).
+- **Count** — how many images to download (1–200).
+- **Destination folder** — where to save the images.
+  **Must be inside your workspace root** (`BOW_WORKSPACE` in `desktop/.env`,
+  default `C:\AI\workspace\`). The REST endpoints reject paths outside the
+  workspace to prevent accidental writes anywhere on disk.
+
+Toggle **which image sources** to query using the six checkboxes below the
+inputs:
+
+| Source | Notes |
+|---|---|
+| **Bing** | Fast, high-volume results |
+| **DuckDuckGo** | No rate-limiting in typical usage |
+| **Yandex** | Strong for non-English subjects |
+| **Brave** | Independent index, low overlap with Bing |
+| **Qwant** | European index, useful variety |
+| **SearXNG** | Requires a local SearXNG instance (`SEARXNG_URL` in `.env`); uncheck if not running |
+
+All sources are enabled by default. Unchecking all sources disables the
+**Download images** button. The button is also disabled while a scrape is
+already running or while the WebSocket is not connected.
+
+Click **Download images** to start. The backend scrapes all enabled sources in
+parallel and streams progress back over the WebSocket.
+
+#### 2. Watch live progress
+
+The **Progress log** panel (below the search panel) updates in real time:
+
+- Each source reports how many candidate URLs it found (or an error).
+- `candidates: N (filtered M)` — after deduplication/filtering, N URLs remain.
+- `X/Y` download ticks as each file is saved to disk.
+- A final summary line when the scrape finishes or if it errors out.
+
+No page refresh is needed; the log auto-scrolls.
+
+#### 3. Curate the results grid
+
+Once a scrape finishes, the **curation grid** appears automatically, showing
+thumbnail previews of every downloaded image in the destination folder.
+
+| Control | What it does |
+|---|---|
+| Click a thumbnail | Toggles selection (red border = selected) |
+| **Delete selected (N)** | Permanently deletes the selected files from disk and removes them from the grid |
+| **Remove duplicates** | Runs perceptual-hash (pHash) deduplication: near-duplicate images are moved into a `_bow_dupes` subfolder (nothing is permanently deleted). A note shows how many were quarantined. |
+| **Open folder** | Opens the destination folder in Windows Explorer |
+| **Refresh** | Re-reads the folder and reloads the grid (useful after external changes) |
+
+The status note next to the toolbar buttons shows the result of the last
+action (e.g. `Deleted 3`, `Quarantined 2 duplicates`).
+
 ---
 
 ## Native tools
