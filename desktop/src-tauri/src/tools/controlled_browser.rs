@@ -22,6 +22,8 @@ pub fn chrome_executable() -> Option<PathBuf> {
 }
 
 use anyhow::{anyhow, Result};
+use base64::Engine as _;
+use chromiumoxide::cdp::browser_protocol::network::{CookieParam, DeleteCookiesParams};
 use chromiumoxide::{Browser, BrowserConfig, Page};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -211,6 +213,217 @@ impl ControlledBrowser {
             Ok(normalize_image_urls(list, &base))
         })
         .await
+    }
+
+    /// Click the first element matching `selector`.
+    pub async fn click(&self, selector: &str) -> Result<Value> {
+        let sel = selector.to_string();
+        self.with_page(|page| async move {
+            let el = page
+                .find_element(&sel)
+                .await
+                .map_err(|_| anyhow!("Element not found: {}", sel))?;
+            el.click().await.map_err(|e| anyhow!("click: {}", e))?;
+            Ok(json!(format!("Clicked: {}", sel)))
+        })
+        .await
+    }
+
+    /// Focus the first element matching `selector`, type `value`, and optionally
+    /// press Enter to submit.
+    pub async fn fill(&self, selector: &str, value: &str, submit: bool) -> Result<Value> {
+        let (sel, val) = (selector.to_string(), value.to_string());
+        self.with_page(|page| async move {
+            let el = page
+                .find_element(&sel)
+                .await
+                .map_err(|_| anyhow!("Element not found: {}", sel))?;
+            el.click().await.ok();
+            el.type_str(&val)
+                .await
+                .map_err(|e| anyhow!("type: {}", e))?;
+            if submit {
+                el.press_key("Enter").await.ok();
+            }
+            Ok(json!(format!("Filled: {}", sel)))
+        })
+        .await
+    }
+
+    /// Evaluate arbitrary JavaScript in the page and return its JSON result.
+    pub async fn exec_js(&self, js: &str) -> Result<Value> {
+        let js = js.to_string();
+        self.with_page(|page| async move {
+            let r = page.evaluate(js).await.map_err(|e| anyhow!("eval: {}", e))?;
+            Ok(r.into_value::<Value>().unwrap_or(Value::Null))
+        })
+        .await
+    }
+
+    /// Capture a PNG screenshot of the current page. Returns the same
+    /// image+text content-array shape the old BrowserBridge produced so it can
+    /// be embedded directly into a `tool_result` content field.
+    pub async fn screenshot(&self) -> Result<Value> {
+        self.with_page(|page| async move {
+            let bytes = page
+                .screenshot(chromiumoxide::page::ScreenshotParams::builder().build())
+                .await
+                .map_err(|e| anyhow!("screenshot: {}", e))?;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            Ok(json!([
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": b64
+                    }
+                },
+                {
+                    "type": "text",
+                    "text": "Screenshot of current browser tab."
+                }
+            ]))
+        })
+        .await
+    }
+
+    /// Navigate back in history. chromiumoxide 0.9.1 has no native history API,
+    /// so this is driven via `history.back()` (see report for the adaptation).
+    pub async fn back(&self) -> Result<Value> {
+        self.with_page(|page| async move {
+            page.evaluate("history.back()")
+                .await
+                .map_err(|e| anyhow!("back: {}", e))?;
+            page.wait_for_navigation().await.ok();
+            let url = page.url().await.ok().flatten().unwrap_or_default();
+            let title = page.get_title().await.ok().flatten().unwrap_or_default();
+            Ok(json!({ "url": url, "title": title }))
+        })
+        .await
+    }
+
+    /// Navigate forward in history (driven via `history.forward()`).
+    pub async fn forward(&self) -> Result<Value> {
+        self.with_page(|page| async move {
+            page.evaluate("history.forward()")
+                .await
+                .map_err(|e| anyhow!("forward: {}", e))?;
+            page.wait_for_navigation().await.ok();
+            let url = page.url().await.ok().flatten().unwrap_or_default();
+            let title = page.get_title().await.ok().flatten().unwrap_or_default();
+            Ok(json!({ "url": url, "title": title }))
+        })
+        .await
+    }
+
+    /// Reload the current page. chromiumoxide 0.9.1's `reload()` takes no
+    /// cache-bypass flag, so `_bypass` is accepted for signature parity only.
+    pub async fn reload(&self, _bypass: bool) -> Result<Value> {
+        self.with_page(|page| async move {
+            page.reload().await.map_err(|e| anyhow!("reload: {}", e))?;
+            let url = page.url().await.ok().flatten().unwrap_or_default();
+            let title = page.get_title().await.ok().flatten().unwrap_or_default();
+            Ok(json!({ "url": url, "title": title }))
+        })
+        .await
+    }
+
+    /// Return cookies for the current page as a JSON array. chromiumoxide's
+    /// `get_cookies` is scoped to the tab's current URL, so `_url` is accepted
+    /// for signature parity only.
+    pub async fn get_cookies(&self, _url: &str) -> Result<Value> {
+        self.with_page(|page| async move {
+            let cookies = page
+                .get_cookies()
+                .await
+                .map_err(|e| anyhow!("get_cookies: {}", e))?;
+            Ok(serde_json::to_value(cookies).unwrap_or(Value::Null))
+        })
+        .await
+    }
+
+    /// Set a single cookie from a JSON object matching CDP's `CookieParam`
+    /// (`{ name, value, url?, domain?, path?, ... }`).
+    pub async fn set_cookie(&self, params: &Value) -> Result<Value> {
+        let cookie: CookieParam = serde_json::from_value(params.clone())
+            .map_err(|e| anyhow!("set_cookie: invalid cookie params: {}", e))?;
+        self.with_page(|page| async move {
+            page.set_cookie(cookie)
+                .await
+                .map_err(|e| anyhow!("set_cookie: {}", e))?;
+            Ok(json!("Cookie set"))
+        })
+        .await
+    }
+
+    /// Delete cookies for `url`. If `name` is given, only that cookie is
+    /// removed; otherwise every cookie scoped to the current page is removed.
+    pub async fn delete_cookies(&self, url: &str, name: Option<&str>) -> Result<Value> {
+        let url = url.to_string();
+        let name = name.map(|s| s.to_string());
+        self.with_page(|page| async move {
+            let targets: Vec<DeleteCookiesParams> = match name {
+                Some(n) => vec![DeleteCookiesParams::builder()
+                    .name(n)
+                    .url(url)
+                    .build()
+                    .map_err(|e| anyhow!("delete_cookies: {}", e))?],
+                None => {
+                    let existing = page
+                        .get_cookies()
+                        .await
+                        .map_err(|e| anyhow!("delete_cookies: {}", e))?;
+                    existing
+                        .into_iter()
+                        .map(|c| {
+                            DeleteCookiesParams::builder()
+                                .name(c.name)
+                                .url(url.clone())
+                                .build()
+                                .map_err(|e| anyhow!("delete_cookies: {}", e))
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                }
+            };
+            let count = targets.len();
+            if !targets.is_empty() {
+                page.delete_cookies(targets)
+                    .await
+                    .map_err(|e| anyhow!("delete_cookies: {}", e))?;
+            }
+            Ok(json!(format!("Deleted {} cookie(s)", count)))
+        })
+        .await
+    }
+
+    /// Capture a screenshot + distilled page text in one call (same shape the
+    /// old BrowserBridge returned).
+    pub async fn analyze_page(&self) -> Result<Value> {
+        let (shot, page) = tokio::join!(self.screenshot(), self.read_page("text"));
+        let b64 = shot.ok().and_then(|v| {
+            v.as_array()?
+                .first()?
+                .get("source")?
+                .get("data")?
+                .as_str()
+                .map(|s| s.to_string())
+        });
+        let (url, title, text): (String, String, String) = match page {
+            Ok(v) => (
+                v["url"].as_str().unwrap_or("").to_string(),
+                v["title"].as_str().unwrap_or("").to_string(),
+                v["content"].as_str().unwrap_or("").to_string(),
+            ),
+            Err(_) => (String::new(), String::new(), String::new()),
+        };
+        let mut out = json!({ "url": url, "title": title, "text_content": text });
+        if let Some(b) = b64 {
+            out["screenshot_base64"] = json!(b);
+            out["screenshot_note"] =
+                json!("PNG screenshot available if your model supports vision.");
+        }
+        Ok(out)
     }
 }
 
