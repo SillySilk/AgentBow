@@ -83,6 +83,7 @@ are actually read:
 | `BOW_WORKSPACE` | Where Bow reads/writes files, stores `memory.db`, finds `mcp.json`. |
 | `TAVILY_API_KEY` | For `web_search` / `web_search_deep`. |
 | `SEARXNG_URL` | Local SearXNG instance for `searxng_search` (optional). |
+| `CHROME_PATH` | Full path to `chrome.exe` (or `msedge.exe`) for the controlled browser. Auto-detected from standard install locations; only needed if your install is non-standard. |
 
 ## Run
 
@@ -162,6 +163,63 @@ thumbnail previews of every downloaded image in the destination folder.
 The status note next to the toolbar buttons shows the result of the last
 action (e.g. `Deleted 3`, `Quarantined 2 duplicates`).
 
+### Scrape a page or gallery
+
+Phase 3 added a **Controlled Browser** — a separate Chrome window that Bow
+drives directly (via chromiumoxide / Chrome DevTools Protocol). It is
+**independent of your everyday browser** and uses a persistent profile stored
+under `workspace_root\.bow_browser_profile`. This means you can log into an
+auth-walled site once in that window, and the login cookies survive across
+every subsequent Bow run.
+
+The agent's `browser_*` tools (`browser_navigate`, `browser_click`,
+`browser_fill`, `browser_screenshot`, `browser_exec_js`, etc.) now drive this
+controlled browser; no Chrome extension is required.
+
+#### 1. Open the controlled browser
+
+In the **Scrape a page / gallery** panel (below the search panel):
+
+1. Paste the URL of the gallery or image page you want to scrape.
+2. Click **Open browser**. A headed Chrome window opens using the persistent
+   `.bow_browser_profile`. If the site requires a login, do so now in that
+   window — the credentials are saved in the profile and will be available on
+   every future run.
+3. Navigate inside that window to the specific page or gallery you want.
+
+#### 2. Configure and start the page scrape
+
+Back in the Bow UI, fill in:
+
+- **Count** — maximum number of images to download (1–500).
+- **Scroll passes** — how many times the backend scrolls the page before
+  extracting URLs. Set this higher (e.g. 10–20) for infinite-scroll galleries
+  that lazy-load images as you scroll.
+- **Destination folder** — where to save the images (must be inside
+  `BOW_WORKSPACE`).
+
+Click **Scrape images from current page**. The backend:
+
+1. Scrolls the controlled-browser page the requested number of times.
+2. Extracts all `img[src]`, `img[srcset]`, and image-linked `a[href]` URLs.
+3. Filters, deduplicates, and downloads the candidates using the same pipeline
+   as the search scraper, streaming `scrape_event` messages back.
+
+#### 3. Watch live progress and curate
+
+Progress streams into the **Progress log** panel in real time (same format as
+the search scrape). When the scrape finishes the **curation grid** fills with
+thumbnails; delete, dedupe, and open-folder work identically.
+
+#### Notes
+
+- If Chrome or Edge is not found automatically, set `CHROME_PATH` in
+  `desktop/.env` to the full path of `chrome.exe` (or `msedge.exe`).
+- The persistent profile lives at `<BOW_WORKSPACE>\.bow_browser_profile` by
+  default. Delete it to reset all saved logins.
+- The controlled browser is a separate Chrome instance — it does **not** share
+  cookies, extensions, or history with your normal browser.
+
 ---
 
 ## Native tools
@@ -172,18 +230,9 @@ action (e.g. `Deleted 3`, `Quarantined 2 duplicates`).
 | Shell | `shell_exec` — **persistent** PowerShell session (cwd, `$env:`, and `$vars` carry across calls; per-command timeout auto-respawns a hung shell) |
 | Web | `web_search`, `web_search_deep`, `searxng_search`, `jina_read`, `search_evaluate` |
 | Images | `image_download` (Bing/DDG/Yandex/Brave/Qwant/SearXNG), `image_verify` (vision; transcodes WebP→PNG), `image_dedupe` (pHash near-dup quarantine), `image_stats` (folder report), `image_resize` (non-destructive resize/convert for training sets), `image_autotag` (writes kohya `.txt` captions via the local vision model) |
-| Browser | `browser_navigate`, `browser_click`, `browser_fill`, `browser_read_page`, `browser_screenshot`, `browser_analyze_page`, tabs, cookies, bookmarks, history, `browser_exec_js` — **INACTIVE in this build** (see note below) |
+| Browser | `browser_navigate`, `browser_back`, `browser_forward`, `browser_reload`, `browser_click`, `browser_fill`, `browser_read_page`, `browser_screenshot`, `browser_analyze_page`, `browser_scroll`, `browser_get_url`, `browser_get_cookies`, `browser_set_cookie`, `browser_delete_cookies`, `browser_exec_js` — drive the **controlled Chrome** (see "Scrape a page or gallery" above) |
 | Planning | `plan_create`, `plan_step_start/done/fail`, `verify_step`, `task_complete` |
 | Memory | `memory_store`, `memory_retrieve` (SQLite FTS5 + optional embeddings) |
-
-> **Browser-control tools — INACTIVE in this build**
-> The `browser_*` tools and `browser_exec_js` are present in the tool schema but
-> do not function in the current release. They previously relied on a Chrome
-> extension ("browser bridge") that relayed commands from the Rust backend to the
-> active tab; that extension has been removed. Browser control will be reconnected
-> to a backend-controlled headless/headed browser in **Phase 3**. Until then,
-> calling any `browser_*` tool will return an error and will not interact with
-> any browser.
 
 ### Image-training workflow
 
@@ -264,7 +313,8 @@ Bow is an intentionally unrestricted local agent. Be aware:
   (`tools/mod.rs`), but it is otherwise unsandboxed.
 - Saved logins are read from `credentials.json` in plaintext and typed into
   forms. Consider moving these to Windows Credential Manager / DPAPI.
-- `browser_exec_js` (inactive until Phase 3) will run arbitrary JS in the active
-  tab when browser control is reconnected.
+- `browser_exec_js` runs arbitrary JavaScript in the controlled Chrome tab.
+  The controlled browser opens with a persistent profile — treat it with the
+  same care you would a logged-in browser session.
 
 Run Bow only with models and tasks you trust.
