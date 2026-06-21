@@ -168,7 +168,7 @@ action (e.g. `Deleted 3`, `Quarantined 2 duplicates`).
 Phase 3 added a **Controlled Browser** — a separate Chrome window that Bow
 drives directly (via chromiumoxide / Chrome DevTools Protocol). It is
 **independent of your everyday browser** and uses a persistent profile stored
-under `workspace_root\.bow_browser_profile`. This means you can log into an
+under `<BOW_WORKSPACE>\.bow_browser_profile`. This means you can log into an
 auth-walled site once in that window, and the login cookies survive across
 every subsequent Bow run.
 
@@ -219,6 +219,11 @@ thumbnails; delete, dedupe, and open-folder work identically.
   default. Delete it to reset all saved logins.
 - The controlled browser is a separate Chrome instance — it does **not** share
   cookies, extensions, or history with your normal browser.
+- **Auth-cookie limitation:** The persistent login profile authenticates page
+  navigation and image-URL extraction in the controlled browser, but image files
+  are downloaded by the backend's HTTP client, which does not share the browser's
+  session cookies. Images hosted behind authentication (not just the gallery page)
+  may fail to download even after you log in. Public image hosts work normally.
 
 ---
 

@@ -6,6 +6,7 @@ export default function PageScrapePanel() {
   const pageScrape = useStore((s) => s.pageScrape);
   const status = useStore((s) => s.status);
   const running = useStore((s) => s.scrape.running);
+  const browserUrl = useStore((s) => s.browserUrl);
   const [url, setUrl] = useState("");
   const [count, setCount] = useState(30);
   const [scrolls, setScrolls] = useState(5);
@@ -14,6 +15,7 @@ export default function PageScrapePanel() {
   return (
     <div style={{ display: "grid", gap: 8, maxWidth: 560, marginTop: 24, borderTop: "1px solid #2a2a4a", paddingTop: 16 }}>
       <strong style={{ color: "#a8b2d8" }}>Scrape a page / gallery</strong>
+      {browserUrl && <div style={{ fontSize: "0.8em", color: "#a8b2d8" }}>Browser open at: {browserUrl}</div>}
       <div style={{ display: "flex", gap: 8 }}>
         <input placeholder="Page URL (log in / navigate first)" value={url} onChange={(e) => setUrl(e.target.value)} style={inp} />
         <button disabled={!ready || !url.trim()} onClick={() => openBrowser(url)} style={btn2}>Open browser</button>

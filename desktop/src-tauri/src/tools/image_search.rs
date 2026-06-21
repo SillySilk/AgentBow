@@ -963,10 +963,10 @@ pub async fn download_urls_to_dir(
 ) -> Result<Vec<String>> {
     let emit = |e: ScrapeEvent| { if let Some(tx) = progress { let _ = tx.send(e); } };
 
-    log.push(format!("-- Downloading (target: {}, pool: {}) --", count, urls.len()));
     emit(ScrapeEvent::Phase { label: "Downloading".into() });
 
     let candidates = filter_candidates(urls);
+    log.push(format!("-- Downloading (target: {}, pool: {}) --", count, candidates.len()));
 
     let sanitized = sanitize_filename(name_hint);
     let dest_base = dest_dir.trim_end_matches(['\\', '/']).to_string();

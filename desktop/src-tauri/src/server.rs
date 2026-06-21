@@ -263,7 +263,9 @@ pub async fn run_ws(
                                     let _ = fwd.send(v.to_string()).await;
                                 }
                             });
-                            let _ = tx.send(crate::tools::image_search::ScrapeEvent::Phase { label: "Scrolling page".into() });
+                            if scrolls > 0 {
+                                let _ = tx.send(crate::tools::image_search::ScrapeEvent::Phase { label: "Scrolling page".into() });
+                            }
                             for _ in 0..scrolls {
                                 let _ = cb.scroll("down", 1200).await;
                                 tokio::time::sleep(std::time::Duration::from_millis(700)).await;

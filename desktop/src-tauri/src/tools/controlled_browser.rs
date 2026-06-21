@@ -1,8 +1,3 @@
-// This module is a forward-looking seam: the public API (chrome_executable,
-// ControlledBrowser) is wired into the browser_* tools by later Phase 3 tasks,
-// so the items are intentionally unused until then.
-#![allow(dead_code)]
-
 use std::path::PathBuf;
 
 pub fn chrome_executable() -> Option<PathBuf> {
@@ -32,6 +27,9 @@ use tokio::sync::Mutex;
 use url::Url;
 
 struct BrowserState {
+    // Held alive to keep the browser process running; methods are only needed
+    // during launch (ensure_launched) where it is used directly before storage.
+    #[allow(dead_code)]
     browser: Browser,
     page: Page,
     _handler: tokio::task::JoinHandle<()>,
@@ -51,6 +49,7 @@ impl ControlledBrowser {
         }
     }
 
+    #[cfg(test)]
     pub async fn is_running(&self) -> bool {
         self.inner.lock().await.is_some()
     }
