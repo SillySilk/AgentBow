@@ -28,13 +28,13 @@ enum InboundMsg {
 }
 
 /// Classify a raw inbound WS text frame before full deserialization.
-/// Returns None for control frames the loop should skip (ping/browser_result).
+/// Returns None for control frames the loop should skip (e.g. ping).
 #[derive(Debug, PartialEq)]
 pub enum Inbound { Skip, Process }
 
 pub fn classify(raw: &serde_json::Value) -> Inbound {
     match raw["type"].as_str() {
-        Some("ping") | Some("browser_result") => Inbound::Skip,
+        Some("ping") => Inbound::Skip,
         _ => Inbound::Process,
     }
 }
@@ -43,6 +43,7 @@ pub async fn run_ws(
     socket: WebSocket,
     config: Arc<crate::state::Config>,
     shell_session: crate::tools::shell_session::ShellSessionManager,
+    controlled_browser: crate::tools::controlled_browser::ControlledBrowser,
     mcp: crate::tools::mcp::McpManager,
 ) -> Result<()> {
     let (mut ws_sink, mut ws_source) = socket.split();
@@ -56,8 +57,6 @@ pub async fn run_ws(
             }
         }
     });
-
-    let browser = crate::tools::browser::BrowserBridge::new(out_tx.clone());
 
     let mut authenticated = false;
     let mut history: Vec<OaiMessage> = Vec::new();
@@ -93,15 +92,6 @@ pub async fn run_ws(
                 };
 
                 if classify(&raw) == Inbound::Skip {
-                    // Handle browser_result pending-resolution before skipping
-                    if raw["type"].as_str() == Some("browser_result") {
-                        if let Some(request_id) = raw["request_id"].as_str() {
-                            let mut pending = browser.pending.lock().await;
-                            if let Some(tx) = pending.remove(request_id) {
-                                let _ = tx.send(raw.clone());
-                            }
-                        }
-                    }
                     continue;
                 }
 
@@ -153,7 +143,7 @@ pub async fn run_ws(
                         let hist_snapshot = history.clone();
                         let htx = hist_tx.clone();
                         let shell_session_clone = shell_session.clone();
-                        let browser_clone = browser.clone();
+                        let browser_clone = controlled_browser.clone();
                         let mcp_clone = mcp.clone();
                         let busy_clone = busy.clone();
 

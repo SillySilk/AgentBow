@@ -223,7 +223,7 @@ pub async fn run_local_chat(
     interrupt: Arc<AtomicBool>,
     event_tx: mpsc::Sender<AgentEvent>,
     shell_session: crate::tools::shell_session::ShellSessionManager,
-    browser: crate::tools::browser::BrowserBridge,
+    browser: crate::tools::controlled_browser::ControlledBrowser,
     mcp: crate::tools::mcp::McpManager,
 ) -> Result<()> {
     history.push(OaiMessage {

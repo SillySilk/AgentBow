@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use crate::tools::shell_session::ShellSessionManager;
+use crate::tools::controlled_browser::ControlledBrowser;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -115,13 +116,16 @@ fn env_candidates() -> Vec<PathBuf> {
 pub struct AppState {
     pub config: Config,
     pub shell_session: ShellSessionManager,
+    pub controlled_browser: ControlledBrowser,
 }
 
 impl AppState {
     pub fn new(config: Config) -> Self {
+        let browser_profile = config.workspace_root.join(".bow_browser_profile");
         Self {
-            config,
             shell_session: ShellSessionManager::new(),
+            controlled_browser: ControlledBrowser::new(browser_profile),
+            config,
         }
     }
 }

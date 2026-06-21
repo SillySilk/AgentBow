@@ -1,4 +1,3 @@
-pub mod browser;
 pub mod controlled_browser;
 pub mod file_ops;
 pub mod image_curate;
@@ -205,45 +204,6 @@ pub fn tool_schemas() -> Vec<Value> {
             }
         }),
         json!({
-            "name": "browser_tab_list",
-            "description": "List all open browser tabs with ID, title, URL.",
-            "input_schema": { "type": "object", "properties": {} }
-        }),
-        json!({
-            "name": "browser_tab_new",
-            "description": "Open a new browser tab, optionally at a URL.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "url": { "type": "string" },
-                    "active": { "type": "boolean" }
-                }
-            }
-        }),
-        json!({
-            "name": "browser_tab_close",
-            "description": "Close browser tabs by ID.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "tab_ids": { "type": "array", "items": { "type": "integer" } }
-                },
-                "required": ["tab_ids"]
-            }
-        }),
-        json!({
-            "name": "browser_tab_switch",
-            "description": "Switch to a browser tab by ID.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "tab_id": { "type": "integer" },
-                    "window_id": { "type": "integer" }
-                },
-                "required": ["tab_id"]
-            }
-        }),
-        json!({
             "name": "browser_back",
             "description": "Go back in browser history.",
             "input_schema": { "type": "object", "properties": {} }
@@ -359,11 +319,6 @@ pub fn tool_schemas() -> Vec<Value> {
         json!({
             "name": "browser_analyze_page",
             "description": "Capture a screenshot AND distilled page text in one call. Use this for understanding complex pages — returns url, title, clean text content, and screenshot (if model supports vision).",
-            "input_schema": { "type": "object", "properties": {} }
-        }),
-        json!({
-            "name": "browser_get_bookmarks",
-            "description": "Return all Chrome bookmarks as a flat list. Each entry has title, url, and folder (slash-separated path). Useful for finding saved pages, researching prior interests, or navigating to a bookmarked site.",
             "input_schema": { "type": "object", "properties": {} }
         }),
         json!({
@@ -547,7 +502,7 @@ pub async fn dispatch(
     workspace_root: &str,
     searxng_url: &str,
     shell_session: &shell_session::ShellSessionManager,
-    browser: &browser::BrowserBridge,
+    browser: &controlled_browser::ControlledBrowser,
     memory_db: &memory::MemoryDb,
 ) -> Result<Value> {
     match tool_name {
@@ -666,28 +621,6 @@ pub async fn dispatch(
                 .ok_or_else(|| anyhow::anyhow!("browser_navigate: missing 'url'"))?;
             browser.navigate(url).await
         }
-        "browser_tab_list" => browser.tab_list().await,
-        "browser_tab_new" => {
-            let url = input["url"].as_str();
-            let active = input["active"].as_bool().unwrap_or(true);
-            browser.tab_new(url, active).await
-        }
-        "browser_tab_close" => {
-            let tab_ids: Vec<i64> = input["tab_ids"]
-                .as_array()
-                .ok_or_else(|| anyhow::anyhow!("browser_tab_close: missing 'tab_ids'"))?
-                .iter()
-                .filter_map(|v| v.as_i64())
-                .collect();
-            browser.tab_close(tab_ids).await
-        }
-        "browser_tab_switch" => {
-            let tab_id = input["tab_id"]
-                .as_i64()
-                .ok_or_else(|| anyhow::anyhow!("browser_tab_switch: missing 'tab_id'"))?;
-            let window_id = input["window_id"].as_i64();
-            browser.tab_switch(tab_id, window_id).await
-        }
         "browser_back" => browser.back().await,
         "browser_forward" => browser.forward().await,
         "browser_reload" => {
@@ -739,7 +672,6 @@ pub async fn dispatch(
         }
         "browser_get_url" => browser.get_url().await,
         "browser_analyze_page" => browser.analyze_page().await,
-        "browser_get_bookmarks" => browser.get_bookmarks().await,
         "image_download" => {
             let query = input["query"]
                 .as_str()
