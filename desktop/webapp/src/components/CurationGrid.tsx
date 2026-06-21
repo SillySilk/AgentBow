@@ -3,6 +3,8 @@ import { useStore } from "../store";
 import type { ImageItem } from "../api";
 import { listImages, thumbUrl, deleteImages, dedupe, openFolder } from "../api";
 
+const tool: React.CSSProperties = { background: "#0f3460", color: "#a8b2d8", border: "1px solid #2a2a4a", borderRadius: 6, padding: "6px 10px", cursor: "pointer", fontSize: 12 };
+
 export default function CurationGrid() {
   const dir = useStore((s) => s.lastDestDir);
   const finished = useStore((s) => s.scrape.finished);
@@ -26,9 +28,9 @@ export default function CurationGrid() {
     if (selected.size === 0) return;
     const res = await deleteImages([...selected]);
     setNote(`Deleted ${res.deleted}${res.errors ? `, ${res.errors} errors` : ""}`);
-    refresh();
+    await refresh();
   };
-  const onDedupe = async () => { setNote(await dedupe(dir, true)); refresh(); };
+  const onDedupe = async () => { setNote(await dedupe(dir, true)); await refresh(); };
 
   return (
     <div style={{ marginTop: 20 }}>
@@ -56,4 +58,3 @@ export default function CurationGrid() {
     </div>
   );
 }
-const tool: React.CSSProperties = { background: "#0f3460", color: "#a8b2d8", border: "1px solid #2a2a4a", borderRadius: 6, padding: "6px 10px", cursor: "pointer", fontSize: 12 };
