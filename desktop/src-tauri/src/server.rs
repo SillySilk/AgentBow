@@ -24,7 +24,18 @@ enum InboundMsg {
     },
     UserMessage { content: String, message_id: String },
     Interrupt { session_id: String },
-    ScrapeRequest { query: String, count: u32, dest_dir: String, #[serde(default)] sources: Option<Vec<String>> },
+    ScrapeRequest {
+        query: String,
+        count: u32,
+        dest_dir: String,
+        #[serde(default)] sources: Option<Vec<String>>,
+        /// Delay between downloads (ms). 0 + verify=false ⇒ fast concurrent path.
+        #[serde(default)] delay_ms: u64,
+        /// Run the vision-QA inline keep/discard gate.
+        #[serde(default)] verify: bool,
+        /// Optional override for the vision judging prompt.
+        #[serde(default)] vision_prompt: Option<String>,
+    },
     BrowserOpen { url: String },
     PageScrapeRequest { count: u32, dest_dir: String, #[serde(default)] scrolls: u32 },
 }
@@ -179,7 +190,7 @@ pub async fn run_ws(
                         interrupt_flag.store(true, Ordering::Relaxed);
                     }
 
-                    InboundMsg::ScrapeRequest { query, count, dest_dir, sources } => {
+                    InboundMsg::ScrapeRequest { query, count, dest_dir, sources, delay_ms, verify, vision_prompt } => {
                         if !authenticated {
                             send_json(&out_tx, json!({"type":"error","code":"unauthenticated","message":"Must authenticate first"})).await;
                             continue;
@@ -195,6 +206,15 @@ pub async fn run_ws(
                         };
                         // Clamp count to a sane bound (Fix 4).
                         let count = (count as usize).clamp(1, 500);
+                        // Clamp pacing to a sane ceiling (0–30s between downloads).
+                        let delay_ms = delay_ms.min(30_000);
+                        let tuning = crate::tools::image_search::ScrapeTuning {
+                            delay_ms,
+                            verify,
+                            vision_prompt,
+                            lm_studio_url: config.lm_studio_url.clone(),
+                            vision_model: config.lm_studio_vision_model.clone(),
+                        };
                         let out_tx = out_tx.clone();
                         let log_dir = format!("{}\\logs", config.workspace_root.to_string_lossy().trim_end_matches(['\\', '/']));
                         tokio::spawn(async move {
@@ -209,7 +229,7 @@ pub async fn run_ws(
                                 }
                             });
                             let result = crate::tools::image_search::image_download(
-                                &query, count, &dest_dir, &log_dir, sources, Some(tx),
+                                &query, count, &dest_dir, &log_dir, sources, tuning, Some(tx),
                             ).await;
                             // tx dropped here → forwarder drains and exits.
                             let _ = forwarder.await;
@@ -274,7 +294,7 @@ pub async fn run_ws(
                             let urls = cb.extract_image_urls().await.unwrap_or_default();
                             let _ = tx.send(crate::tools::image_search::ScrapeEvent::Candidates { total: urls.len(), filtered: 0 });
                             let mut log = crate::tools::image_search::SessionLog::new(&log_dir, "page_scrape");
-                            let result = crate::tools::image_search::download_urls_to_dir(urls, count, &dest, "page", &mut log, &Some(tx.clone())).await;
+                            let result = crate::tools::image_search::download_urls_to_dir(urls, count, &dest, "page", 0, None, &mut log, &Some(tx.clone())).await;
                             let log_note = log.flush();
                             let downloaded = result.unwrap_or_default();
                             let _ = tx.send(crate::tools::image_search::ScrapeEvent::Done { downloaded, log_note });
@@ -333,11 +353,13 @@ mod tests {
         let v = serde_json::json!({"type":"scrape_request","query":"cats","count":15,"dest_dir":"C:\\x"});
         let parsed: InboundMsg = serde_json::from_value(v).unwrap();
         match parsed {
-            InboundMsg::ScrapeRequest { query, count, dest_dir, sources } => {
+            InboundMsg::ScrapeRequest { query, count, dest_dir, sources, delay_ms, verify, .. } => {
                 assert_eq!(query, "cats");
                 assert_eq!(count, 15);
                 assert_eq!(dest_dir, "C:\\x");
                 assert!(sources.is_none());
+                assert_eq!(delay_ms, 0);
+                assert!(!verify);
             }
             _ => panic!("wrong variant"),
         }

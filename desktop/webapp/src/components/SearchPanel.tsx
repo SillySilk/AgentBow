@@ -2,13 +2,17 @@ import { useState } from "react";
 import { useStore } from "../store";
 
 const ALL_SOURCES = [
-  { key: "bing", label: "Bing" },
+  { key: "brave", label: "Brave" },
   { key: "ddg", label: "DuckDuckGo" },
   { key: "yandex", label: "Yandex" },
-  { key: "brave", label: "Brave" },
-  { key: "qwant", label: "Qwant" },
-  { key: "searxng", label: "SearXNG" },
+  { key: "bing", label: "Bing" },
 ];
+// Sources enabled by default. Bing is omitted — DuckDuckGo already serves the Bing
+// index with more results, so Bing is a redundant fallback you can toggle on.
+const DEFAULT_ENABLED = ["brave", "ddg", "yandex"];
+
+const DEFAULT_PROMPT_HINT =
+  "Leave blank to use the default: judges relevance to the query, technical quality, and rejects watermarks/collages/text overlays.";
 
 export default function SearchPanel() {
   const startScrape = useStore((s) => s.startScrape);
@@ -17,7 +21,10 @@ export default function SearchPanel() {
   const [query, setQuery] = useState("");
   const [count, setCount] = useState(15);
   const [destDir, setDestDir] = useState("C:\\AI\\workspace\\");
-  const [enabled, setEnabled] = useState<Set<string>>(new Set(ALL_SOURCES.map((s) => s.key)));
+  const [enabled, setEnabled] = useState<Set<string>>(new Set(DEFAULT_ENABLED));
+  const [verify, setVerify] = useState(true);
+  const [visionPrompt, setVisionPrompt] = useState("");
+  const [delayMs, setDelayMs] = useState(1500);
 
   const disabled = running || status !== "connected" || !query.trim() || !destDir.trim() || enabled.size === 0;
   return (
@@ -40,7 +47,26 @@ export default function SearchPanel() {
           </label>
         ))}
       </div>
-      <button disabled={disabled} onClick={() => startScrape({ query, count, destDir, sources: [...enabled] })}
+
+      {/* Vision-QA gate */}
+      <label style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 13, color: "#a8b2d8" }}>
+        <input type="checkbox" checked={verify} onChange={(e) => setVerify(e.target.checked)} />
+        Vision-QA: have the local model check each image (slower, higher quality)
+      </label>
+      {verify && (
+        <textarea placeholder={DEFAULT_PROMPT_HINT} value={visionPrompt}
+          onChange={(e) => setVisionPrompt(e.target.value)} rows={3}
+          style={{ ...inp, resize: "vertical", fontFamily: "inherit" }} />
+      )}
+
+      {/* Pacing */}
+      <label style={{ display: "grid", gap: 2, fontSize: 12, color: "#a8b2d8" }}>
+        <span>Delay between downloads: {(delayMs / 1000).toFixed(1)}s {delayMs === 0 ? "(fastest)" : ""}</span>
+        <input type="range" min={0} max={10000} step={250} value={delayMs}
+          onChange={(e) => setDelayMs(Number(e.target.value))} />
+      </label>
+
+      <button disabled={disabled} onClick={() => startScrape({ query, count, destDir, sources: [...enabled], delayMs, verify, visionPrompt })}
         style={{ ...btn, opacity: disabled ? 0.5 : 1 }}>
         {running ? "Scraping…" : "Download images"}
       </button>

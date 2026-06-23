@@ -11,6 +11,9 @@ pub struct Config {
     pub workspace_root: PathBuf,
     pub lm_studio_url: String,
     pub lm_studio_model: String,
+    /// Vision-capable model used for the image-QA gate. Defaults to `lm_studio_model`
+    /// when `LM_STUDIO_VISION_MODEL` is unset.
+    pub lm_studio_vision_model: String,
     pub searxng_url: String,
     /// "low" | "medium" | "high" — passed as reasoning_effort in chat completions.
     /// Leave unset to omit the field (model default).
@@ -30,6 +33,7 @@ impl Config {
             workspace_root,
             lm_studio_url: "http://localhost:1234".to_string(),
             lm_studio_model: "test-model".to_string(),
+            lm_studio_vision_model: "test-model".to_string(),
             searxng_url: "http://localhost:8888".to_string(),
             reasoning_effort: None,
             reasoning_tokens: None,
@@ -60,6 +64,8 @@ impl Config {
             .unwrap_or_else(|_| "http://localhost:1234".to_string());
         let lm_studio_model = std::env::var("LM_STUDIO_MODEL")
             .unwrap_or_else(|_| "qwen3.5-9b".to_string());
+        let lm_studio_vision_model = std::env::var("LM_STUDIO_VISION_MODEL")
+            .unwrap_or_else(|_| lm_studio_model.clone());
         let searxng_url = std::env::var("SEARXNG_URL")
             .unwrap_or_else(|_| "http://localhost:8888".to_string());
 
@@ -86,6 +92,7 @@ impl Config {
             workspace_root,
             lm_studio_url,
             lm_studio_model,
+            lm_studio_vision_model,
             searxng_url,
             reasoning_effort,
             reasoning_tokens,

@@ -72,6 +72,7 @@ pub enum ScrapeEvent {
     Phase { label: String },
     Source { source: String, count: usize, error: Option<String> },
     Candidates { total: usize, filtered: usize },
+    Verifying { url: String, done: usize, target: usize },
     Downloaded { done: usize, target: usize, path: String },
     Failed { url: String, reason: String },
     Done { downloaded: Vec<String>, log_note: String },
@@ -85,6 +86,8 @@ impl ScrapeEvent {
                 json!({ "kind": "source", "source": source, "count": count, "error": error }),
             ScrapeEvent::Candidates { total, filtered } =>
                 json!({ "kind": "candidates", "total": total, "filtered": filtered }),
+            ScrapeEvent::Verifying { url, done, target } =>
+                json!({ "kind": "verifying", "url": url, "done": done, "target": target }),
             ScrapeEvent::Downloaded { done, target, path } =>
                 json!({ "kind": "downloaded", "done": done, "target": target, "path": path }),
             ScrapeEvent::Failed { url, reason } =>
@@ -149,6 +152,9 @@ fn unix_ts() -> u64 {
 
 // ── image_verify ──────────────────────────────────────────────────────────────
 
+/// Vision models reject very large payloads; skip verification past this size.
+const MAX_VERIFY_BYTES: usize = 4 * 1024 * 1024;
+
 pub async fn image_verify(
     image_path: &str,
     prompt: &str,
@@ -180,7 +186,6 @@ pub async fn image_verify(
         }
     }
 
-    const MAX_VERIFY_BYTES: usize = 4 * 1024 * 1024;
     if image_bytes.len() > MAX_VERIFY_BYTES {
         return Ok(format!(
             "[image_verify skipped: {} is {:.1} MB — may exceed vision model context window. \
@@ -413,18 +418,121 @@ fn source_enabled(sources: &Option<Vec<String>>, key: &str) -> bool {
     }
 }
 
+// ── Pacing + vision-QA ──────────────────────────────────────────────────────────
+
+/// Per-run knobs threaded from the WS request: download pacing + the vision gate.
+#[derive(Clone, Default)]
+pub struct ScrapeTuning {
+    /// Delay between downloads, in milliseconds. 0 + no verify ⇒ fast concurrent path.
+    pub delay_ms: u64,
+    /// Run the vision-QA inline keep/discard gate.
+    pub verify: bool,
+    /// Override the default judging prompt (empty/None ⇒ default).
+    pub vision_prompt: Option<String>,
+    pub lm_studio_url: String,
+    pub vision_model: String,
+}
+
+/// Resolved vision-gate settings (prompt already query-interpolated).
+#[derive(Clone)]
+pub struct VerifyConfig {
+    pub prompt: String,
+    pub lm_studio_url: String,
+    pub vision_model: String,
+}
+
+/// Sleep a small randomized interval (~300–800 ms) between search-engine scrapes.
+/// Uses wall-clock nanos for jitter to avoid pulling in an RNG dependency.
+async fn scrape_jitter() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let ms = 300 + (nanos % 500) as u64;
+    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+}
+
+/// Default judging prompt for the vision gate, with the query interpolated in.
+fn default_verify_prompt(query: &str) -> String {
+    format!(
+        "You are curating image-search results for the query: \"{query}\".\n\
+         Judge this single image on three things:\n\
+         1. Relevance — does it clearly depict \"{query}\"? Reject off-topic images, the wrong \
+         subject, or text/memes about the topic rather than the thing itself.\n\
+         2. Technical quality — reject blurry, low-resolution, heavily compressed images and \
+         upscaled thumbnails.\n\
+         3. Cleanliness — reject watermarks, logos, collages or grids of multiple images, \
+         screenshots with UI chrome, and heavy text overlays.\n\
+         Respond with ONLY a one-line JSON object: {{\"keep\": true or false, \"reason\": \"short reason\"}}."
+    )
+}
+
+/// Parse a vision reply into (keep, reason). Lenient: grabs the first `{…}` object.
+/// On any parse failure, defaults to keep=true with a flag so parser issues never
+/// silently discard valid images.
+fn parse_verdict(reply: &str) -> (bool, String) {
+    if let (Some(s), Some(e)) = (reply.find('{'), reply.rfind('}')) {
+        if e > s {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&reply[s..=e]) {
+                let keep = v["keep"].as_bool().unwrap_or(true);
+                let reason = v["reason"].as_str().unwrap_or("").to_string();
+                return (keep, reason);
+            }
+        }
+    }
+    (true, format!("unparsed verdict (kept): {:.80}", reply.replace('\n', " ")))
+}
+
+/// Judge already-downloaded image bytes with the vision model. Mirrors
+/// `image_verify`'s WebP→PNG transcode + size cap. Never panics; on model/transcode
+/// failure it keeps the image (flagged) rather than losing it.
+async fn vision_judge(bytes: &[u8], ext: &str, cfg: &VerifyConfig) -> (bool, String) {
+    let mut data = bytes.to_vec();
+    let mut ext = ext.to_string();
+    if ext == "webp" {
+        if let Ok(img) = image::load_from_memory(&data) {
+            let mut buf = Vec::new();
+            if img
+                .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+                .is_ok()
+            {
+                data = buf;
+                ext = "png".to_string();
+            }
+        }
+    }
+    if data.len() > MAX_VERIFY_BYTES {
+        return (true, "too large to verify — kept".to_string());
+    }
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+    let mime = match ext.as_str() {
+        "png" => "image/png",
+        "gif" => "image/gif",
+        _ => "image/jpeg",
+    };
+    let data_uri = format!("data:{};base64,{}", mime, b64);
+    match call_vision_model(&data_uri, &cfg.prompt, &cfg.lm_studio_url, &cfg.vision_model, 200).await {
+        Ok(reply) => {
+            debug!("vision verdict: {:.120}", reply.replace('\n', " "));
+            parse_verdict(&reply)
+        }
+        Err(e) => (true, format!("vision error — kept: {}", e)),
+    }
+}
+
 // ── image_download ────────────────────────────────────────────────────────────
 
 /// Download images matching `query` into `dest_dir`, up to `count` files.
 /// Writes a session log to `{log_dir}\\bow_downloads.log`.
 /// `sources` is `None`/empty → run all scrapers; otherwise only the named ones.
-/// Canonical keys: `bing`, `ddg`, `yandex`, `brave`, `qwant`, `searxng`.
+/// Canonical keys: `bing`, `ddg`, `yandex`, `brave`.
 pub async fn image_download(
     query: &str,
     count: usize,
     dest_dir: &str,
     log_dir: &str,
     sources: Option<Vec<String>>,
+    tuning: ScrapeTuning,
     progress: Option<UnboundedSender<ScrapeEvent>>,
 ) -> Result<String> {
     let emit = |e: ScrapeEvent| { if let Some(tx) = &progress { let _ = tx.send(e); } };
@@ -450,13 +558,13 @@ pub async fn image_download(
     log.push("-- Scraping sources --".to_string());
     emit(ScrapeEvent::Phase { label: "Scraping sources".into() });
 
+    // Scrape independent indexes sequentially with a small randomized jitter
+    // between engines — search pages are the real bot-detection surface.
     let mut results: Vec<ScrapeResult> = Vec::new();
-    if source_enabled(&sources, "bing")    { results.push(scrape_bing_images(&client, query, want).await); }
-    if source_enabled(&sources, "ddg")     { results.push(scrape_duckduckgo_images(&client, query, want).await); }
-    if source_enabled(&sources, "yandex")  { results.push(scrape_yandex_images(&client, query, want).await); }
-    if source_enabled(&sources, "brave")   { results.push(scrape_brave_images(&client, query, want).await); }
-    if source_enabled(&sources, "qwant")   { results.push(scrape_qwant_images(&client, query, want).await); }
-    if source_enabled(&sources, "searxng") { results.push(scrape_searxng_images(&client, query, want).await); }
+    if source_enabled(&sources, "bing")   { results.push(scrape_bing_images(&client, query, want).await); scrape_jitter().await; }
+    if source_enabled(&sources, "ddg")    { results.push(scrape_duckduckgo_images(&client, query, want).await); scrape_jitter().await; }
+    if source_enabled(&sources, "yandex") { results.push(scrape_yandex_images(&client, query, want).await); scrape_jitter().await; }
+    if source_enabled(&sources, "brave")  { results.push(scrape_brave_images(&client, query, want).await); }
 
     for r in &results {
         log.push(r.log_line());
@@ -485,7 +593,22 @@ pub async fn image_download(
     }
 
     // ── Download phase ────────────────────────────────────────────────────────
-    let downloaded = download_urls_to_dir(candidates, count, dest_dir, query, &mut log, &progress).await?;
+    let verify_cfg = if tuning.verify {
+        let prompt = tuning.vision_prompt.clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| default_verify_prompt(query));
+        log.push(format!("Vision-QA gate ON (model: {})", tuning.vision_model));
+        Some(VerifyConfig {
+            prompt,
+            lm_studio_url: tuning.lm_studio_url.clone(),
+            vision_model: tuning.vision_model.clone(),
+        })
+    } else {
+        None
+    };
+    let downloaded = download_urls_to_dir(
+        candidates, count, dest_dir, query, tuning.delay_ms, verify_cfg, &mut log, &progress,
+    ).await?;
 
     let log_note = log.flush();
 
@@ -627,16 +750,35 @@ async fn scrape_duckduckgo_images(client: &reqwest::Client, query: &str, max: us
     }
 }
 
+/// True when a Yandex response is the SmartCaptcha / "are you a robot" interstitial
+/// rather than a real results page.
+fn is_yandex_captcha(html: &str) -> bool {
+    html.contains("SmartCaptcha")
+        || html.contains("showcaptcha")
+        || html.contains("/checkcaptcha")
+        || html.contains("captcha-required")
+}
+
 async fn scrape_yandex_images(client: &reqwest::Client, query: &str, max: usize) -> ScrapeResult {
     let encoded = urlencoding::encode(query);
     let url = format!(
         "https://yandex.com/images/search?text={}&nomisspell=1&numdoc=50&filter=0&itype=photo",
         encoded
     );
+    // Full modern-Chrome header set. On a residential IP this is usually enough to
+    // avoid the SmartCaptcha interstitial that datacenter IPs always hit.
     let result = client.get(&url)
-        .header("Accept", "text/html,*/*;q=0.8")
-        .header("Accept-Language", "en-US,en;q=0.5")
-        .header("Referer", "https://yandex.com/")
+        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .header("Referer", "https://yandex.com/images/")
+        .header("Upgrade-Insecure-Requests", "1")
+        .header("Sec-Fetch-Dest", "document")
+        .header("Sec-Fetch-Mode", "navigate")
+        .header("Sec-Fetch-Site", "same-origin")
+        .header("Sec-Fetch-User", "?1")
+        .header("sec-ch-ua", "\"Chromium\";v=\"124\", \"Google Chrome\";v=\"124\", \"Not-A.Brand\";v=\"99\"")
+        .header("sec-ch-ua-mobile", "?0")
+        .header("sec-ch-ua-platform", "\"Windows\"")
         .header("Cookie", "safesearch=0; yp=1999999999.sp.ssp%3D0")
         .send().await;
 
@@ -647,10 +789,24 @@ async fn scrape_yandex_images(client: &reqwest::Client, query: &str, max: usize)
         Ok(r) => match r.text().await {
             Err(e) => ScrapeResult::err("Yandex", format!("read: {}", e)),
             Ok(html) => {
+                // Detect the anti-bot interstitial and report it honestly instead of
+                // silently returning 0 URLs.
+                if is_yandex_captcha(&html) {
+                    return ScrapeResult::err("Yandex", "captcha challenge — skipped".to_string());
+                }
+
                 let mut urls = Vec::new();
 
-                // JS layout: img_href in data-bem JSON
-                extract_between(&html, "\"img_href\":\"", "\"", max, &mut urls);
+                // JS layout: img_href in data-bem JSON. Yandex escapes slashes as `\/`,
+                // so unescape each captured URL before keeping it.
+                let mut raw_hrefs = Vec::new();
+                extract_between(&html, "\"img_href\":\"", "\"", max, &mut raw_hrefs);
+                for u in &raw_hrefs {
+                    let unescaped = u.replace("\\/", "/");
+                    if unescaped.starts_with("http") && unescaped.len() > 12 {
+                        urls.push(unescaped);
+                    }
+                }
 
                 // No-JS layout: extract img_url= from result link hrefs
                 // These contain URL-encoded original image URLs like:
@@ -687,94 +843,6 @@ async fn scrape_yandex_images(client: &reqwest::Client, query: &str, max: usize)
                 }
 
                 ScrapeResult::ok("Yandex", urls, &html)
-            }
-        }
-    }
-}
-
-async fn scrape_qwant_images(client: &reqwest::Client, query: &str, max: usize) -> ScrapeResult {
-    let encoded = urlencoding::encode(query);
-    let url = format!(
-        "https://api.qwant.com/v3/search/images?q={}&count=50&offset=0&safesearch=0&locale=en_US&tgp=2",
-        encoded
-    );
-    let result = client.get(&url)
-        .header("Accept", "application/json, text/javascript, */*; q=0.01")
-        .header("Accept-Language", "en-US,en;q=0.9")
-        .header("Referer", "https://www.qwant.com/")
-        .header("Origin", "https://www.qwant.com")
-        .header("DNT", "1")
-        .header("Sec-Fetch-Dest", "empty")
-        .header("Sec-Fetch-Mode", "cors")
-        .header("Sec-Fetch-Site", "same-origin")
-        .header("X-Requested-With", "XMLHttpRequest")
-        .send().await;
-
-    match result {
-        Err(e) => ScrapeResult::err("Qwant", e.to_string()),
-        Ok(r) if !r.status().is_success() =>
-            ScrapeResult::err("Qwant", format!("HTTP {}", r.status())),
-        Ok(r) => match r.json::<serde_json::Value>().await {
-            Err(e) => ScrapeResult::err("Qwant", format!("json: {}", e)),
-            Ok(data) => {
-                let mut urls = Vec::new();
-                if let Some(items) = data["data"]["result"]["items"].as_array() {
-                    for item in items {
-                        if urls.len() >= max { break; }
-                        if let Some(u) = item["media"].as_str() {
-                            if u.starts_with("http") { urls.push(u.to_string()); }
-                        }
-                    }
-                }
-                let raw = data.to_string();
-                ScrapeResult::ok("Qwant", urls, &raw)
-            }
-        }
-    }
-}
-
-async fn scrape_searxng_images(client: &reqwest::Client, query: &str, max: usize) -> ScrapeResult {
-    let encoded = urlencoding::encode(query);
-    let url = format!(
-        "https://search.hbubli.cc/search?q={}&category=images&format=json&safesearch=0&pageno=1",
-        encoded
-    );
-    let result = client.get(&url)
-        .header("Accept", "application/json, */*; q=0.8")
-        .header("Accept-Language", "en-US,en;q=0.9")
-        .header("Referer", "https://search.hbubli.cc/")
-        .send().await;
-
-    match result {
-        Err(e) => ScrapeResult::err("SearXNG", e.to_string()),
-        Ok(r) if r.status() == 429 =>
-            ScrapeResult::err("SearXNG", "rate-limited (429)".to_string()),
-        Ok(r) if !r.status().is_success() =>
-            ScrapeResult::err("SearXNG", format!("HTTP {}", r.status())),
-        Ok(r) => {
-            let text = match r.text().await {
-                Err(e) => return ScrapeResult::err("SearXNG", format!("read: {}", e)),
-                Ok(t) => t,
-            };
-            // Try JSON first (format=json supported)
-            if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
-                let mut urls = Vec::new();
-                if let Some(results) = data["results"].as_array() {
-                    for r in results {
-                        if urls.len() >= max { break; }
-                        let img = r["img_src"].as_str().or_else(|| r["url"].as_str());
-                        if let Some(u) = img {
-                            if u.starts_with("http") { urls.push(u.to_string()); }
-                        }
-                    }
-                }
-                ScrapeResult::ok("SearXNG", urls, &text)
-            } else {
-                // Instance returned HTML — scrape img src attributes as fallback
-                let mut urls = Vec::new();
-                extract_between(&text, "data-src=\"http", "\"", max, &mut urls);
-                for u in urls.iter_mut() { if !u.starts_with("http") { *u = format!("http{}", u); } }
-                ScrapeResult::ok("SearXNG", urls, &text)
             }
         }
     }
@@ -958,6 +1026,8 @@ pub async fn download_urls_to_dir(
     count: usize,
     dest_dir: &str,
     name_hint: &str,
+    delay_ms: u64,
+    verify: Option<VerifyConfig>,
     log: &mut SessionLog,
     progress: &Option<UnboundedSender<ScrapeEvent>>,
 ) -> Result<Vec<String>> {
@@ -982,48 +1052,94 @@ pub async fn download_urls_to_dir(
             .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {}", e))?
     );
 
-    // 3 concurrent downloads — low enough to not spike RAM
-    let sem = Arc::new(Semaphore::new(3));
-    let mut tasks = tokio::task::JoinSet::new();
-
-    for (i, url) in candidates.iter().enumerate() {
-        let url = url.clone();
-        let client = client.clone();
-        let sem = sem.clone();
-        let sanitized = sanitized.clone();
-        let dest_base = dest_base.clone();
-        tasks.spawn(async move {
-            let _permit = sem.acquire().await.ok()?;
-            match download_image_bytes(&client, &url).await {
-                Ok((bytes, ext)) => {
-                    let path = format!("{}\\{}_{:03}.{}", dest_base, sanitized, i + 1, ext);
-                    match std::fs::write(&path, &bytes) {
-                        Ok(_) => Some((true, url, path, String::new())),
-                        Err(e) => Some((false, url, String::new(), format!("write: {}", e))),
-                    }
-                }
-                Err(e) => Some((false, url, String::new(), e.to_string())),
-            }
-        });
-    }
-
     let mut downloaded: Vec<String> = Vec::new();
     let mut failures: Vec<(String, String)> = Vec::new(); // (url, reason)
 
-    while let Some(task_result) = tasks.join_next().await {
-        if let Ok(Some((ok, url, path, reason))) = task_result {
-            if ok {
-                debug!("OK  {}", path);
-                downloaded.push(path);
-                emit(ScrapeEvent::Downloaded { done: downloaded.len(), target: count, path: downloaded.last().cloned().unwrap_or_default() });
-                if downloaded.len() >= count {
-                    tasks.abort_all();
-                    break;
+    // The vision gate (and any non-zero pacing delay) forces the sequential path:
+    // download one candidate, optionally judge it, keep or discard, then pace.
+    if verify.is_some() || delay_ms > 0 {
+        for url in &candidates {
+            if downloaded.len() >= count { break; }
+            match download_image_bytes(&client, url).await {
+                Ok((bytes, ext)) => {
+                    let (keep, reason) = match &verify {
+                        Some(cfg) => {
+                            emit(ScrapeEvent::Verifying { url: url.clone(), done: downloaded.len(), target: count });
+                            vision_judge(&bytes, ext, cfg).await
+                        }
+                        None => (true, String::new()),
+                    };
+                    if keep {
+                        let path = format!("{}\\{}_{:03}.{}", dest_base, sanitized, downloaded.len() + 1, ext);
+                        match std::fs::write(&path, &bytes) {
+                            Ok(_) => {
+                                debug!("OK  {}", path);
+                                downloaded.push(path.clone());
+                                emit(ScrapeEvent::Downloaded { done: downloaded.len(), target: count, path });
+                            }
+                            Err(e) => {
+                                let reason = format!("write: {}", e);
+                                failures.push((url.clone(), reason.clone()));
+                                emit(ScrapeEvent::Failed { url: url.clone(), reason });
+                            }
+                        }
+                    } else {
+                        let reason = format!("rejected: {}", reason);
+                        debug!("SKIP {} — {}", url, reason);
+                        failures.push((url.clone(), reason.clone()));
+                        emit(ScrapeEvent::Failed { url: url.clone(), reason });
+                    }
                 }
-            } else {
-                debug!("FAIL {} — {}", url, reason);
-                failures.push((url.clone(), reason.clone()));
-                emit(ScrapeEvent::Failed { url, reason });
+                Err(e) => {
+                    failures.push((url.clone(), e.to_string()));
+                    emit(ScrapeEvent::Failed { url: url.clone(), reason: e.to_string() });
+                }
+            }
+            if delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+        }
+    } else {
+        // Fast path: 3 concurrent downloads, no verification or pacing.
+        let sem = Arc::new(Semaphore::new(3));
+        let mut tasks = tokio::task::JoinSet::new();
+
+        for (i, url) in candidates.iter().enumerate() {
+            let url = url.clone();
+            let client = client.clone();
+            let sem = sem.clone();
+            let sanitized = sanitized.clone();
+            let dest_base = dest_base.clone();
+            tasks.spawn(async move {
+                let _permit = sem.acquire().await.ok()?;
+                match download_image_bytes(&client, &url).await {
+                    Ok((bytes, ext)) => {
+                        let path = format!("{}\\{}_{:03}.{}", dest_base, sanitized, i + 1, ext);
+                        match std::fs::write(&path, &bytes) {
+                            Ok(_) => Some((true, url, path, String::new())),
+                            Err(e) => Some((false, url, String::new(), format!("write: {}", e))),
+                        }
+                    }
+                    Err(e) => Some((false, url, String::new(), e.to_string())),
+                }
+            });
+        }
+
+        while let Some(task_result) = tasks.join_next().await {
+            if let Ok(Some((ok, url, path, reason))) = task_result {
+                if ok {
+                    debug!("OK  {}", path);
+                    downloaded.push(path);
+                    emit(ScrapeEvent::Downloaded { done: downloaded.len(), target: count, path: downloaded.last().cloned().unwrap_or_default() });
+                    if downloaded.len() >= count {
+                        tasks.abort_all();
+                        break;
+                    }
+                } else {
+                    debug!("FAIL {} — {}", url, reason);
+                    failures.push((url.clone(), reason.clone()));
+                    emit(ScrapeEvent::Failed { url, reason });
+                }
             }
         }
     }
@@ -1031,6 +1147,12 @@ pub async fn download_urls_to_dir(
 
     // Log download results
     log.push(format!("Downloaded: {}/{}", downloaded.len(), count));
+    if verify.is_some() && downloaded.len() < count {
+        log.push(format!(
+            "Vision-QA: approved {}/{} — candidate pool exhausted (raise count or loosen the prompt)",
+            downloaded.len(), count
+        ));
+    }
     if !failures.is_empty() {
         log.push(format!("Failed: {} URLs", failures.len()));
         // Group failures by reason for readability
@@ -1087,6 +1209,26 @@ mod tests {
         assert!(source_enabled(&Some(vec![]), "bing"));
         assert!(source_enabled(&Some(vec!["bing".into(), "ddg".into()]), "BING"));
         assert!(!source_enabled(&Some(vec!["ddg".into()]), "bing"));
+    }
+
+    #[test]
+    fn parse_verdict_keep_discard_and_malformed() {
+        let (k, _) = parse_verdict("{\"keep\": true, \"reason\": \"sharp cat\"}");
+        assert!(k);
+        let (k, r) = parse_verdict("sure: {\"keep\": false, \"reason\": \"blurry\"} done");
+        assert!(!k);
+        assert_eq!(r, "blurry");
+        // Malformed → keep (never silently drop a valid image)
+        let (k, r) = parse_verdict("the model rambled with no json");
+        assert!(k);
+        assert!(r.contains("unparsed"));
+    }
+
+    #[test]
+    fn yandex_captcha_detected() {
+        assert!(is_yandex_captcha("<html>... SmartCaptcha ...</html>"));
+        assert!(is_yandex_captcha("redirect to /checkcaptcha?key=1"));
+        assert!(!is_yandex_captcha("<html><div class=\"serp-item\">img</div></html>"));
     }
 
     #[test]
