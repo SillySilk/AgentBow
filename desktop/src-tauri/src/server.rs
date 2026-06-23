@@ -204,6 +204,17 @@ pub async fn run_ws(
                                 continue;
                             }
                         };
+                        // Each scrape lands in its own fresh numbered set folder (lowest free
+                        // integer under dest_dir) so sets never pile up in one directory.
+                        let dest_dir = match crate::tools::image_search::next_numbered_subdir(&dest_dir) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                let err = serde_json::json!({"type":"scrape_event","kind":"error","message": format!("set folder: {}", e)});
+                                let _ = out_tx.send(err.to_string()).await;
+                                continue;
+                            }
+                        };
+                        let _ = out_tx.send(serde_json::json!({"type":"scrape_event","kind":"phase","label": format!("Set folder: {}", dest_dir)}).to_string()).await;
                         // Clamp count to a sane bound (Fix 4).
                         let count = (count as usize).clamp(1, 500);
                         // Clamp pacing to a sane ceiling (0–30s between downloads).
@@ -271,6 +282,14 @@ pub async fn run_ws(
                                 Some(p) => p.to_string_lossy().to_string(),
                                 None => {
                                     let _ = out_tx.send(serde_json::json!({"type":"scrape_event","kind":"error","message":"dest_dir outside workspace"}).to_string()).await;
+                                    return;
+                                }
+                            };
+                            // Fresh numbered set folder per page-scrape too (see ScrapeRequest).
+                            let dest = match crate::tools::image_search::next_numbered_subdir(&dest) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    let _ = out_tx.send(serde_json::json!({"type":"scrape_event","kind":"error","message": format!("set folder: {}", e)}).to_string()).await;
                                     return;
                                 }
                             };

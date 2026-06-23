@@ -1190,6 +1190,29 @@ fn content_type_to_ext(ct: &str) -> Option<&'static str> {
     else { None }
 }
 
+/// Pick a fresh numbered set folder under `parent`: the lowest positive integer N
+/// for which `<parent>\N` does not yet exist, create it, and return its path.
+/// Fills gaps — if folder 3 was deleted, the next scrape reuses 3 — and has no
+/// upper bound beyond the loop ceiling. Creates `parent` first if needed.
+pub fn next_numbered_subdir(parent: &str) -> Result<String> {
+    let base = parent.trim_end_matches(['\\', '/']);
+    std::fs::create_dir_all(base)
+        .map_err(|e| anyhow::anyhow!("Failed to create '{}': {}", base, e))?;
+    for n in 1..=1_000_000u32 {
+        let candidate = format!("{}\\{}", base, n);
+        if Path::new(&candidate).exists() {
+            continue;
+        }
+        match std::fs::create_dir(&candidate) {
+            Ok(_) => return Ok(candidate),
+            // Lost a race to another scrape that just took this number — try the next.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(anyhow::anyhow!("Failed to create '{}': {}", candidate, e)),
+        }
+    }
+    Err(anyhow::anyhow!("No free numbered set folder under '{}'", base))
+}
+
 fn sanitize_filename(name: &str) -> String {
     name.chars()
         .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
@@ -1222,6 +1245,22 @@ mod tests {
         let (k, r) = parse_verdict("the model rambled with no json");
         assert!(k);
         assert!(r.contains("unparsed"));
+    }
+
+    #[test]
+    fn numbered_subdir_fills_lowest_gap() {
+        let base = std::env::temp_dir().join(format!("bow_numtest_{}", unix_ts()));
+        let base_s = base.to_string_lossy().to_string();
+        // First two scrapes → 1, then 2.
+        let d1 = next_numbered_subdir(&base_s).unwrap();
+        assert!(d1.ends_with("\\1"));
+        let d2 = next_numbered_subdir(&base_s).unwrap();
+        assert!(d2.ends_with("\\2"));
+        // Delete 1 → next scrape reuses the gap.
+        std::fs::remove_dir(&d1).unwrap();
+        let d3 = next_numbered_subdir(&base_s).unwrap();
+        assert!(d3.ends_with("\\1"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
