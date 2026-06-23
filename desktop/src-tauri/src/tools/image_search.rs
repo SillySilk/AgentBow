@@ -598,25 +598,29 @@ pub async fn image_download(
     // and Yandex are fetched through the real headed browser — it loads the same
     // results page reqwest gets blocked on, and we run the existing parsers over it.
     let encoded = urlencoding::encode(query);
-    let browser_engines: &[(&str, &str, String, fn(&str, usize) -> Vec<String>)] = &[
+    type EngineRow = (&'static str, &'static str, String, fn(&str, usize) -> Vec<String>, &'static [(&'static str, &'static str, &'static str)]);
+    let browser_engines: &[EngineRow] = &[
         ("bing", "Bing",
          format!("https://www.bing.com/images/search?q={}&count=50&first=1&safeSearch=Off&adlt=off&mkt=en-US", encoded),
-         parse_bing),
+         parse_bing,
+         &[("SRCHHPGUSR", "SRCHLANG=en&ADLT=OFF&NNT=10&NRSLT=50", ".bing.com"), ("adlt", "off", ".bing.com")]),
         ("brave", "Brave",
          format!("https://search.brave.com/images?q={}&safesearch=off&source=web", encoded),
-         parse_brave),
+         parse_brave,
+         &[("safesearch", "off", ".search.brave.com")]),
         ("yandex", "Yandex",
          format!("https://yandex.com/images/search?text={}&nomisspell=1&numdoc=50&filter=0&itype=photo", encoded),
-         parse_yandex),
+         parse_yandex,
+         &[("safesearch", "0", ".yandex.com"), ("yp", "1999999999.sp.ssp%3D0", ".yandex.com")]),
     ];
 
     let mut results: Vec<ScrapeResult> = Vec::new();
     if source_enabled(&sources, "ddg") {
         results.push(scrape_duckduckgo_images(&client, query, want).await);
     }
-    for (key, name, url, parse) in browser_engines {
+    for (key, name, url, parse, cookies) in browser_engines {
         if source_enabled(&sources, key) {
-            results.push(scrape_via_browser(browser, *name, url, want, *parse, log_dir, &progress).await);
+            results.push(scrape_via_browser(browser, *name, url, want, *parse, cookies, log_dir, &progress).await);
         }
     }
 
@@ -699,12 +703,13 @@ async fn scrape_via_browser(
     url: &str,
     max: usize,
     parse: fn(&str, usize) -> Vec<String>,
+    cookies: &[(&str, &str, &str)],
     log_dir: &str,
     progress: &Option<UnboundedSender<ScrapeEvent>>,
 ) -> ScrapeResult {
     let emit = |e: ScrapeEvent| { if let Some(tx) = progress { let _ = tx.send(e); } };
 
-    let html = match browser.scrape_search_page(url, 3).await {
+    let html = match browser.scrape_search_page(url, 3, cookies).await {
         Ok(h) => h,
         Err(e) => return ScrapeResult::err(source, format!("browser: {}", e)),
     };

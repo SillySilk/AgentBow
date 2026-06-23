@@ -124,10 +124,31 @@ impl ControlledBrowser {
     /// times to lazy-load more tiles, and return the **raw** page HTML (not distilled
     /// — the per-engine parsers need the embedded JSON intact). Used by the
     /// browser-primary scraper.
-    pub async fn scrape_search_page(&self, url: &str, scrolls: u32) -> Result<String> {
+    ///
+    /// `cookies` (name, value, domain) are set **before** navigation — this is how we
+    /// force safe-search OFF, since these engines honour their cookie/account setting
+    /// over URL params.
+    pub async fn scrape_search_page(
+        &self,
+        url: &str,
+        scrolls: u32,
+        cookies: &[(&str, &str, &str)],
+    ) -> Result<String> {
         self.ensure_launched(false).await?;
         let u = url.to_string();
+        let owned_cookies: Vec<(String, String, String)> = cookies
+            .iter()
+            .map(|(n, v, d)| (n.to_string(), v.to_string(), d.to_string()))
+            .collect();
         self.with_page(|page| async move {
+            // Force safe-search-off cookies before the page loads.
+            for (n, v, d) in &owned_cookies {
+                if let Ok(cp) = serde_json::from_value::<CookieParam>(
+                    json!({ "name": n, "value": v, "domain": d, "path": "/" }),
+                ) {
+                    let _ = page.set_cookie(cp).await;
+                }
+            }
             page.goto(&u).await.map_err(|e| anyhow!("goto: {}", e))?;
             page.wait_for_navigation().await.ok();
             // Let the initial result tiles render.
