@@ -430,7 +430,53 @@ pub struct ScrapeTuning {
     /// Override the default judging prompt (empty/None ⇒ default).
     pub vision_prompt: Option<String>,
     pub lm_studio_url: String,
-    pub vision_model: String,
+    /// Manual vision-model override. Empty ⇒ auto-detect the loaded VLM from LM Studio.
+    pub vision_model_override: String,
+    /// Chat model id — used as a last-resort fallback if auto-detect fails.
+    pub chat_model: String,
+}
+
+/// Choose the vision model id from LM Studio's `/api/v0/models` JSON. Prefers a
+/// **loaded** model of `type == "vlm"`; if the loaded model isn't a VLM it's used
+/// anyway with a warning; if nothing is loaded it falls back to `fallback`.
+fn pick_loaded_vision_model(models_json: &serde_json::Value, fallback: &str) -> (String, Option<String>) {
+    let models = match models_json["data"].as_array() {
+        Some(m) => m,
+        None => return (fallback.to_string(), Some("LM Studio returned no model list — using fallback".to_string())),
+    };
+    let loaded: Vec<&serde_json::Value> =
+        models.iter().filter(|m| m["state"].as_str() == Some("loaded")).collect();
+    if let Some(m) = loaded.iter().find(|m| m["type"].as_str() == Some("vlm")) {
+        return (m["id"].as_str().unwrap_or(fallback).to_string(), None);
+    }
+    if let Some(m) = loaded.first() {
+        let id = m["id"].as_str().unwrap_or(fallback).to_string();
+        let ty = m["type"].as_str().unwrap_or("unknown");
+        return (id.clone(), Some(format!(
+            "loaded model '{}' is type '{}', not a vision model — image checks may be unreliable. Load a vision (VLM) model in LM Studio.",
+            id, ty
+        )));
+    }
+    (fallback.to_string(), Some("no model loaded in LM Studio — using fallback; load a vision model".to_string()))
+}
+
+/// Resolve which model to use for the vision gate. A non-empty `override_id` wins;
+/// otherwise auto-detect the loaded VLM from LM Studio's native API. Returns the
+/// chosen id and an optional warning to surface to the user.
+async fn resolve_vision_model(lm_studio_url: &str, override_id: &str, fallback: &str) -> (String, Option<String>) {
+    if !override_id.trim().is_empty() {
+        return (override_id.to_string(), None);
+    }
+    let url = format!("{}/api/v0/models", lm_studio_url.trim_end_matches('/'));
+    let client = reqwest::Client::new();
+    match client.get(&url).timeout(std::time::Duration::from_secs(8)).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
+            Ok(data) => pick_loaded_vision_model(&data, fallback),
+            Err(e) => (fallback.to_string(), Some(format!("could not read LM Studio models ({}) — using fallback", e))),
+        },
+        Ok(resp) => (fallback.to_string(), Some(format!("LM Studio /api/v0/models HTTP {} — using fallback", resp.status()))),
+        Err(e) => (fallback.to_string(), Some(format!("LM Studio not reachable for model auto-detect ({}) — using fallback", e))),
+    }
 }
 
 /// Resolved vision-gate settings (prompt already query-interpolated).
@@ -602,14 +648,21 @@ pub async fn image_download(
 
     // ── Download phase ────────────────────────────────────────────────────────
     let verify_cfg = if tuning.verify {
+        let (model, warn) = resolve_vision_model(
+            &tuning.lm_studio_url, &tuning.vision_model_override, &tuning.chat_model,
+        ).await;
+        if let Some(w) = &warn {
+            log.push(format!("Vision-QA WARNING: {}", w));
+            emit(ScrapeEvent::Phase { label: format!("Vision-QA: {}", w) });
+        }
         let prompt = tuning.vision_prompt.clone()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| default_verify_prompt(query));
-        log.push(format!("Vision-QA gate ON (model: {})", tuning.vision_model));
+        log.push(format!("Vision-QA gate ON (model: {})", model));
         Some(VerifyConfig {
             prompt,
             lm_studio_url: tuning.lm_studio_url.clone(),
-            vision_model: tuning.vision_model.clone(),
+            vision_model: model,
         })
     } else {
         None
@@ -1252,6 +1305,38 @@ mod tests {
         let d3 = next_numbered_subdir(&base_s).unwrap();
         assert!(d3.ends_with("\\1"));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pick_vision_model_prefers_loaded_vlm() {
+        let json = serde_json::json!({"data": [
+            {"id": "qwen-text", "type": "llm", "state": "loaded"},
+            {"id": "gemma-4-e4b", "type": "vlm", "state": "loaded"},
+            {"id": "other-vlm", "type": "vlm", "state": "not-loaded"},
+        ]});
+        let (model, warn) = pick_loaded_vision_model(&json, "fallback");
+        assert_eq!(model, "gemma-4-e4b");
+        assert!(warn.is_none());
+    }
+
+    #[test]
+    fn pick_vision_model_warns_when_loaded_is_text() {
+        let json = serde_json::json!({"data": [
+            {"id": "qwen-text", "type": "llm", "state": "loaded"},
+        ]});
+        let (model, warn) = pick_loaded_vision_model(&json, "fallback");
+        assert_eq!(model, "qwen-text");
+        assert!(warn.unwrap().contains("not a vision model"));
+    }
+
+    #[test]
+    fn pick_vision_model_falls_back_when_none_loaded() {
+        let json = serde_json::json!({"data": [
+            {"id": "x", "type": "vlm", "state": "not-loaded"},
+        ]});
+        let (model, warn) = pick_loaded_vision_model(&json, "fallback");
+        assert_eq!(model, "fallback");
+        assert!(warn.is_some());
     }
 
     #[test]

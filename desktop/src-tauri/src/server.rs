@@ -224,7 +224,8 @@ pub async fn run_ws(
                             verify,
                             vision_prompt,
                             lm_studio_url: config.lm_studio_url.clone(),
-                            vision_model: config.lm_studio_vision_model.clone(),
+                            vision_model_override: config.lm_studio_vision_model.clone(),
+                            chat_model: config.lm_studio_model.clone(),
                         };
                         let out_tx = out_tx.clone();
                         let cb = controlled_browser.clone();
