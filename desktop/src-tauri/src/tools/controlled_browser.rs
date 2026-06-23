@@ -120,6 +120,36 @@ impl ControlledBrowser {
         .await
     }
 
+    /// Navigate to a search-results `url` in the headed window, scroll `scrolls`
+    /// times to lazy-load more tiles, and return the **raw** page HTML (not distilled
+    /// — the per-engine parsers need the embedded JSON intact). Used by the
+    /// browser-primary scraper.
+    pub async fn scrape_search_page(&self, url: &str, scrolls: u32) -> Result<String> {
+        self.ensure_launched(false).await?;
+        let u = url.to_string();
+        self.with_page(|page| async move {
+            page.goto(&u).await.map_err(|e| anyhow!("goto: {}", e))?;
+            page.wait_for_navigation().await.ok();
+            // Let the initial result tiles render.
+            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+            for _ in 0..scrolls {
+                let _ = page.evaluate("window.scrollTo(0,document.body.scrollHeight)").await;
+                tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+            }
+            page.content().await.map_err(|e| anyhow!("content: {}", e))
+        })
+        .await
+    }
+
+    /// Return the current page's raw HTML without navigating (used to poll while the
+    /// user solves a captcha).
+    pub async fn raw_html(&self) -> Result<String> {
+        self.with_page(|page| async move {
+            page.content().await.map_err(|e| anyhow!("content: {}", e))
+        })
+        .await
+    }
+
     /// Return the current page's `{ url, title }`.
     pub async fn get_url(&self) -> Result<Value> {
         self.with_page(|page| async move {

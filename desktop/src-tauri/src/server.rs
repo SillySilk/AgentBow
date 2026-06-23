@@ -227,6 +227,7 @@ pub async fn run_ws(
                             vision_model: config.lm_studio_vision_model.clone(),
                         };
                         let out_tx = out_tx.clone();
+                        let cb = controlled_browser.clone();
                         let log_dir = format!("{}\\logs", config.workspace_root.to_string_lossy().trim_end_matches(['\\', '/']));
                         tokio::spawn(async move {
                             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::tools::image_search::ScrapeEvent>();
@@ -240,7 +241,7 @@ pub async fn run_ws(
                                 }
                             });
                             let result = crate::tools::image_search::image_download(
-                                &query, count, &dest_dir, &log_dir, sources, tuning, Some(tx),
+                                &query, count, &dest_dir, &log_dir, sources, tuning, &cb, Some(tx),
                             ).await;
                             // tx dropped here → forwarder drains and exits.
                             let _ = forwarder.await;

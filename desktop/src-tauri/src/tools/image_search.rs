@@ -441,17 +441,6 @@ pub struct VerifyConfig {
     pub vision_model: String,
 }
 
-/// Sleep a small randomized interval (~300–800 ms) between search-engine scrapes.
-/// Uses wall-clock nanos for jitter to avoid pulling in an RNG dependency.
-async fn scrape_jitter() {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    let ms = 300 + (nanos % 500) as u64;
-    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-}
-
 /// Default judging prompt for the vision gate, with the query interpolated in.
 fn default_verify_prompt(query: &str) -> String {
     format!(
@@ -533,6 +522,7 @@ pub async fn image_download(
     log_dir: &str,
     sources: Option<Vec<String>>,
     tuning: ScrapeTuning,
+    browser: &crate::tools::controlled_browser::ControlledBrowser,
     progress: Option<UnboundedSender<ScrapeEvent>>,
 ) -> Result<String> {
     let emit = |e: ScrapeEvent| { if let Some(tx) = &progress { let _ = tx.send(e); } };
@@ -558,13 +548,31 @@ pub async fn image_download(
     log.push("-- Scraping sources --".to_string());
     emit(ScrapeEvent::Phase { label: "Scraping sources".into() });
 
-    // Scrape independent indexes sequentially with a small randomized jitter
-    // between engines — search pages are the real bot-detection surface.
+    // DuckDuckGo stays on its working HTTP/JSON-API path (not blocked). Bing, Brave,
+    // and Yandex are fetched through the real headed browser — it loads the same
+    // results page reqwest gets blocked on, and we run the existing parsers over it.
+    let encoded = urlencoding::encode(query);
+    let browser_engines: &[(&str, &str, String, fn(&str, usize) -> Vec<String>)] = &[
+        ("bing", "Bing",
+         format!("https://www.bing.com/images/search?q={}&count=50&first=1&safeSearch=Off&adlt=off&mkt=en-US", encoded),
+         parse_bing),
+        ("brave", "Brave",
+         format!("https://search.brave.com/images?q={}&safesearch=off&source=web", encoded),
+         parse_brave),
+        ("yandex", "Yandex",
+         format!("https://yandex.com/images/search?text={}&nomisspell=1&numdoc=50&filter=0&itype=photo", encoded),
+         parse_yandex),
+    ];
+
     let mut results: Vec<ScrapeResult> = Vec::new();
-    if source_enabled(&sources, "bing")   { results.push(scrape_bing_images(&client, query, want).await); scrape_jitter().await; }
-    if source_enabled(&sources, "ddg")    { results.push(scrape_duckduckgo_images(&client, query, want).await); scrape_jitter().await; }
-    if source_enabled(&sources, "yandex") { results.push(scrape_yandex_images(&client, query, want).await); scrape_jitter().await; }
-    if source_enabled(&sources, "brave")  { results.push(scrape_brave_images(&client, query, want).await); }
+    if source_enabled(&sources, "ddg") {
+        results.push(scrape_duckduckgo_images(&client, query, want).await);
+    }
+    for (key, name, url, parse) in browser_engines {
+        if source_enabled(&sources, key) {
+            results.push(scrape_via_browser(browser, *name, url, want, *parse, &progress).await);
+        }
+    }
 
     for r in &results {
         log.push(r.log_line());
@@ -629,45 +637,73 @@ pub async fn image_download(
 
 // ── Scrapers ──────────────────────────────────────────────────────────────────
 
-async fn scrape_bing_images(client: &reqwest::Client, query: &str, max: usize) -> ScrapeResult {
-    let encoded = urlencoding::encode(query);
-    let url = format!(
-        "https://www.bing.com/images/search?q={}&count=50&first=1&safeSearch=Off&adlt=off&mkt=en-US",
-        encoded
-    );
-    let result = client.get(&url)
-        .header("Accept", "text/html,application/xhtml+xml,*/*;q=0.8")
-        .header("Accept-Language", "en-US,en;q=0.9")
-        .header("Referer", "https://www.bing.com/")
-        .header("Cookie", "SRCHHPGUSR=SRCHLANG=en&ADLT=OFF&NNT=10&NRSLT=50; adlt=off; SUID=M; MSCC=NR; _EDGE_S=ui=en-us")
-        .send().await;
+/// Fetch an engine's results page through the real headed browser and parse it with
+/// `parse`. If the page is a captcha challenge, prompt the user (via a Phase event)
+/// and wait for them to solve it before extracting.
+async fn scrape_via_browser(
+    browser: &crate::tools::controlled_browser::ControlledBrowser,
+    source: &'static str,
+    url: &str,
+    max: usize,
+    parse: fn(&str, usize) -> Vec<String>,
+    progress: &Option<UnboundedSender<ScrapeEvent>>,
+) -> ScrapeResult {
+    let emit = |e: ScrapeEvent| { if let Some(tx) = progress { let _ = tx.send(e); } };
 
-    match result {
-        Err(e) => ScrapeResult::err("Bing", e.to_string()),
-        Ok(resp) => {
-            let status = resp.status();
-            if !status.is_success() {
-                return ScrapeResult::err("Bing", format!("HTTP {}", status));
-            }
-            match resp.text().await {
-                Err(e) => ScrapeResult::err("Bing", format!("read: {}", e)),
-                Ok(html) => {
-                    let mut urls = Vec::new();
-                    // Primary: HTML-entity encoded data-m attributes
-                    extract_between(&html, "&quot;murl&quot;:&quot;", "&quot;", max, &mut urls);
-                    // Fallback 1: plain JSON in script blocks
-                    if urls.is_empty() {
-                        extract_between(&html, "\"murl\":\"", "\"", max, &mut urls);
-                    }
-                    // Fallback 2: data-imgurl attributes (older Bing layout)
-                    if urls.is_empty() {
-                        extract_between(&html, "data-imgurl=\"", "\"", max, &mut urls);
-                    }
-                    ScrapeResult::ok("Bing", urls, &html)
-                }
-            }
+    let html = match browser.scrape_search_page(url, 3).await {
+        Ok(h) => h,
+        Err(e) => return ScrapeResult::err(source, format!("browser: {}", e)),
+    };
+
+    let html = if is_captcha_page(&html) {
+        emit(ScrapeEvent::Phase {
+            label: format!("Solve the captcha for {} in the browser window — then it continues…", source),
+        });
+        match wait_for_captcha_clear(browser, std::time::Duration::from_secs(120)).await {
+            Some(h) => h,
+            None => return ScrapeResult::err(source, "captcha — not solved in time".to_string()),
+        }
+    } else {
+        html
+    };
+
+    let urls = parse(&html, max);
+    ScrapeResult::ok(source, urls, &html)
+}
+
+/// Poll the current page until it's no longer a captcha challenge, or `timeout`
+/// elapses. Returns the cleared HTML on success.
+async fn wait_for_captcha_clear(
+    browser: &crate::tools::controlled_browser::ControlledBrowser,
+    timeout: std::time::Duration,
+) -> Option<String> {
+    let start = std::time::Instant::now();
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let html = browser.raw_html().await.ok()?;
+        if !is_captcha_page(&html) {
+            return Some(html);
+        }
+        if start.elapsed() > timeout {
+            return None;
         }
     }
+}
+
+/// Parse original image URLs from a Bing images results page.
+fn parse_bing(html: &str, max: usize) -> Vec<String> {
+    let mut urls = Vec::new();
+    // Primary: HTML-entity encoded data-m attributes
+    extract_between(html, "&quot;murl&quot;:&quot;", "&quot;", max, &mut urls);
+    // Fallback 1: plain JSON in script blocks / decoded DOM attributes
+    if urls.is_empty() {
+        extract_between(html, "\"murl\":\"", "\"", max, &mut urls);
+    }
+    // Fallback 2: data-imgurl attributes (older Bing layout)
+    if urls.is_empty() {
+        extract_between(html, "data-imgurl=\"", "\"", max, &mut urls);
+    }
+    urls
 }
 
 async fn scrape_duckduckgo_images(client: &reqwest::Client, query: &str, max: usize) -> ScrapeResult {
@@ -750,140 +786,82 @@ async fn scrape_duckduckgo_images(client: &reqwest::Client, query: &str, max: us
     }
 }
 
-/// True when a Yandex response is the SmartCaptcha / "are you a robot" interstitial
-/// rather than a real results page.
-fn is_yandex_captcha(html: &str) -> bool {
-    html.contains("SmartCaptcha")
-        || html.contains("showcaptcha")
-        || html.contains("/checkcaptcha")
-        || html.contains("captcha-required")
+/// True when a results page is actually a bot/captcha challenge rather than results.
+/// Covers Yandex SmartCaptcha, Google `/sorry`, and generic reCAPTCHA/hCaptcha/Cloudflare.
+fn is_captcha_page(html: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "SmartCaptcha", "showcaptcha", "/checkcaptcha", "captcha-required",
+        "/sorry/index", "g-recaptcha", "h-captcha", "hcaptcha.com",
+        "challenges.cloudflare.com", "Checking your browser",
+    ];
+    MARKERS.iter().any(|m| html.contains(m))
 }
 
-async fn scrape_yandex_images(client: &reqwest::Client, query: &str, max: usize) -> ScrapeResult {
-    let encoded = urlencoding::encode(query);
-    let url = format!(
-        "https://yandex.com/images/search?text={}&nomisspell=1&numdoc=50&filter=0&itype=photo",
-        encoded
-    );
-    // Full modern-Chrome header set. On a residential IP this is usually enough to
-    // avoid the SmartCaptcha interstitial that datacenter IPs always hit.
-    let result = client.get(&url)
-        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-        .header("Accept-Language", "en-US,en;q=0.9")
-        .header("Referer", "https://yandex.com/images/")
-        .header("Upgrade-Insecure-Requests", "1")
-        .header("Sec-Fetch-Dest", "document")
-        .header("Sec-Fetch-Mode", "navigate")
-        .header("Sec-Fetch-Site", "same-origin")
-        .header("Sec-Fetch-User", "?1")
-        .header("sec-ch-ua", "\"Chromium\";v=\"124\", \"Google Chrome\";v=\"124\", \"Not-A.Brand\";v=\"99\"")
-        .header("sec-ch-ua-mobile", "?0")
-        .header("sec-ch-ua-platform", "\"Windows\"")
-        .header("Cookie", "safesearch=0; yp=1999999999.sp.ssp%3D0")
-        .send().await;
+/// Parse original image URLs from a Yandex images results page.
+fn parse_yandex(html: &str, max: usize) -> Vec<String> {
+    let mut urls = Vec::new();
 
-    match result {
-        Err(e) => ScrapeResult::err("Yandex", e.to_string()),
-        Ok(r) if !r.status().is_success() =>
-            ScrapeResult::err("Yandex", format!("HTTP {}", r.status())),
-        Ok(r) => match r.text().await {
-            Err(e) => ScrapeResult::err("Yandex", format!("read: {}", e)),
-            Ok(html) => {
-                // Detect the anti-bot interstitial and report it honestly instead of
-                // silently returning 0 URLs.
-                if is_yandex_captcha(&html) {
-                    return ScrapeResult::err("Yandex", "captcha challenge — skipped".to_string());
-                }
+    // JS layout: img_href in data-bem JSON. Yandex escapes slashes as `\/`,
+    // so unescape each captured URL before keeping it.
+    let mut raw_hrefs = Vec::new();
+    extract_between(html, "\"img_href\":\"", "\"", max, &mut raw_hrefs);
+    for u in &raw_hrefs {
+        let unescaped = u.replace("\\/", "/");
+        if unescaped.starts_with("http") && unescaped.len() > 12 {
+            urls.push(unescaped);
+        }
+    }
 
-                let mut urls = Vec::new();
+    // No-JS layout: extract img_url= from result link hrefs, e.g.
+    //   href="/images/search?...&img_url=https%3A%2F%2Fexample.com%2Fimage.jpg&..."
+    if urls.is_empty() {
+        let mut encoded_urls = Vec::new();
+        extract_between(html, "img_url=http", "&", max, &mut encoded_urls);
+        for u in &encoded_urls {
+            let full = format!("http{}", u);
+            let decoded = urlencoding::decode(&full)
+                .map(|c| c.into_owned())
+                .unwrap_or(full);
+            if decoded.len() > 12 { urls.push(decoded); }
+        }
+    }
 
-                // JS layout: img_href in data-bem JSON. Yandex escapes slashes as `\/`,
-                // so unescape each captured URL before keeping it.
-                let mut raw_hrefs = Vec::new();
-                extract_between(&html, "\"img_href\":\"", "\"", max, &mut raw_hrefs);
-                for u in &raw_hrefs {
-                    let unescaped = u.replace("\\/", "/");
-                    if unescaped.starts_with("http") && unescaped.len() > 12 {
-                        urls.push(unescaped);
-                    }
-                }
-
-                // No-JS layout: extract img_url= from result link hrefs
-                // These contain URL-encoded original image URLs like:
-                //   href="/images/search?...&img_url=https%3A%2F%2Fexample.com%2Fimage.jpg&..."
-                if urls.is_empty() {
-                    let mut encoded_urls = Vec::new();
-                    extract_between(&html, "img_url=http", "&", max, &mut encoded_urls);
-                    for u in &encoded_urls {
-                        let full = format!("http{}", u);
-                        let decoded = urlencoding::decode(&full)
-                            .map(|c| c.into_owned())
-                            .unwrap_or(full);
-                        if decoded.len() > 12 { urls.push(decoded); }
-                    }
-                }
-
-                // Thumbnails on avatars.mds.yandex.net
-                if urls.is_empty() {
-                    let mut thumb_urls = Vec::new();
-                    extract_between(&html, "src=\"//avatars.mds.yandex.net/", "\"", max, &mut thumb_urls);
-                    for u in &thumb_urls {
-                        urls.push(format!("https://avatars.mds.yandex.net/{}", u));
-                    }
-                }
-                // im0-tub style thumbs
-                if urls.is_empty() {
-                    let mut thumb_urls = Vec::new();
-                    extract_between(&html, "src=\"//im", "\"", max, &mut thumb_urls);
-                    for u in &thumb_urls {
-                        if u.contains(".yandex.net/") || u.contains(".yandex.ru/") {
-                            urls.push(format!("https://im{}", u));
-                        }
-                    }
-                }
-
-                ScrapeResult::ok("Yandex", urls, &html)
+    // Thumbnails on avatars.mds.yandex.net
+    if urls.is_empty() {
+        let mut thumb_urls = Vec::new();
+        extract_between(html, "src=\"//avatars.mds.yandex.net/", "\"", max, &mut thumb_urls);
+        for u in &thumb_urls {
+            urls.push(format!("https://avatars.mds.yandex.net/{}", u));
+        }
+    }
+    // im0-tub style thumbs
+    if urls.is_empty() {
+        let mut thumb_urls = Vec::new();
+        extract_between(html, "src=\"//im", "\"", max, &mut thumb_urls);
+        for u in &thumb_urls {
+            if u.contains(".yandex.net/") || u.contains(".yandex.ru/") {
+                urls.push(format!("https://im{}", u));
             }
         }
     }
+
+    urls
 }
 
-async fn scrape_brave_images(client: &reqwest::Client, query: &str, max: usize) -> ScrapeResult {
-    let encoded = urlencoding::encode(query);
-    let url = format!(
-        "https://search.brave.com/images?q={}&safesearch=off&source=web",
-        encoded
-    );
-    let result = client.get(&url)
-        .header("Accept", "text/html,application/xhtml+xml,*/*;q=0.8")
-        .header("Accept-Language", "en-US,en;q=0.9")
-        .header("Cookie", "safesearch=off")
-        .send().await;
-
-    match result {
-        Err(e) => ScrapeResult::err("Brave", e.to_string()),
-        Ok(r) if !r.status().is_success() =>
-            ScrapeResult::err("Brave", format!("HTTP {}", r.status())),
-        Ok(r) => match r.text().await {
-            Err(e) => ScrapeResult::err("Brave", format!("read: {}", e)),
-            Ok(html) => {
-                let mut urls = Vec::new();
-                // Brave proxies all images via imgs.search.brave.com
-                // Extract from href="..." and src="..." — use href=" as needle
-                // so the candidate starts with "https://" (passes extract_between filter)
-                let mut all_hrefs = Vec::new();
-                extract_between(&html, "href=\"", "\"", max * 3, &mut all_hrefs);
-                extract_between(&html, "src=\"", "\"", max * 3, &mut all_hrefs);
-                for u in &all_hrefs {
-                    if u.contains("imgs.search.brave.com/") && !urls.contains(u) {
-                        urls.push(u.clone());
-                    }
-                    if urls.len() >= max { break; }
-                }
-                ScrapeResult::ok("Brave", urls, &html)
-            }
+/// Parse image URLs from a Brave images results page. Brave proxies every image
+/// through `imgs.search.brave.com`, so we keep only those.
+fn parse_brave(html: &str, max: usize) -> Vec<String> {
+    let mut urls = Vec::new();
+    let mut all_hrefs = Vec::new();
+    extract_between(html, "href=\"", "\"", max * 3, &mut all_hrefs);
+    extract_between(html, "src=\"", "\"", max * 3, &mut all_hrefs);
+    for u in &all_hrefs {
+        if u.contains("imgs.search.brave.com/") && !urls.contains(u) {
+            urls.push(u.clone());
         }
+        if urls.len() >= max { break; }
     }
+    urls
 }
 
 // ── Download ──────────────────────────────────────────────────────────────────
@@ -1264,10 +1242,39 @@ mod tests {
     }
 
     #[test]
-    fn yandex_captcha_detected() {
-        assert!(is_yandex_captcha("<html>... SmartCaptcha ...</html>"));
-        assert!(is_yandex_captcha("redirect to /checkcaptcha?key=1"));
-        assert!(!is_yandex_captcha("<html><div class=\"serp-item\">img</div></html>"));
+    fn captcha_page_detected() {
+        assert!(is_captcha_page("<html>... SmartCaptcha ...</html>"));
+        assert!(is_captcha_page("redirect to /checkcaptcha?key=1"));
+        assert!(is_captcha_page("<div class=\"g-recaptcha\"></div>"));
+        assert!(is_captcha_page("challenges.cloudflare.com/turnstile"));
+        assert!(!is_captcha_page("<html><div class=\"serp-item\">img</div></html>"));
+    }
+
+    #[test]
+    fn parse_bing_extracts_murl() {
+        let html = "x &quot;murl&quot;:&quot;https://a.com/1.jpg&quot; y \
+                    &quot;murl&quot;:&quot;https://b.com/2.png&quot; z";
+        let urls = parse_bing(html, 10);
+        assert_eq!(urls, vec!["https://a.com/1.jpg", "https://b.com/2.png"]);
+    }
+
+    #[test]
+    fn parse_brave_keeps_only_proxy_urls() {
+        let html = "<a href=\"https://imgs.search.brave.com/abc\">x</a>\
+                    <img src=\"https://other.com/skip.jpg\">\
+                    <img src=\"https://imgs.search.brave.com/def\">";
+        let urls = parse_brave(html, 10);
+        assert_eq!(urls, vec![
+            "https://imgs.search.brave.com/abc",
+            "https://imgs.search.brave.com/def",
+        ]);
+    }
+
+    #[test]
+    fn parse_yandex_unescapes_img_href() {
+        let html = r#"...{"img_href":"https:\/\/ex.com\/cat.jpg"}...{"img_href":"https:\/\/ex.com\/dog.png"}..."#;
+        let urls = parse_yandex(html, 10);
+        assert_eq!(urls, vec!["https://ex.com/cat.jpg", "https://ex.com/dog.png"]);
     }
 
     #[test]

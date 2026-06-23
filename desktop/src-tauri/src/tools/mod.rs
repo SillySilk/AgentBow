@@ -683,7 +683,7 @@ pub async fn dispatch(
             let log_dir = format!("{}\\logs", workspace_root.trim_end_matches(['\\', '/']));
             let s = crate::tools::image_search::image_download(
                 query, count, dest_dir, &log_dir, None,
-                crate::tools::image_search::ScrapeTuning::default(), None,
+                crate::tools::image_search::ScrapeTuning::default(), browser, None,
             ).await?;
             Ok(json!(s))
         }
