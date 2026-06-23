@@ -570,7 +570,7 @@ pub async fn image_download(
     }
     for (key, name, url, parse) in browser_engines {
         if source_enabled(&sources, key) {
-            results.push(scrape_via_browser(browser, *name, url, want, *parse, &progress).await);
+            results.push(scrape_via_browser(browser, *name, url, want, *parse, log_dir, &progress).await);
         }
     }
 
@@ -646,6 +646,7 @@ async fn scrape_via_browser(
     url: &str,
     max: usize,
     parse: fn(&str, usize) -> Vec<String>,
+    log_dir: &str,
     progress: &Option<UnboundedSender<ScrapeEvent>>,
 ) -> ScrapeResult {
     let emit = |e: ScrapeEvent| { if let Some(tx) = progress { let _ = tx.send(e); } };
@@ -668,6 +669,16 @@ async fn scrape_via_browser(
     };
 
     let urls = parse(&html, max);
+
+    // TEMP DIAGNOSTIC: when a browser engine parses 0 URLs from a non-captcha page,
+    // dump the rendered HTML so the parser can be fixed against the real DOM.
+    if urls.is_empty() {
+        let path = format!("{}\\{}_debug.html",
+            log_dir.trim_end_matches(['\\', '/']), source.to_lowercase());
+        let _ = std::fs::create_dir_all(log_dir);
+        let _ = std::fs::write(&path, &html);
+    }
+
     ScrapeResult::ok(source, urls, &html)
 }
 
@@ -801,13 +812,15 @@ fn is_captcha_page(html: &str) -> bool {
 fn parse_yandex(html: &str, max: usize) -> Vec<String> {
     let mut urls = Vec::new();
 
-    // JS layout: img_href in data-bem JSON. Yandex escapes slashes as `\/`,
-    // so unescape each captured URL before keeping it.
-    let mut raw_hrefs = Vec::new();
-    extract_between(html, "\"img_href\":\"", "\"", max, &mut raw_hrefs);
-    for u in &raw_hrefs {
+    // img_href lives in the `data-bem` JSON. The real browser serializes that
+    // attribute with its quotes HTML-encoded (`&quot;`), while a raw HTTP response
+    // uses literal quotes — try both. Yandex also escapes slashes as `\/`.
+    let mut hrefs = Vec::new();
+    extract_between(html, "&quot;img_href&quot;:&quot;", "&quot;", max, &mut hrefs);
+    extract_between(html, "\"img_href\":\"", "\"", max, &mut hrefs);
+    for u in &hrefs {
         let unescaped = u.replace("\\/", "/");
-        if unescaped.starts_with("http") && unescaped.len() > 12 {
+        if unescaped.starts_with("http") && unescaped.len() > 12 && !urls.contains(&unescaped) {
             urls.push(unescaped);
         }
     }
@@ -1275,6 +1288,14 @@ mod tests {
         let html = r#"...{"img_href":"https:\/\/ex.com\/cat.jpg"}...{"img_href":"https:\/\/ex.com\/dog.png"}..."#;
         let urls = parse_yandex(html, 10);
         assert_eq!(urls, vec!["https://ex.com/cat.jpg", "https://ex.com/dog.png"]);
+    }
+
+    #[test]
+    fn parse_yandex_handles_browser_entity_encoded() {
+        // page.content() serializes data-bem quotes as &quot; — the real-browser case.
+        let html = "data-bem=\"{&quot;serp-item&quot;:{&quot;img_href&quot;:&quot;https:\\/\\/ex.com\\/a.jpg&quot;}}\"";
+        let urls = parse_yandex(html, 10);
+        assert_eq!(urls, vec!["https://ex.com/a.jpg"]);
     }
 
     #[test]
