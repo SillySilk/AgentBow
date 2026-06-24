@@ -1,5 +1,8 @@
 @echo off
 REM Bow Image Studio launcher — builds web UI + backend, then runs.
+REM Stop any running instance first so the binary can be relinked (no "Access denied").
+taskkill /F /IM bow-desktop.exe >nul 2>&1
+timeout /t 1 /nobreak >nul
 pushd "%~dp0desktop\webapp"
 call npm run build || goto :err
 popd
