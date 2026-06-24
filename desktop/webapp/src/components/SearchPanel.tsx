@@ -7,9 +7,10 @@ const ALL_SOURCES = [
   { key: "yandex", label: "Yandex" },
   { key: "bing", label: "Bing" },
 ];
-// Sources enabled by default. Bing is omitted — DuckDuckGo already serves the Bing
-// index with more results, so Bing is a redundant fallback you can toggle on.
-const DEFAULT_ENABLED = ["brave", "ddg", "yandex"];
+// Default to Yandex only: its safe-search-off cookie is confirmed working (uncensored
+// results), and since downloads fill from the first engine's candidates, a single
+// uncensored source guarantees uncensored downloads. Toggle the others on as needed.
+const DEFAULT_ENABLED = ["yandex"];
 
 const DEFAULT_PROMPT_HINT =
   "Leave blank to use the default: judges relevance to the query, technical quality, and rejects watermarks/collages/text overlays.";

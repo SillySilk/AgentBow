@@ -598,7 +598,13 @@ pub async fn image_download(
     // results page reqwest gets blocked on, and we run the existing parsers over it.
     let encoded = urlencoding::encode(query);
     type EngineRow = (&'static str, &'static str, String, fn(&str, usize) -> Vec<String>, &'static [(&'static str, &'static str, &'static str)]);
+    // Yandex first: its safe-search-off is confirmed working, so leading with it puts
+    // uncensored candidates at the front of the download queue. DDG (HTTP) runs last.
     let browser_engines: &[EngineRow] = &[
+        ("yandex", "Yandex",
+         format!("https://yandex.com/images/search?text={}&nomisspell=1&numdoc=50&filter=0&itype=photo", encoded),
+         parse_yandex,
+         &[("safesearch", "0", ".yandex.com"), ("yp", "1999999999.sp.ssp%3D0", ".yandex.com")]),
         ("bing", "Bing",
          format!("https://www.bing.com/images/search?q={}&count=50&first=1&safeSearch=Off&adlt=off&mkt=en-US", encoded),
          parse_bing,
@@ -607,20 +613,16 @@ pub async fn image_download(
          format!("https://search.brave.com/images?q={}&safesearch=off&source=web", encoded),
          parse_brave,
          &[("safesearch", "off", ".search.brave.com")]),
-        ("yandex", "Yandex",
-         format!("https://yandex.com/images/search?text={}&nomisspell=1&numdoc=50&filter=0&itype=photo", encoded),
-         parse_yandex,
-         &[("safesearch", "0", ".yandex.com"), ("yp", "1999999999.sp.ssp%3D0", ".yandex.com")]),
     ];
 
     let mut results: Vec<ScrapeResult> = Vec::new();
-    if source_enabled(&sources, "ddg") {
-        results.push(scrape_duckduckgo_images(&client, query, want).await);
-    }
     for (key, name, url, parse, cookies) in browser_engines {
         if source_enabled(&sources, key) {
             results.push(scrape_via_browser(browser, *name, url, want, *parse, cookies, log_dir, &progress).await);
         }
+    }
+    if source_enabled(&sources, "ddg") {
+        results.push(scrape_duckduckgo_images(&client, query, want).await);
     }
 
     for r in &results {
