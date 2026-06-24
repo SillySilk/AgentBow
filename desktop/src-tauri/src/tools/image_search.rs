@@ -102,42 +102,41 @@ impl ScrapeEvent {
 
 pub struct SessionLog {
     path: String,
-    lines: Vec<String>,
+    file: Option<std::fs::File>,
 }
 
 impl SessionLog {
     pub fn new(log_dir: &str, query: &str) -> Self {
-        // Ensure logs directory exists; if it fails we'll surface the error in flush()
+        // Ensure logs directory exists; if it fails we'll surface it in flush()
         let _ = std::fs::create_dir_all(log_dir);
         let path = format!("{}\\bow_downloads.log",
             log_dir.trim_end_matches(['\\', '/']));
-        let mut log = Self { path, lines: Vec::new() };
+        let file = std::fs::OpenOptions::new()
+            .create(true).append(true).open(&path).ok();
+        let mut log = Self { path, file };
         log.push(format!("=== bow image_download [ts:{}] ===", unix_ts()));
         log.push(format!("query: {:?}", query));
         log
     }
+    /// Append a line to the log immediately (write-through). A run that hangs or is
+    /// interrupted (e.g. the window is closed) still leaves a diagnostic trail —
+    /// std::fs::File is unbuffered, so each line hits the OS without an explicit flush.
     fn push(&mut self, line: String) {
         info!("{}", line);
-        self.lines.push(line);
+        if let Some(f) = self.file.as_mut() {
+            let _ = writeln!(f, "{}", line);
+        }
     }
-    /// Write log to disk. Returns a warning string if the write fails so the
-    /// caller can surface it — no more silent failures.
+    /// Lines are already on disk (write-through); this just returns a path note for
+    /// the UI/result, plus a trailing separator between sessions.
     pub fn flush(&self) -> String {
-        match std::fs::OpenOptions::new()
-            .create(true).append(true).open(&self.path)
-        {
-            Err(e) => format!("(log write failed: {} — path: {})", e, self.path),
-            Ok(mut f) => {
-                let mut ok = true;
-                for l in &self.lines {
-                    if writeln!(f, "{}", l).is_err() { ok = false; break; }
-                }
-                let _ = writeln!(f, "");
-                if ok {
-                    format!("Log: {}", self.path)
-                } else {
-                    format!("(log partially written — path: {})", self.path)
-                }
+        match &self.file {
+            None => format!("(log unavailable — could not open {})", self.path),
+            Some(f) => {
+                // &File implements Write; rebind as a mutable place for writeln!.
+                let mut fh = f;
+                let _ = writeln!(fh, "");
+                format!("Log: {}", self.path)
             }
         }
     }
@@ -714,30 +713,43 @@ async fn scrape_via_browser(
         Err(e) => return ScrapeResult::err(source, format!("browser: {}", e)),
     };
 
-    let html = if is_captcha_page(&html) {
+    // Parse FIRST. If results are present, any captcha marker is a false positive
+    // (e.g. Brave is Cloudflare-fronted, so its normal page mentions cloudflare
+    // challenge scripts) — never wait, which avoids multi-minute hangs.
+    let urls = parse(&html, max);
+    if !urls.is_empty() {
+        return ScrapeResult::ok(source, urls, &html);
+    }
+
+    // 0 results: dump the rendered HTML for diagnosis…
+    dump_debug_html(log_dir, source, &html);
+
+    // …and only treat it as a real captcha if a challenge marker is also present.
+    if is_captcha_page(&html) {
         emit(ScrapeEvent::Phase {
             label: format!("Solve the captcha for {} in the browser window — then it continues…", source),
         });
         match wait_for_captcha_clear(browser, std::time::Duration::from_secs(120)).await {
-            Some(h) => h,
-            None => return ScrapeResult::err(source, "captcha — not solved in time".to_string()),
+            Some(h) => {
+                let urls = parse(&h, max);
+                if urls.is_empty() { dump_debug_html(log_dir, source, &h); }
+                ScrapeResult::ok(source, urls, &h)
+            }
+            None => ScrapeResult::err(source, "captcha — not solved in time".to_string()),
         }
     } else {
-        html
-    };
-
-    let urls = parse(&html, max);
-
-    // TEMP DIAGNOSTIC: when a browser engine parses 0 URLs from a non-captcha page,
-    // dump the rendered HTML so the parser can be fixed against the real DOM.
-    if urls.is_empty() {
-        let path = format!("{}\\{}_debug.html",
-            log_dir.trim_end_matches(['\\', '/']), source.to_lowercase());
-        let _ = std::fs::create_dir_all(log_dir);
-        let _ = std::fs::write(&path, &html);
+        // Genuinely empty (no results, no challenge).
+        ScrapeResult::ok(source, urls, &html)
     }
+}
 
-    ScrapeResult::ok(source, urls, &html)
+/// Write a browser engine's rendered HTML to `logs\<engine>_debug.html` so a parser
+/// that returns 0 URLs can be fixed against the real DOM.
+fn dump_debug_html(log_dir: &str, source: &str, html: &str) {
+    let _ = std::fs::create_dir_all(log_dir);
+    let path = format!("{}\\{}_debug.html",
+        log_dir.trim_end_matches(['\\', '/']), source.to_lowercase());
+    let _ = std::fs::write(&path, html);
 }
 
 /// Poll the current page until it's no longer a captcha challenge, or `timeout`
