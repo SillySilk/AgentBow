@@ -21,16 +21,24 @@ fn web_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../webapp/dist")
 }
 
-/// Kill any process currently LISTENING on `port` so a fresh launch can take
-/// over the fixed port (the usual cause is a previous Bow instance still
-/// running). Windows-only; runs `netstat`/`taskkill` with no console window so
-/// nothing flashes on screen. Never targets our own PID.
+/// Free the fixed port so a fresh launch can take it over. The usual cause is a
+/// previous Bow instance still running, so first kill every other `bow-desktop.exe`
+/// by image name (reliable, locale-independent), then defensively kill whatever else
+/// is LISTENING on the port. Windows-only; no console window flashes; never our PID.
 #[cfg(windows)]
 fn free_port(port: u16) {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let me = std::process::id();
 
+    // 1) Kill stale Bow instances by name, excluding ourselves. This is the reliable
+    //    path — it doesn't depend on parsing netstat output.
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/IM", "bow-desktop.exe", "/FI", &format!("PID ne {}", me)])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+
+    // 2) Defensive: kill any non-Bow process LISTENING on the port.
     let output = match std::process::Command::new("netstat")
         .args(["-ano", "-p", "tcp"])
         .creation_flags(CREATE_NO_WINDOW)
@@ -65,6 +73,43 @@ fn free_port(port: u16) {
 
 #[cfg(not(windows))]
 fn free_port(_port: u16) {}
+
+/// Bind `preferred`, recovering from a stale holder. If it still can't be bound —
+/// e.g. the port is reserved by Windows/Hyper-V/WSL and has *no* killable owner — fall
+/// back to the next free port in a small range. Returns the listener and the port
+/// actually bound (which the browser-open + tray then use).
+async fn bind_with_recovery(preferred: u16) -> Option<(tokio::net::TcpListener, u16)> {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], preferred));
+    if let Ok(l) = tokio::net::TcpListener::bind(addr).await {
+        return Some((l, preferred));
+    }
+
+    // Busy — free a stale instance and retry the preferred port over ~4s. A
+    // force-killed listener can take a second or two for Windows to release.
+    info!("Port {} busy — freeing stale instance and retrying", preferred);
+    free_port(preferred);
+    for attempt in 1..=10 {
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        if let Ok(l) = tokio::net::TcpListener::bind(addr).await {
+            info!("Port {} reclaimed", preferred);
+            return Some((l, preferred));
+        }
+        if attempt == 5 {
+            free_port(preferred);
+        }
+    }
+
+    // Still stuck — most likely an OS-reserved port with no owner to kill. Fall back
+    // to the next available port so Bow always launches.
+    for p in (preferred + 1)..=(preferred + 10) {
+        let a = std::net::SocketAddr::from(([127, 0, 0, 1], p));
+        if let Ok(l) = tokio::net::TcpListener::bind(a).await {
+            info!("Port {} unavailable — falling back to {}", preferred, p);
+            return Some((l, p));
+        }
+    }
+    None
+}
 
 fn fatal_config_box(msg: &str) {
     eprintln!("{}", msg);
@@ -106,49 +151,27 @@ pub fn run() {
 
     // tokio runtime on a background thread; tao event loop owns the main thread.
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+
+    // Bind synchronously up front so the browser-open + tray use the port we actually
+    // got (the preferred one after freeing a stale instance, or a fallback if reserved).
+    let (listener, actual_port) = match rt.block_on(bind_with_recovery(ws_port)) {
+        Some(x) => x,
+        None => {
+            fatal_config_box(&format!(
+                "Bow failed to bind 127.0.0.1:{} or any nearby port.\n\nClose any running Bow instance (or run kill-bow.bat) and try again.",
+                ws_port
+            ));
+            std::process::exit(1);
+        }
+    };
+    info!("HTTP+WS listening on http://127.0.0.1:{}", actual_port);
+
     let server_state = app_state.clone();
     let dir = web_dir();
     rt.spawn(async move {
         // MUST run inside the async runtime: load_in_background spawns a task.
         let mcp = crate::tools::mcp::McpManager::load_in_background(workspace.clone());
         let router = crate::http::build_router(server_state, mcp, dir);
-        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], ws_port));
-        let listener = match tokio::net::TcpListener::bind(addr).await {
-            Ok(l) => l,
-            Err(_) => {
-                // Port is taken — almost always a previous Bow instance still
-                // running. Kill whatever holds it, then wait for Windows to release
-                // the socket and retry. A force-killed listener can take a second or
-                // two to free up, so retry several times over ~4s rather than once.
-                info!("Port {} busy — freeing stale instance and retrying", ws_port);
-                free_port(ws_port);
-                let mut bound = None;
-                for attempt in 1..=10 {
-                    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-                    match tokio::net::TcpListener::bind(addr).await {
-                        Ok(l) => { bound = Some(l); break; }
-                        Err(_) => {
-                            // Re-kill in case a slow/respawned holder reclaimed it.
-                            if attempt == 5 { free_port(ws_port); }
-                        }
-                    }
-                }
-                match bound {
-                    Some(l) => {
-                        info!("Port {} reclaimed", ws_port);
-                        l
-                    }
-                    None => {
-                        fatal_config_box(&format!(
-                            "Bow failed to bind 127.0.0.1:{}:\n\nThe port is in use and could not be freed after several attempts.\n\nClose any running Bow instance and try again.",
-                            ws_port
-                        ));
-                        std::process::exit(1);
-                    }
-                }
-            }
-        };
-        info!("HTTP+WS listening on http://{}", addr);
         if let Err(e) = axum::serve(listener, router).await {
             fatal_config_box(&format!("Bow HTTP server error:\n\n{}", e));
             std::process::exit(1);
@@ -156,7 +179,7 @@ pub fn run() {
     });
 
     // Open the browser once the server is up.
-    let url = format!("http://127.0.0.1:{}", ws_port);
+    let url = format!("http://127.0.0.1:{}", actual_port);
     std::thread::spawn({
         let url = url.clone();
         move || {
@@ -186,7 +209,7 @@ pub fn run() {
 
     let _tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip(format!("Bow Image Studio — port {}", ws_port))
+        .with_tooltip(format!("Bow Image Studio — port {}", actual_port))
         .with_icon(icon)
         .build()
         .expect("tray icon");
