@@ -21,6 +21,51 @@ fn web_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../webapp/dist")
 }
 
+/// Kill any process currently LISTENING on `port` so a fresh launch can take
+/// over the fixed port (the usual cause is a previous Bow instance still
+/// running). Windows-only; runs `netstat`/`taskkill` with no console window so
+/// nothing flashes on screen. Never targets our own PID.
+#[cfg(windows)]
+fn free_port(port: u16) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let me = std::process::id();
+
+    let output = match std::process::Command::new("netstat")
+        .args(["-ano", "-p", "tcp"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return,
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let needle = format!(":{}", port);
+    let mut killed = std::collections::HashSet::new();
+    for line in text.lines() {
+        if !line.contains("LISTENING") {
+            continue;
+        }
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        // netstat tcp row: Proto  Local  Foreign  State  PID
+        if cols.len() < 5 || !cols[1].ends_with(&needle) {
+            continue;
+        }
+        if let Ok(pid) = cols[4].parse::<u32>() {
+            if pid != 0 && pid != me && killed.insert(pid) {
+                info!("Port {} held by PID {} — terminating stale instance", port, pid);
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/F", "/PID", &pid.to_string()])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .output();
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn free_port(_port: u16) {}
+
 fn fatal_config_box(msg: &str) {
     eprintln!("{}", msg);
     let _ = std::process::Command::new("powershell.exe")
@@ -70,12 +115,37 @@ pub fn run() {
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], ws_port));
         let listener = match tokio::net::TcpListener::bind(addr).await {
             Ok(l) => l,
-            Err(e) => {
-                fatal_config_box(&format!(
-                    "Bow failed to bind 127.0.0.1:{}:\n\n{}\n\nThe port may already be in use by another instance of Bow.",
-                    ws_port, e
-                ));
-                std::process::exit(1);
+            Err(_) => {
+                // Port is taken — almost always a previous Bow instance still
+                // running. Kill whatever holds it, then wait for Windows to release
+                // the socket and retry. A force-killed listener can take a second or
+                // two to free up, so retry several times over ~4s rather than once.
+                info!("Port {} busy — freeing stale instance and retrying", ws_port);
+                free_port(ws_port);
+                let mut bound = None;
+                for attempt in 1..=10 {
+                    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                    match tokio::net::TcpListener::bind(addr).await {
+                        Ok(l) => { bound = Some(l); break; }
+                        Err(_) => {
+                            // Re-kill in case a slow/respawned holder reclaimed it.
+                            if attempt == 5 { free_port(ws_port); }
+                        }
+                    }
+                }
+                match bound {
+                    Some(l) => {
+                        info!("Port {} reclaimed", ws_port);
+                        l
+                    }
+                    None => {
+                        fatal_config_box(&format!(
+                            "Bow failed to bind 127.0.0.1:{}:\n\nThe port is in use and could not be freed after several attempts.\n\nClose any running Bow instance and try again.",
+                            ws_port
+                        ));
+                        std::process::exit(1);
+                    }
+                }
             }
         };
         info!("HTTP+WS listening on http://{}", addr);
