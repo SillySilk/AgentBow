@@ -75,7 +75,7 @@ pub enum ScrapeEvent {
     Verifying { url: String, done: usize, target: usize },
     Downloaded { done: usize, target: usize, path: String },
     Failed { url: String, reason: String },
-    Done { downloaded: Vec<String>, log_note: String },
+    Done { downloaded: Vec<String>, log_note: String, dest_dir: String },
 }
 
 impl ScrapeEvent {
@@ -92,8 +92,8 @@ impl ScrapeEvent {
                 json!({ "kind": "downloaded", "done": done, "target": target, "path": path }),
             ScrapeEvent::Failed { url, reason } =>
                 json!({ "kind": "failed", "url": url, "reason": reason }),
-            ScrapeEvent::Done { downloaded, log_note } =>
-                json!({ "kind": "done", "downloaded": downloaded, "log_note": log_note }),
+            ScrapeEvent::Done { downloaded, log_note, dest_dir } =>
+                json!({ "kind": "done", "downloaded": downloaded, "log_note": log_note, "dest_dir": dest_dir }),
         }
     }
 }
@@ -682,7 +682,7 @@ pub async fn image_download(
         ));
     }
 
-    emit(ScrapeEvent::Done { downloaded: downloaded.clone(), log_note: log_note.clone() });
+    emit(ScrapeEvent::Done { downloaded: downloaded.clone(), log_note: log_note.clone(), dest_dir: dest_dir.to_string() });
 
     Ok(format!(
         "Downloaded {}/{} images to {}\n{}\nFiles:\n{}",

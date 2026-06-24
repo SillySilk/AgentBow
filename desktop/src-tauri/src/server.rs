@@ -318,7 +318,7 @@ pub async fn run_ws(
                             let result = crate::tools::image_search::download_urls_to_dir(urls, count, &dest, "page", 0, None, &mut log, &Some(tx.clone())).await;
                             let log_note = log.flush();
                             let downloaded = result.unwrap_or_default();
-                            let _ = tx.send(crate::tools::image_search::ScrapeEvent::Done { downloaded, log_note });
+                            let _ = tx.send(crate::tools::image_search::ScrapeEvent::Done { downloaded, log_note, dest_dir: dest.clone() });
                             drop(tx);
                             let _ = forwarder.await;
                         });

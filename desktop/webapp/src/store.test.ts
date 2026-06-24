@@ -14,7 +14,7 @@ describe("applyEvent", () => {
 
   it("marks finished on done", () => {
     let s = initialScrapeState();
-    s = applyEvent(s, { type: "scrape_event", kind: "done", downloaded: ["a"], log_note: "Log: x" });
+    s = applyEvent(s, { type: "scrape_event", kind: "done", downloaded: ["a"], log_note: "Log: x", dest_dir: "C:\\x\\1" });
     expect(s.finished).toBe(true);
     expect(s.running).toBe(false);
   });
@@ -23,6 +23,6 @@ describe("applyEvent", () => {
 describe("isBrowserOpened", () => {
   it("detects browser_opened", () => {
     expect(isBrowserOpened({ type: "browser_opened", url: "https://x" })).toBe(true);
-    expect(isBrowserOpened({ type: "scrape_event", kind: "done", downloaded: [], log_note: "" })).toBe(false);
+    expect(isBrowserOpened({ type: "scrape_event", kind: "done", downloaded: [], log_note: "", dest_dir: "" })).toBe(false);
   });
 });

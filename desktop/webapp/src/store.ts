@@ -7,7 +7,7 @@ export type ScrapeEventMsg =
   | { type: "scrape_event"; kind: "verifying"; url: string; done: number; target: number }
   | { type: "scrape_event"; kind: "downloaded"; done: number; target: number; path: string }
   | { type: "scrape_event"; kind: "failed"; url: string; reason: string }
-  | { type: "scrape_event"; kind: "done"; downloaded: string[]; log_note: string }
+  | { type: "scrape_event"; kind: "done"; downloaded: string[]; log_note: string; dest_dir: string }
   | { type: "scrape_event"; kind: "error"; message: string };
 
 export interface ScrapeState {
@@ -47,9 +47,12 @@ interface Store {
   status: string;
   scrape: ScrapeState;
   lastDestDir: string;
+  /** Folder currently shown in the preview (the active "working slot"). */
+  workingSlotDir: string;
   browserUrl?: string;
   connect: () => void;
   startScrape: (a: { query: string; count: number; destDir: string; sources: string[]; delayMs: number; verify: boolean; visionPrompt: string }) => void;
+  setWorkingSlot: (dir: string) => void;
   openBrowser: (url: string) => void;
   pageScrape: (a: { count: number; destDir: string; scrolls: number }) => void;
   _ws?: WebSocket;
@@ -59,6 +62,7 @@ export const useStore = create<Store>((set, get) => ({
   status: "connecting…",
   scrape: initialScrapeState(),
   lastDestDir: "",
+  workingSlotDir: "",
   connect: () => {
     fetch("/api/config").then(r => r.json()).then(cfg => {
       const token: string = cfg.token ?? "";
@@ -73,7 +77,12 @@ export const useStore = create<Store>((set, get) => ({
         const m = JSON.parse(e.data);
         if (m.type === "auth_ok") set({ status: "connected" });
         else if (m.type === "auth_error") set({ status: "auth error: " + (m.message ?? "") });
-        else if (m.type === "scrape_event") set((st) => ({ scrape: applyEvent(st.scrape, m) }));
+        else if (m.type === "scrape_event") set((st) => {
+          const next: Partial<Store> = { scrape: applyEvent(st.scrape, m) };
+          // When a scrape finishes, the freshly-filled slot becomes the working slot.
+          if (m.kind === "done" && m.dest_dir) next.workingSlotDir = m.dest_dir;
+          return next;
+        });
         else if (isBrowserOpened(m)) set({ browserUrl: m.url });
       };
       ws.onclose = () => set({ status: "disconnected" });
@@ -90,6 +99,7 @@ export const useStore = create<Store>((set, get) => ({
       delay_ms: a.delayMs, verify: a.verify, vision_prompt: a.visionPrompt.trim() || null,
     }));
   },
+  setWorkingSlot: (dir: string) => set({ workingSlotDir: dir }),
   openBrowser: (url: string) => {
     const ws = get()._ws;
     if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "browser_open", url }));

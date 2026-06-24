@@ -155,9 +155,49 @@ pub async fn open_folder(State(s): State<HttpState>, Json(b): Json<OpenBody>) ->
     Json(json!({ "ok": true })).into_response()
 }
 
+/// Immediate subdirectories of `base` whose name is all ASCII digits, sorted
+/// numerically. These are the scrape "set" folders created by `next_numbered_subdir`.
+pub(crate) fn numeric_slot_dirs(base: &Path) -> Vec<(u64, String, PathBuf)> {
+    let mut slots: Vec<(u64, String, PathBuf)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(base) {
+        for e in entries.flatten() {
+            let path = e.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()) {
+                    if let Ok(num) = name.parse::<u64>() {
+                        slots.push((num, name.to_string(), path.clone()));
+                    }
+                }
+            }
+        }
+    }
+    slots.sort_by_key(|(n, _, _)| *n);
+    slots
+}
+
+/// List the numbered set folders under `dir`, each with an image count.
+pub async fn list_slots(State(s): State<HttpState>, Query(q): Query<DirQuery>) -> Response {
+    let Some(base) = within_workspace(&s.app.config.workspace_root, &q.dir) else {
+        return (StatusCode::BAD_REQUEST, "dir outside workspace").into_response();
+    };
+    let slots: Vec<_> = numeric_slot_dirs(&base)
+        .into_iter()
+        .map(|(_, name, path)| {
+            let mut imgs = Vec::new();
+            crate::tools::image_curate::collect_images(&path, false, &mut imgs);
+            json!({ "name": name, "path": path.to_string_lossy(), "count": imgs.len() })
+        })
+        .collect();
+    Json(json!({ "base": base.to_string_lossy(), "slots": slots })).into_response()
+}
+
 pub fn routes() -> Router<HttpState> {
     Router::new()
         .route("/api/images", get(list_images))
+        .route("/api/slots", get(list_slots))
         .route("/api/thumb", get(thumb))
         .route("/api/images/delete", post(delete_images))
         .route("/api/curate/dedupe", post(dedupe))
@@ -180,6 +220,18 @@ mod tests {
         let result2 = resolve_within_workspace(&ws, outside.to_str().unwrap());
         assert!(result2.is_none(), "expected None for path outside workspace");
         std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn numeric_slot_dirs_filters_and_sorts() {
+        let base = std::env::temp_dir().join(format!("bow_slots_{}", uuid::Uuid::new_v4().simple()));
+        for d in ["2", "10", "1", "logs", "notanumber"] {
+            std::fs::create_dir_all(base.join(d)).unwrap();
+        }
+        std::fs::write(base.join("3"), b"a file, not a dir").unwrap();
+        let names: Vec<String> = numeric_slot_dirs(&base).into_iter().map(|(_, n, _)| n).collect();
+        assert_eq!(names, vec!["1", "2", "10"]); // numeric only, numeric sort, no "3" (it's a file)
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]

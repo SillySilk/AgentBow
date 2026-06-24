@@ -1,4 +1,11 @@
 export interface ImageItem { name: string; path: string; bytes: number }
+export interface Slot { name: string; path: string; count: number }
+
+export async function listSlots(dir: string): Promise<Slot[]> {
+  const r = await fetch(`/api/slots?dir=${encodeURIComponent(dir)}`);
+  if (!r.ok) { console.error("listSlots failed", r.status); return []; }
+  return (await r.json()).slots as Slot[];
+}
 
 export function thumbUrl(path: string, w = 256): string {
   return `/api/thumb?path=${encodeURIComponent(path)}&w=${w}`;
