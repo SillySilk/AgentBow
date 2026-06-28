@@ -433,6 +433,9 @@ pub struct ScrapeTuning {
     pub vision_model_override: String,
     /// Chat model id — used as a last-resort fallback if auto-detect fails.
     pub chat_model: String,
+    /// Skip images that perceptually match an image already in the bin or kept earlier
+    /// this run. Forces the sequential download path so hashing stays ordered.
+    pub dedupe: bool,
 }
 
 /// Choose the vision model id from LM Studio's `/api/v0/models` JSON. Prefers a
@@ -587,71 +590,32 @@ pub async fn image_download(
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {}", e))?;
 
-    let want = count * 4;
-    let mut candidates: Vec<String> = Vec::new();
-
-    log.push("-- Scraping sources --".to_string());
-    emit(ScrapeEvent::Phase { label: "Scraping sources".into() });
-
-    // DuckDuckGo stays on its working HTTP/JSON-API path (not blocked). Bing, Brave,
-    // and Yandex are fetched through the real headed browser — it loads the same
-    // results page reqwest gets blocked on, and we run the existing parsers over it.
+    // A single results page yields ~50 images, so over-fetch per page and paginate
+    // until we have `count` *successful* downloads (or the enabled sources run out).
+    const MAX_SCRAPE_PAGES: usize = 12;
+    let per_page_max = (count * 4).max(50);
     let encoded = urlencoding::encode(query);
-    type EngineRow = (&'static str, &'static str, String, fn(&str, usize) -> Vec<String>, &'static [(&'static str, &'static str, &'static str)]);
-    // Yandex first: its safe-search-off is confirmed working, so leading with it puts
-    // uncensored candidates at the front of the download queue. DDG (HTTP) runs last.
+
+    // (key, display, page-url builder, parser, pre-nav cookies). Yandex first: its
+    // safe-search-off is confirmed working, so leading with it puts uncensored
+    // candidates at the front of the download queue. DDG (HTTP) runs last.
+    type EngineRow = (
+        &'static str,
+        &'static str,
+        fn(&str, usize) -> String,
+        fn(&str, usize) -> Vec<String>,
+        &'static [(&'static str, &'static str, &'static str)],
+    );
     let browser_engines: &[EngineRow] = &[
-        ("yandex", "Yandex",
-         format!("https://yandex.com/images/search?text={}&nomisspell=1&numdoc=50&filter=0&itype=photo", encoded),
-         parse_yandex,
+        ("yandex", "Yandex", yandex_page_url, parse_yandex,
          &[("safesearch", "0", ".yandex.com"), ("yp", "1999999999.sp.ssp%3D0", ".yandex.com")]),
-        ("bing", "Bing",
-         format!("https://www.bing.com/images/search?q={}&count=50&first=1&safeSearch=Off&adlt=off&mkt=en-US", encoded),
-         parse_bing,
+        ("bing", "Bing", bing_page_url, parse_bing,
          &[("SRCHHPGUSR", "SRCHLANG=en&ADLT=OFF&NNT=10&NRSLT=50", ".bing.com"), ("adlt", "off", ".bing.com")]),
-        ("brave", "Brave",
-         format!("https://search.brave.com/images?q={}&safesearch=off&source=web", encoded),
-         parse_brave,
+        ("brave", "Brave", brave_page_url, parse_brave,
          &[("safesearch", "off", ".search.brave.com")]),
     ];
 
-    let mut results: Vec<ScrapeResult> = Vec::new();
-    for (key, name, url, parse, cookies) in browser_engines {
-        if source_enabled(&sources, key) {
-            results.push(scrape_via_browser(browser, *name, url, want, *parse, cookies, log_dir, &progress).await);
-        }
-    }
-    if source_enabled(&sources, "ddg") {
-        results.push(scrape_duckduckgo_images(&client, query, want).await);
-    }
-
-    for r in &results {
-        log.push(r.log_line());
-        emit(ScrapeEvent::Source { source: r.source.to_string(), count: r.urls.len(), error: r.error.clone() });
-        for u in &r.urls {
-            if !candidates.contains(u) { candidates.push(u.clone()); }
-        }
-    }
-    log.push(format!("Total candidates: {}", candidates.len()));
-
-    // Filter out known paid/auth-gated CDNs that always return 400/403
-    let before = candidates.len();
-    candidates.retain(|u| !is_paywalled_url(u));
-    let filtered = before - candidates.len();
-    if filtered > 0 {
-        log.push(format!("Filtered {} paid CDN URLs (Getty, iStock, Shutterstock, Alamy)", filtered));
-    }
-    emit(ScrapeEvent::Candidates { total: candidates.len(), filtered });
-
-    if candidates.is_empty() {
-        log.push("FATAL: no candidates — all scrapers returned 0 URLs".to_string());
-        let log_note = log.flush();
-        return Err(anyhow::anyhow!(
-            "No images found for {:?}. {}", query, log_note
-        ));
-    }
-
-    // ── Download phase ────────────────────────────────────────────────────────
+    // Resolve the vision gate once (independent of paging).
     let verify_cfg = if tuning.verify {
         let (model, warn) = resolve_vision_model(
             &tuning.lm_studio_url, &tuning.vision_model_override, &tuning.chat_model,
@@ -672,15 +636,115 @@ pub async fn image_download(
     } else {
         None
     };
-    let downloaded = download_urls_to_dir(
-        candidates, count, dest_dir, query, tuning.delay_ms, verify_cfg, &mut log, &progress,
-    ).await?;
+
+    // Dedicated download client (separate from the scraping `client` above).
+    let dl_client = Arc::new(
+        reqwest::Client::builder()
+            .cookie_store(true)
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                         (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+            .timeout(std::time::Duration::from_secs(30))
+            .redirect(safe_redirect_policy())
+            .build()
+            .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {}", e))?
+    );
+
+    let sanitized = sanitize_filename(query);
+    let dest_base = dest_dir.trim_end_matches(['\\', '/']).to_string();
+
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut downloaded: Vec<String> = Vec::new();
+    let mut failures: Vec<(String, String)> = Vec::new();
+    // Continue numbering after any files already in the bin (resume/append) so an
+    // existing set is never overwritten.
+    let mut seq = highest_existing_index(&dest_base, &sanitized);
+    // Seed the content-dedup set with the bin's existing images so a resumed scrape
+    // skips ones it already holds (even under different filenames).
+    let mut seen_hashes: Vec<Phash> = if tuning.dedupe {
+        let h = hash_dir_images(&dest_base).await;
+        log.push(format!("Dedupe ON — hashed {} existing image(s) in bin", h.len()));
+        h
+    } else {
+        Vec::new()
+    };
+
+    log.push("-- Scraping + downloading (paginated until target met) --".to_string());
+    emit(ScrapeEvent::Phase { label: "Scraping sources".into() });
+
+    for page in 0..MAX_SCRAPE_PAGES {
+        if downloaded.len() >= count {
+            break;
+        }
+
+        // Scrape this page from every enabled source.
+        let mut results: Vec<ScrapeResult> = Vec::new();
+        for (key, name, page_url, parse, cookies) in browser_engines {
+            if source_enabled(&sources, key) {
+                let url = page_url(&encoded, page);
+                results.push(
+                    scrape_via_browser(browser, *name, &url, per_page_max, *parse, cookies, log_dir, &progress).await,
+                );
+            }
+        }
+        if source_enabled(&sources, "ddg") {
+            results.push(scrape_duckduckgo_images(&client, query, per_page_max, page).await);
+        }
+
+        // Gather raw URLs, decode/paywall-filter/dedupe within the page, then keep only
+        // candidates not already seen on an earlier page.
+        let mut raw: Vec<String> = Vec::new();
+        for r in &results {
+            log.push(format!("p{} {}", page, r.log_line()));
+            emit(ScrapeEvent::Source { source: r.source.to_string(), count: r.urls.len(), error: r.error.clone() });
+            raw.extend(r.urls.iter().cloned());
+        }
+        let raw_n = raw.len();
+        let decoded = filter_candidates(raw);
+        let filtered = raw_n.saturating_sub(decoded.len());
+        let new_candidates: Vec<String> =
+            decoded.into_iter().filter(|u| seen.insert(u.clone())).collect();
+
+        emit(ScrapeEvent::Candidates { total: seen.len(), filtered });
+        log.push(format!(
+            "p{}: +{} new candidates (pool {}), downloaded {}/{}",
+            page, new_candidates.len(), seen.len(), downloaded.len(), count
+        ));
+
+        // No new candidates this round → the enabled sources are exhausted.
+        if new_candidates.is_empty() {
+            break;
+        }
+
+        download_batch(
+            &dl_client, new_candidates, count, &dest_base, &sanitized,
+            tuning.delay_ms, &verify_cfg, tuning.dedupe, &mut seen_hashes,
+            &mut downloaded, &mut failures, &mut seq, &progress,
+        ).await;
+    }
+
+    downloaded.sort();
+    log_download_summary(&mut log, &downloaded, &failures, count, verify_cfg.is_some());
 
     let log_note = log.flush();
 
+    if seen.is_empty() {
+        return Err(anyhow::anyhow!("No images found for {:?}. {}", query, log_note));
+    }
+
+    // Nothing new saved. Distinguish "everything was already in the bin" (a normal
+    // resume outcome) from a genuine total failure so the UI doesn't show a scary error.
     if downloaded.is_empty() {
-        return Err(anyhow::anyhow!(
-            "All downloads failed for {:?}. {}", query, log_note
+        let dup_skips = failures.iter().filter(|(_, r)| r.starts_with("duplicate")).count();
+        let other = failures.len() - dup_skips;
+        if dup_skips == 0 {
+            return Err(anyhow::anyhow!("All downloads failed for {:?}. {}", query, log_note));
+        }
+        emit(ScrapeEvent::Done { downloaded: vec![], log_note: log_note.clone(), dest_dir: dest_dir.to_string() });
+        return Ok(format!(
+            "0 new images for {:?} — {} candidate(s) already in the bin{}.\n{}",
+            query, dup_skips,
+            if other > 0 { format!(", {} failed", other) } else { String::new() },
+            log_note
         ));
     }
 
@@ -773,6 +837,32 @@ async fn wait_for_captcha_clear(
     }
 }
 
+// ── Per-engine page URLs ────────────────────────────────────────────────────────
+// `page` is 0-indexed. Each builder maps it to that engine's pagination param so the
+// scraper can keep pulling fresh results until the success target is met.
+
+fn yandex_page_url(encoded_query: &str, page: usize) -> String {
+    format!(
+        "https://yandex.com/images/search?text={}&nomisspell=1&numdoc=50&filter=0&itype=photo&p={}",
+        encoded_query, page
+    )
+}
+
+fn bing_page_url(encoded_query: &str, page: usize) -> String {
+    // Bing's `first` is a 1-indexed result offset; 50 results per page.
+    format!(
+        "https://www.bing.com/images/search?q={}&count=50&first={}&safeSearch=Off&adlt=off&mkt=en-US",
+        encoded_query, page * 50 + 1
+    )
+}
+
+fn brave_page_url(encoded_query: &str, page: usize) -> String {
+    format!(
+        "https://search.brave.com/images?q={}&safesearch=off&source=web&offset={}",
+        encoded_query, page
+    )
+}
+
 /// Parse original image URLs from a Bing images results page.
 fn parse_bing(html: &str, max: usize) -> Vec<String> {
     let mut urls = Vec::new();
@@ -789,8 +879,9 @@ fn parse_bing(html: &str, max: usize) -> Vec<String> {
     urls
 }
 
-async fn scrape_duckduckgo_images(client: &reqwest::Client, query: &str, max: usize) -> ScrapeResult {
+async fn scrape_duckduckgo_images(client: &reqwest::Client, query: &str, max: usize, page: usize) -> ScrapeResult {
     let encoded = urlencoding::encode(query);
+    let offset = page * 100; // DDG's i.js `s` param pages ~100 results at a time
 
     // Step 1: Pre-seed safe search OFF in cookie store by visiting DDG with kp=-2
     // This causes DDG to set the safe search preference cookie in our cookie jar
@@ -829,8 +920,8 @@ async fn scrape_duckduckgo_images(client: &reqwest::Client, query: &str, max: us
     };
 
     let api_url = format!(
-        "https://duckduckgo.com/i.js?q={}&vqd={}&o=json&l=us-en&s=0&f=,,,,,&p=-2",
-        encoded, vqd
+        "https://duckduckgo.com/i.js?q={}&vqd={}&o=json&l=us-en&s={}&f=,,,,,&p=-2",
+        encoded, vqd, offset
     );
     info!("DDG vqd={}", vqd);
     let resp = match client.get(&api_url)
@@ -949,6 +1040,137 @@ fn parse_brave(html: &str, max: usize) -> Vec<String> {
     urls
 }
 
+// ── Content dedup (pHash) ───────────────────────────────────────────────────────
+
+type Phash = image_hasher::ImageHash<Box<[u8]>>;
+
+/// Perceptual-hash encoded image bytes off the async runtime (decode is CPU-heavy).
+/// Returns `None` on decode failure.
+async fn phash_async(bytes: &[u8]) -> Option<Phash> {
+    let bytes = bytes.to_vec();
+    tokio::task::spawn_blocking(move || crate::tools::image_curate::phash_bytes(&bytes))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Decide whether a freshly downloaded image is a content duplicate. When `dedupe`
+/// is on, hashes `bytes` and compares it against `seen_hashes` (existing bin images
+/// plus images kept earlier this run). Returns `Some(reason)` to skip a near-duplicate;
+/// otherwise records the hash and returns `None`. Fail-open: an undecodable image is
+/// kept. With `dedupe` off it always returns `None`.
+async fn dedupe_skip(dedupe: bool, bytes: &[u8], seen_hashes: &mut Vec<Phash>) -> Option<String> {
+    if !dedupe {
+        return None;
+    }
+    let h = phash_async(bytes).await?;
+    if seen_hashes.iter().any(|e| e.dist(&h) <= crate::tools::image_curate::DEDUPE_DIST) {
+        Some("duplicate of existing image".to_string())
+    } else {
+        seen_hashes.push(h);
+        None
+    }
+}
+
+/// Perceptual-hash every image already in `dir` (non-recursive), off the runtime, so a
+/// resumed scrape can skip re-downloading images the bin already holds.
+async fn hash_dir_images(dir: &str) -> Vec<Phash> {
+    let dir = dir.to_string();
+    tokio::task::spawn_blocking(move || {
+        let mut paths = Vec::new();
+        crate::tools::image_curate::collect_images(Path::new(&dir), false, &mut paths);
+        paths
+            .iter()
+            .filter_map(|p| std::fs::read(p).ok())
+            .filter_map(|b| crate::tools::image_curate::phash_bytes(&b))
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
+}
+
+// ── SSRF guard ──────────────────────────────────────────────────────────────────
+
+/// True for addresses we must never fetch from search results: loopback, private,
+/// link-local (incl. the `169.254.169.254` cloud-metadata endpoint), CGNAT,
+/// broadcast, documentation, and unspecified ranges. Defense-in-depth against SSRF
+/// via a malicious image URL or redirect.
+fn is_blocked_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => is_blocked_v4(v4),
+        std::net::IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_blocked_v4(&mapped);
+            }
+            let head = v6.segments()[0];
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (head & 0xfe00) == 0xfc00 // fc00::/7 unique-local
+                || (head & 0xffc0) == 0xfe80 // fe80::/10 link-local
+        }
+    }
+}
+
+fn is_blocked_v4(v4: &std::net::Ipv4Addr) -> bool {
+    let o = v4.octets();
+    v4.is_private()
+        || v4.is_loopback()
+        || v4.is_link_local()
+        || v4.is_broadcast()
+        || v4.is_documentation()
+        || v4.is_unspecified()
+        || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64.0.0/10 CGNAT
+}
+
+/// Reject a URL whose host is — or resolves to — a non-public address before we ever
+/// connect. Public IP literals pass without a DNS lookup; hostnames are resolved and
+/// every returned address must be public.
+async fn ensure_public_url(url: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| anyhow::anyhow!("invalid url: {}", e))?;
+    let host = parsed.host_str().ok_or_else(|| anyhow::anyhow!("url has no host"))?;
+
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return if is_blocked_ip(&ip) {
+            Err(anyhow::anyhow!("blocked non-public address {}", ip))
+        } else {
+            Ok(())
+        };
+    }
+
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    let mut any = false;
+    for addr in tokio::net::lookup_host((host, port)).await
+        .map_err(|e| anyhow::anyhow!("dns resolve failed for {}: {}", host, e))?
+    {
+        any = true;
+        if is_blocked_ip(&addr.ip()) {
+            return Err(anyhow::anyhow!("{} resolves to blocked address {}", host, addr.ip()));
+        }
+    }
+    if !any {
+        return Err(anyhow::anyhow!("dns returned no addresses for {}", host));
+    }
+    Ok(())
+}
+
+/// Redirect policy that follows up to 5 hops but refuses any hop to an IP-literal
+/// non-public address — the classic SSRF "public URL → http://127.0.0.1" trick.
+fn safe_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 5 {
+            return attempt.error("too many redirects");
+        }
+        if let Some(host) = attempt.url().host_str() {
+            if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                if is_blocked_ip(&ip) {
+                    return attempt.error("redirect to blocked non-public address");
+                }
+            }
+        }
+        attempt.follow()
+    })
+}
+
 // ── Download ──────────────────────────────────────────────────────────────────
 
 const MAX_IMAGE_BYTES: usize = 6 * 1024 * 1024; // 6 MB
@@ -957,6 +1179,9 @@ const MAX_IMAGE_BYTES: usize = 6 * 1024 * 1024; // 6 MB
 /// Streams in chunks, validates magic bytes, enforces size cap.
 async fn download_image_bytes(client: &reqwest::Client, url: &str) -> Result<(Vec<u8>, &'static str)> {
     use futures_util::StreamExt;
+
+    // Refuse non-public targets before connecting (SSRF guard).
+    ensure_public_url(url).await?;
 
     // Use a domain-appropriate Referer — Reddit images 403 without reddit.com as referer
     let referer = if url.contains("redd.it") || url.contains("reddit.com") {
@@ -1110,35 +1335,82 @@ pub async fn download_urls_to_dir(
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                          (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
             .timeout(std::time::Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::limited(5))
+            .redirect(safe_redirect_policy())
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {}", e))?
     );
 
     let mut downloaded: Vec<String> = Vec::new();
     let mut failures: Vec<(String, String)> = Vec::new(); // (url, reason)
+    let mut seq = highest_existing_index(&dest_base, &sanitized);
 
-    // The vision gate (and any non-zero pacing delay) forces the sequential path:
-    // download one candidate, optionally judge it, keep or discard, then pace.
-    if verify.is_some() || delay_ms > 0 {
+    download_batch(
+        &client, candidates, count, &dest_base, &sanitized,
+        delay_ms, &verify, false, &mut Vec::new(),
+        &mut downloaded, &mut failures, &mut seq, progress,
+    ).await;
+
+    downloaded.sort();
+    log_download_summary(log, &downloaded, &failures, count, verify.is_some());
+    Ok(downloaded)
+}
+
+/// Download from `candidates`, appending successful paths to `downloaded` and
+/// `(url, reason)` pairs to `failures`, until `downloaded` reaches `target_total`
+/// successes or the list is exhausted. Only *successful* downloads count toward the
+/// target — failures are recorded but never advance it. `seq` is a running file-number
+/// counter so naming (`<name>_NNN.ext`) stays unique and continuous across the
+/// multiple paginated batches that make up one request.
+#[allow(clippy::too_many_arguments)]
+async fn download_batch(
+    client: &Arc<reqwest::Client>,
+    candidates: Vec<String>,
+    target_total: usize,
+    dest_base: &str,
+    sanitized: &str,
+    delay_ms: u64,
+    verify: &Option<VerifyConfig>,
+    dedupe: bool,
+    seen_hashes: &mut Vec<Phash>,
+    downloaded: &mut Vec<String>,
+    failures: &mut Vec<(String, String)>,
+    seq: &mut usize,
+    progress: &Option<UnboundedSender<ScrapeEvent>>,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let emit = |e: ScrapeEvent| { if let Some(tx) = progress { let _ = tx.send(e); } };
+
+    // The vision gate, content dedup, and any non-zero pacing delay all force the
+    // sequential path: download one candidate, optionally judge/hash it, keep or
+    // discard, then pace.
+    if verify.is_some() || dedupe || delay_ms > 0 {
         for url in &candidates {
-            if downloaded.len() >= count { break; }
-            match download_image_bytes(&client, url).await {
+            if downloaded.len() >= target_total { break; }
+            match download_image_bytes(client, url).await {
                 Ok((bytes, ext)) => {
-                    let (keep, reason) = match &verify {
+                    let (keep, reason) = match verify {
                         Some(cfg) => {
-                            emit(ScrapeEvent::Verifying { url: url.clone(), done: downloaded.len(), target: count });
+                            emit(ScrapeEvent::Verifying { url: url.clone(), done: downloaded.len(), target: target_total });
                             vision_judge(&bytes, ext, cfg).await
                         }
                         None => (true, String::new()),
                     };
-                    if keep {
-                        let path = format!("{}\\{}_{:03}.{}", dest_base, sanitized, downloaded.len() + 1, ext);
+                    if !keep {
+                        let reason = format!("rejected: {}", reason);
+                        debug!("SKIP {} — {}", url, reason);
+                        failures.push((url.clone(), reason.clone()));
+                        emit(ScrapeEvent::Failed { url: url.clone(), reason });
+                    } else if let Some(dup) = dedupe_skip(dedupe, &bytes, seen_hashes).await {
+                        debug!("DUP  {} — {}", url, dup);
+                        failures.push((url.clone(), dup.clone()));
+                        emit(ScrapeEvent::Failed { url: url.clone(), reason: dup });
+                    } else {
+                        let path = next_free_path(dest_base, sanitized, ext, seq);
                         match std::fs::write(&path, &bytes) {
                             Ok(_) => {
                                 debug!("OK  {}", path);
                                 downloaded.push(path.clone());
-                                emit(ScrapeEvent::Downloaded { done: downloaded.len(), target: count, path });
+                                emit(ScrapeEvent::Downloaded { done: downloaded.len(), target: target_total, path });
                             }
                             Err(e) => {
                                 let reason = format!("write: {}", e);
@@ -1146,11 +1418,6 @@ pub async fn download_urls_to_dir(
                                 emit(ScrapeEvent::Failed { url: url.clone(), reason });
                             }
                         }
-                    } else {
-                        let reason = format!("rejected: {}", reason);
-                        debug!("SKIP {} — {}", url, reason);
-                        failures.push((url.clone(), reason.clone()));
-                        emit(ScrapeEvent::Failed { url: url.clone(), reason });
                     }
                 }
                 Err(e) => {
@@ -1162,74 +1429,94 @@ pub async fn download_urls_to_dir(
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             }
         }
-    } else {
-        // Fast path: 3 concurrent downloads, no verification or pacing.
-        let sem = Arc::new(Semaphore::new(3));
-        let mut tasks = tokio::task::JoinSet::new();
+        return;
+    }
 
-        for (i, url) in candidates.iter().enumerate() {
-            let url = url.clone();
-            let client = client.clone();
-            let sem = sem.clone();
-            let sanitized = sanitized.clone();
-            let dest_base = dest_base.clone();
-            tasks.spawn(async move {
-                let _permit = sem.acquire().await.ok()?;
-                match download_image_bytes(&client, &url).await {
-                    Ok((bytes, ext)) => {
-                        let path = format!("{}\\{}_{:03}.{}", dest_base, sanitized, i + 1, ext);
-                        match std::fs::write(&path, &bytes) {
-                            Ok(_) => Some((true, url, path, String::new())),
-                            Err(e) => Some((false, url, String::new(), format!("write: {}", e))),
-                        }
-                    }
-                    Err(e) => Some((false, url, String::new(), e.to_string())),
-                }
-            });
-        }
+    // Fast path: 3 concurrent downloads, no verification or pacing. A shared atomic
+    // hands out file numbers so concurrent successes never collide, continuing from
+    // `seq` (the count carried over from previous pages).
+    let sem = Arc::new(Semaphore::new(3));
+    let seq_atomic = Arc::new(AtomicUsize::new(*seq));
+    let mut tasks = tokio::task::JoinSet::new();
 
-        while let Some(task_result) = tasks.join_next().await {
-            if let Ok(Some((ok, url, path, reason))) = task_result {
-                if ok {
-                    debug!("OK  {}", path);
-                    downloaded.push(path);
-                    emit(ScrapeEvent::Downloaded { done: downloaded.len(), target: count, path: downloaded.last().cloned().unwrap_or_default() });
-                    if downloaded.len() >= count {
-                        tasks.abort_all();
-                        break;
+    for url in candidates {
+        let client = client.clone();
+        let sem = sem.clone();
+        let sanitized = sanitized.to_string();
+        let dest_base = dest_base.to_string();
+        let seq_atomic = seq_atomic.clone();
+        tasks.spawn(async move {
+            let _permit = sem.acquire().await.ok()?;
+            match download_image_bytes(&client, &url).await {
+                Ok((bytes, ext)) => {
+                    // Unique number per success; skip any number whose file already
+                    // exists (resume into a non-empty bin never overwrites).
+                    let mut n = seq_atomic.fetch_add(1, Ordering::SeqCst) + 1;
+                    let mut path = format!("{}\\{}_{:03}.{}", dest_base, sanitized, n, ext);
+                    while Path::new(&path).exists() {
+                        n = seq_atomic.fetch_add(1, Ordering::SeqCst) + 1;
+                        path = format!("{}\\{}_{:03}.{}", dest_base, sanitized, n, ext);
                     }
-                } else {
-                    debug!("FAIL {} — {}", url, reason);
-                    failures.push((url.clone(), reason.clone()));
-                    emit(ScrapeEvent::Failed { url, reason });
+                    match std::fs::write(&path, &bytes) {
+                        Ok(_) => Some((true, url, path, String::new())),
+                        Err(e) => Some((false, url, String::new(), format!("write: {}", e))),
+                    }
                 }
+                Err(e) => Some((false, url, String::new(), e.to_string())),
+            }
+        });
+    }
+
+    while let Some(task_result) = tasks.join_next().await {
+        if let Ok(Some((ok, url, path, reason))) = task_result {
+            if ok {
+                debug!("OK  {}", path);
+                downloaded.push(path.clone());
+                emit(ScrapeEvent::Downloaded { done: downloaded.len(), target: target_total, path });
+                if downloaded.len() >= target_total {
+                    tasks.abort_all();
+                    break;
+                }
+            } else {
+                debug!("FAIL {} — {}", url, reason);
+                failures.push((url.clone(), reason.clone()));
+                emit(ScrapeEvent::Failed { url, reason });
             }
         }
     }
-    downloaded.sort();
+    *seq = seq_atomic.load(Ordering::SeqCst);
+}
 
-    // Log download results
+/// Append the post-download summary to the session log: success count, grouped
+/// failure reasons, a sample of failed URLs, and the final file list.
+fn log_download_summary(
+    log: &mut SessionLog,
+    downloaded: &[String],
+    failures: &[(String, String)],
+    count: usize,
+    verify_on: bool,
+) {
     log.push(format!("Downloaded: {}/{}", downloaded.len(), count));
-    if verify.is_some() && downloaded.len() < count {
+    if downloaded.len() < count {
         log.push(format!(
-            "Vision-QA: approved {}/{} — candidate pool exhausted (raise count or loosen the prompt)",
-            downloaded.len(), count
+            "Short of target: approved {}/{} — sources exhausted{}",
+            downloaded.len(), count,
+            if verify_on { " (raise count or loosen the vision prompt)" } else { " (raise count or enable more sources)" }
         ));
     }
     if !failures.is_empty() {
         log.push(format!("Failed: {} URLs", failures.len()));
-        // Group failures by reason for readability
+        // Group failures by reason for readability.
         let mut reason_counts: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
-        for (_, reason) in &failures {
-            // Normalise reason to a short key (first 60 chars)
+        for (_, reason) in failures {
             let key = reason.chars().take(60).collect::<String>();
             *reason_counts.entry(key).or_insert(0) += 1;
         }
-        for (reason, count) in &reason_counts {
-            log.push(format!("  x{} — {}", count, reason));
+        for (reason, c) in &reason_counts {
+            log.push(format!("  x{} — {}", c, reason));
         }
-        // Log up to 10 specific failed URLs for targeted debugging
+        // Log up to 10 specific failed URLs for targeted debugging.
         log.push("  Sample failed URLs:".to_string());
         for (url, reason) in failures.iter().take(10) {
             log.push(format!("    [{}] {}", reason.chars().take(40).collect::<String>(), url));
@@ -1237,12 +1524,10 @@ pub async fn download_urls_to_dir(
     }
     if !downloaded.is_empty() {
         log.push("Files:".to_string());
-        for f in &downloaded {
+        for f in downloaded {
             log.push(format!("  {}", f));
         }
     }
-
-    Ok(downloaded)
 }
 
 fn content_type_to_ext(ct: &str) -> Option<&'static str> {
@@ -1253,27 +1538,90 @@ fn content_type_to_ext(ct: &str) -> Option<&'static str> {
     else { None }
 }
 
-/// Pick a fresh numbered set folder under `parent`: the lowest positive integer N
-/// for which `<parent>\N` does not yet exist, create it, and return its path.
-/// Fills gaps — if folder 3 was deleted, the next scrape reuses 3 — and has no
-/// upper bound beyond the loop ceiling. Creates `parent` first if needed.
-pub fn next_numbered_subdir(parent: &str) -> Result<String> {
+/// Count image files directly inside `dir` (non-recursive). A bin is "empty" when
+/// this is 0 — `_bow_dupes` and non-image files don't count.
+fn bin_image_count(dir: &Path) -> usize {
+    let mut v = Vec::new();
+    crate::tools::image_curate::collect_images(dir, false, &mut v);
+    v.len()
+}
+
+/// Auto-select a bin under `parent`: the lowest `N` in `1..=10` that is either
+/// missing or exists but holds no images (reusing an empty bin). Creates the chosen
+/// bin if needed. Errors when all ten bins already contain images.
+pub fn pick_auto_bin(parent: &str) -> Result<String> {
     let base = parent.trim_end_matches(['\\', '/']);
     std::fs::create_dir_all(base)
         .map_err(|e| anyhow::anyhow!("Failed to create '{}': {}", base, e))?;
-    for n in 1..=1_000_000u32 {
+    for n in 1..=10u32 {
         let candidate = format!("{}\\{}", base, n);
-        if Path::new(&candidate).exists() {
-            continue;
+        let path = Path::new(&candidate);
+        if !path.exists() {
+            std::fs::create_dir(&candidate)
+                .map_err(|e| anyhow::anyhow!("Failed to create '{}': {}", candidate, e))?;
+            return Ok(candidate);
         }
-        match std::fs::create_dir(&candidate) {
-            Ok(_) => return Ok(candidate),
-            // Lost a race to another scrape that just took this number — try the next.
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(anyhow::anyhow!("Failed to create '{}': {}", candidate, e)),
+        if path.is_dir() && bin_image_count(path) == 0 {
+            return Ok(candidate);
         }
     }
-    Err(anyhow::anyhow!("No free numbered set folder under '{}'", base))
+    Err(anyhow::anyhow!(
+        "All 10 bins under '{}' contain images — clear one or pick a bin manually.", base
+    ))
+}
+
+/// Resolve a user-chosen bin number (`1..=10`) under `parent` to its path, creating
+/// it if needed. Returns the bin even when it already contains images (resume/append).
+pub fn resolve_manual_bin(parent: &str, n: u32) -> Result<String> {
+    if !(1..=10).contains(&n) {
+        return Err(anyhow::anyhow!("Bin must be between 1 and 10 (got {})", n));
+    }
+    let base = parent.trim_end_matches(['\\', '/']);
+    let candidate = format!("{}\\{}", base, n);
+    std::fs::create_dir_all(&candidate)
+        .map_err(|e| anyhow::anyhow!("Failed to create '{}': {}", candidate, e))?;
+    Ok(candidate)
+}
+
+/// Highest `N` among files named `<prefix>_NNN.<ext>` directly in `dir` (0 if none).
+/// Lets a resumed scrape continue numbering instead of overwriting existing files.
+fn highest_existing_index(dir: &str, prefix: &str) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    let needle = format!("{}_", prefix);
+    let mut max = 0usize;
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !is_image_name(name) { continue; }
+        let Some(stem) = Path::new(name).file_stem().and_then(|s| s.to_str()) else { continue };
+        if let Some(rest) = stem.strip_prefix(&needle) {
+            if let Ok(n) = rest.parse::<usize>() {
+                max = max.max(n);
+            }
+        }
+    }
+    max
+}
+
+/// True when `name` has a known image extension (case-insensitive).
+fn is_image_name(name: &str) -> bool {
+    matches!(
+        Path::new(name).extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).as_deref(),
+        Some("jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "tif" | "tiff")
+    )
+}
+
+/// Advance `*seq` to the next index whose `<prefix>_NNN.<ext>` path doesn't already
+/// exist in `dest_base`, and return that path. Guarantees existing files are never
+/// overwritten, even across paginated batches and resumed scrapes.
+fn next_free_path(dest_base: &str, prefix: &str, ext: &str, seq: &mut usize) -> String {
+    loop {
+        *seq += 1;
+        let path = format!("{}\\{}_{:03}.{}", dest_base, prefix, *seq, ext);
+        if !Path::new(&path).exists() {
+            return path;
+        }
+    }
 }
 
 fn sanitize_filename(name: &str) -> String {
@@ -1310,20 +1658,179 @@ mod tests {
         assert!(r.contains("unparsed"));
     }
 
+    fn write_test_png(path: &Path) {
+        use image::{Rgb, RgbImage};
+        RgbImage::from_pixel(8, 8, Rgb([1, 2, 3])).save(path).unwrap();
+    }
+
+    fn fresh_base(tag: &str) -> (std::path::PathBuf, String) {
+        let base = std::env::temp_dir().join(format!("bow_bin_{}_{}", tag, uuid::Uuid::new_v4().simple()));
+        let s = base.to_string_lossy().to_string();
+        (base, s)
+    }
+
     #[test]
-    fn numbered_subdir_fills_lowest_gap() {
-        let base = std::env::temp_dir().join(format!("bow_numtest_{}", unix_ts()));
-        let base_s = base.to_string_lossy().to_string();
-        // First two scrapes → 1, then 2.
-        let d1 = next_numbered_subdir(&base_s).unwrap();
-        assert!(d1.ends_with("\\1"));
-        let d2 = next_numbered_subdir(&base_s).unwrap();
-        assert!(d2.ends_with("\\2"));
-        // Delete 1 → next scrape reuses the gap.
-        std::fs::remove_dir(&d1).unwrap();
-        let d3 = next_numbered_subdir(&base_s).unwrap();
-        assert!(d3.ends_with("\\1"));
-        let _ = std::fs::remove_dir_all(&base);
+    fn auto_bin_reuses_existing_empty_bin() {
+        let (base, base_s) = fresh_base("reuse");
+        // Bin 1 has an image; bin 2 exists but is empty → reuse 2.
+        std::fs::create_dir_all(base.join("1")).unwrap();
+        write_test_png(&base.join("1").join("a.png"));
+        std::fs::create_dir_all(base.join("2")).unwrap();
+
+        let chosen = pick_auto_bin(&base_s).unwrap();
+        assert!(chosen.ends_with("\\2"), "should reuse empty bin 2, got {}", chosen);
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn auto_bin_creates_lowest_missing_when_no_empty_bin() {
+        let (base, base_s) = fresh_base("missing");
+        // Bin 1 has an image; bins 2..=10 don't exist → create 2.
+        std::fs::create_dir_all(base.join("1")).unwrap();
+        write_test_png(&base.join("1").join("a.png"));
+
+        let chosen = pick_auto_bin(&base_s).unwrap();
+        assert!(chosen.ends_with("\\2"), "should create bin 2, got {}", chosen);
+        assert!(Path::new(&chosen).is_dir());
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn auto_bin_errors_when_all_ten_contain_images() {
+        let (base, base_s) = fresh_base("full");
+        for n in 1..=10 {
+            let d = base.join(n.to_string());
+            std::fs::create_dir_all(&d).unwrap();
+            write_test_png(&d.join("a.png"));
+        }
+        assert!(pick_auto_bin(&base_s).is_err(), "all 10 full → error");
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    fn encode_png(img: image::RgbImage) -> Vec<u8> {
+        let mut buf = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        buf
+    }
+    fn gradient_png(w: u32, h: u32) -> Vec<u8> {
+        use image::{Rgb, RgbImage};
+        let mut img = RgbImage::new(w, h);
+        for y in 0..h { for x in 0..w { let v = ((x + y) % 256) as u8; img.put_pixel(x, y, Rgb([v, v, v])); } }
+        encode_png(img)
+    }
+    fn checker_png(w: u32, h: u32) -> Vec<u8> {
+        use image::{Rgb, RgbImage};
+        let mut img = RgbImage::new(w, h);
+        for y in 0..h { for x in 0..w {
+            let c = if (x / 64 + y / 64) % 2 == 0 { [0, 0, 0] } else { [255, 255, 255] };
+            img.put_pixel(x, y, Rgb(c));
+        } }
+        encode_png(img)
+    }
+
+    #[test]
+    fn blocks_private_and_reserved_ips() {
+        use std::net::IpAddr;
+        for s in ["127.0.0.1", "10.0.0.1", "192.168.1.5", "172.16.0.1",
+                  "169.254.169.254", "100.64.0.1", "0.0.0.0",
+                  "::1", "fe80::1", "fc00::1", "::ffff:127.0.0.1"] {
+            assert!(is_blocked_ip(&s.parse::<IpAddr>().unwrap()), "{} should be blocked", s);
+        }
+        for s in ["8.8.8.8", "1.1.1.1", "93.184.216.34",
+                  "2606:2800:220:1:248:1893:25c8:1946"] {
+            assert!(!is_blocked_ip(&s.parse::<IpAddr>().unwrap()), "{} should be allowed", s);
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_public_url_blocks_local_and_metadata_targets() {
+        assert!(ensure_public_url("http://127.0.0.1/x").await.is_err());
+        assert!(ensure_public_url("http://169.254.169.254/latest/meta-data").await.is_err());
+        assert!(ensure_public_url("http://[::1]:8080/").await.is_err());
+        assert!(ensure_public_url("http://10.1.2.3/img.jpg").await.is_err());
+        assert!(ensure_public_url("http://localhost/").await.is_err()); // resolves to loopback
+        assert!(ensure_public_url("not a url").await.is_err());
+        // Public IP literal: allowed without any DNS lookup.
+        assert!(ensure_public_url("https://8.8.8.8/img.jpg").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dedupe_skip_detects_duplicate_and_keeps_distinct() {
+        let big = gradient_png(256, 256);
+        // A true downscale of the gradient — perceptually identical → duplicate.
+        let small = {
+            let img = image::load_from_memory(&big).unwrap()
+                .resize(128, 128, image::imageops::FilterType::Lanczos3)
+                .to_rgb8();
+            encode_png(img)
+        };
+        let distinct = checker_png(256, 256);
+
+        let mut hashes: Vec<Phash> = Vec::new();
+        // First image is novel → kept and remembered.
+        assert!(dedupe_skip(true, &big, &mut hashes).await.is_none());
+        assert_eq!(hashes.len(), 1);
+        // Its downscale is a near-duplicate → skipped, not remembered.
+        assert!(dedupe_skip(true, &small, &mut hashes).await.is_some());
+        assert_eq!(hashes.len(), 1);
+        // A structurally different image → kept.
+        assert!(dedupe_skip(true, &distinct, &mut hashes).await.is_none());
+        assert_eq!(hashes.len(), 2);
+        // dedupe disabled → never skips, never records.
+        assert!(dedupe_skip(false, &big, &mut hashes).await.is_none());
+        assert_eq!(hashes.len(), 2);
+    }
+
+    #[test]
+    fn highest_existing_index_finds_max_for_prefix() {
+        let (base, base_s) = fresh_base("seq");
+        std::fs::create_dir_all(&base).unwrap();
+        write_test_png(&base.join("query_001.png"));
+        write_test_png(&base.join("query_004.png"));
+        write_test_png(&base.join("dog_009.png")); // different prefix — ignored
+        std::fs::write(base.join("query_007.txt"), b"x").unwrap(); // non-image — ignored
+        assert_eq!(highest_existing_index(&base_s, "query"), 4);
+        assert_eq!(highest_existing_index(&base_s, "cat"), 0); // none → 0
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn next_free_path_skips_existing_files() {
+        let (base, base_s) = fresh_base("free");
+        std::fs::create_dir_all(&base).unwrap();
+        write_test_png(&base.join("query_001.png"));
+        let mut seq = 0usize;
+        let p = next_free_path(&base_s, "query", "png", &mut seq);
+        assert!(p.ends_with("query_002.png"), "got {}", p);
+        assert_eq!(seq, 2);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn manual_bin_rejects_out_of_range() {
+        let (base, base_s) = fresh_base("range");
+        std::fs::create_dir_all(&base).unwrap();
+        assert!(resolve_manual_bin(&base_s, 0).is_err());
+        assert!(resolve_manual_bin(&base_s, 11).is_err());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn manual_bin_creates_and_returns_requested() {
+        let (base, base_s) = fresh_base("manual");
+        let p = resolve_manual_bin(&base_s, 5).unwrap();
+        assert!(p.ends_with("\\5"), "got {}", p);
+        assert!(Path::new(&p).is_dir());
+        // Returns the same bin even when it already has images.
+        write_test_png(&Path::new(&p).join("a.png"));
+        let p2 = resolve_manual_bin(&base_s, 5).unwrap();
+        assert_eq!(p, p2);
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
@@ -1365,6 +1872,20 @@ mod tests {
         assert!(is_captcha_page("<div class=\"g-recaptcha\"></div>"));
         assert!(is_captcha_page("challenges.cloudflare.com/turnstile"));
         assert!(!is_captcha_page("<html><div class=\"serp-item\">img</div></html>"));
+    }
+
+    #[test]
+    fn page_urls_advance_per_engine_offsets() {
+        // Yandex: 0-indexed page param.
+        assert!(yandex_page_url("cats", 0).contains("&p=0"));
+        assert!(yandex_page_url("cats", 3).contains("&p=3"));
+        // Bing: 1-indexed result offset, 50 per page.
+        assert!(bing_page_url("cats", 0).contains("first=1"));
+        assert!(bing_page_url("cats", 1).contains("first=51"));
+        assert!(bing_page_url("cats", 2).contains("first=101"));
+        // Brave: offset param echoes the page index.
+        assert!(brave_page_url("cats", 0).contains("offset=0"));
+        assert!(brave_page_url("cats", 4).contains("offset=4"));
     }
 
     #[test]

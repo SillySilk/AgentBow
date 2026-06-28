@@ -51,7 +51,7 @@ interface Store {
   workingSlotDir: string;
   browserUrl?: string;
   connect: () => void;
-  startScrape: (a: { query: string; count: number; destDir: string; sources: string[]; delayMs: number; verify: boolean; visionPrompt: string }) => void;
+  startScrape: (a: { query: string; count: number; destDir: string; sources: string[]; delayMs: number; verify: boolean; visionPrompt: string; bin: number | null; dedupe: boolean }) => void;
   setWorkingSlot: (dir: string) => void;
   openBrowser: (url: string) => void;
   pageScrape: (a: { count: number; destDir: string; scrolls: number }) => void;
@@ -90,13 +90,14 @@ export const useStore = create<Store>((set, get) => ({
       set({ _ws: ws });
     }).catch(() => set({ status: "config unavailable" }));
   },
-  startScrape: (a: { query: string; count: number; destDir: string; sources: string[]; delayMs: number; verify: boolean; visionPrompt: string }) => {
+  startScrape: (a: { query: string; count: number; destDir: string; sources: string[]; delayMs: number; verify: boolean; visionPrompt: string; bin: number | null; dedupe: boolean }) => {
     const ws = get()._ws;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     set({ scrape: { ...initialScrapeState(), running: true, target: a.count }, lastDestDir: a.destDir });
     ws.send(JSON.stringify({
       type: "scrape_request", query: a.query, count: a.count, dest_dir: a.destDir, sources: a.sources,
       delay_ms: a.delayMs, verify: a.verify, vision_prompt: a.visionPrompt.trim() || null,
+      bin: a.bin, dedupe: a.dedupe,
     }));
   },
   setWorkingSlot: (dir: string) => set({ workingSlotDir: dir }),

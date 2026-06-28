@@ -26,6 +26,9 @@ export default function SearchPanel() {
   const [verify, setVerify] = useState(true);
   const [visionPrompt, setVisionPrompt] = useState("");
   const [delayMs, setDelayMs] = useState(1500);
+  const [useBin, setUseBin] = useState(false);
+  const [bin, setBin] = useState(1);
+  const [dedupe, setDedupe] = useState(true);
 
   const disabled = running || status !== "connected" || !query.trim() || !destDir.trim() || enabled.size === 0;
   return (
@@ -49,6 +52,26 @@ export default function SearchPanel() {
         ))}
       </div>
 
+      {/* Bin selection: auto by default; check to target a specific bin (resume/append). */}
+      <div style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 13, color: "#a8b2d8" }}>
+        <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+          <input type="checkbox" checked={useBin} onChange={(e) => setUseBin(e.target.checked)} />
+          Add to a specific bin
+        </label>
+        <select disabled={!useBin} value={bin} onChange={(e) => setBin(Number(e.target.value))}
+          style={{ ...inp, padding: "6px 8px", opacity: useBin ? 1 : 0.5 }}>
+          {Array.from({ length: 10 }, (_, i) => i + 1).map((n) => (
+            <option key={n} value={n}>Bin {n}</option>
+          ))}
+        </select>
+      </div>
+
+      {/* Content dedup gate (default on). */}
+      <label style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 13, color: "#a8b2d8" }}>
+        <input type="checkbox" checked={dedupe} onChange={(e) => setDedupe(e.target.checked)} />
+        Skip duplicates already in the bin (visual match, ignores filename)
+      </label>
+
       {/* Vision-QA gate */}
       <label style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 13, color: "#a8b2d8" }}>
         <input type="checkbox" checked={verify} onChange={(e) => setVerify(e.target.checked)} />
@@ -67,7 +90,7 @@ export default function SearchPanel() {
           onChange={(e) => setDelayMs(Number(e.target.value))} />
       </label>
 
-      <button disabled={disabled} onClick={() => startScrape({ query, count, destDir, sources: [...enabled], delayMs, verify, visionPrompt })}
+      <button disabled={disabled} onClick={() => startScrape({ query, count, destDir, sources: [...enabled], delayMs, verify, visionPrompt, bin: useBin ? bin : null, dedupe })}
         style={{ ...btn, opacity: disabled ? 0.5 : 1 }}>
         {running ? "Scraping…" : "Download images"}
       </button>

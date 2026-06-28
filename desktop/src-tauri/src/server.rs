@@ -35,10 +35,17 @@ enum InboundMsg {
         #[serde(default)] verify: bool,
         /// Optional override for the vision judging prompt.
         #[serde(default)] vision_prompt: Option<String>,
+        /// Target a specific bin (1–10). None ⇒ auto-pick the lowest empty bin.
+        #[serde(default)] bin: Option<u32>,
+        /// Skip images that perceptually match ones already in the bin or this run.
+        #[serde(default = "default_true")] dedupe: bool,
     },
     BrowserOpen { url: String },
     PageScrapeRequest { count: u32, dest_dir: String, #[serde(default)] scrolls: u32 },
 }
+
+/// serde default for the dedup flag (on unless the client explicitly disables it).
+fn default_true() -> bool { true }
 
 /// Classify a raw inbound WS text frame before full deserialization.
 /// Returns None for control frames the loop should skip (e.g. ping).
@@ -190,7 +197,7 @@ pub async fn run_ws(
                         interrupt_flag.store(true, Ordering::Relaxed);
                     }
 
-                    InboundMsg::ScrapeRequest { query, count, dest_dir, sources, delay_ms, verify, vision_prompt } => {
+                    InboundMsg::ScrapeRequest { query, count, dest_dir, sources, delay_ms, verify, vision_prompt, bin, dedupe } => {
                         if !authenticated {
                             send_json(&out_tx, json!({"type":"error","code":"unauthenticated","message":"Must authenticate first"})).await;
                             continue;
@@ -204,12 +211,16 @@ pub async fn run_ws(
                                 continue;
                             }
                         };
-                        // Each scrape lands in its own fresh numbered set folder (lowest free
-                        // integer under dest_dir) so sets never pile up in one directory.
-                        let dest_dir = match crate::tools::image_search::next_numbered_subdir(&dest_dir) {
+                        // Resolve the target bin: a manual 1–10 choice (resume/append, even if
+                        // non-empty) or auto-pick the lowest empty bin (error if all ten are full).
+                        let bin_result = match bin {
+                            Some(n) => crate::tools::image_search::resolve_manual_bin(&dest_dir, n),
+                            None => crate::tools::image_search::pick_auto_bin(&dest_dir),
+                        };
+                        let dest_dir = match bin_result {
                             Ok(p) => p,
                             Err(e) => {
-                                let err = serde_json::json!({"type":"scrape_event","kind":"error","message": format!("set folder: {}", e)});
+                                let err = serde_json::json!({"type":"scrape_event","kind":"error","message": format!("bin: {}", e)});
                                 let _ = out_tx.send(err.to_string()).await;
                                 continue;
                             }
@@ -226,6 +237,7 @@ pub async fn run_ws(
                             lm_studio_url: config.lm_studio_url.clone(),
                             vision_model_override: config.lm_studio_vision_model.clone(),
                             chat_model: config.lm_studio_model.clone(),
+                            dedupe,
                         };
                         let out_tx = out_tx.clone();
                         let cb = controlled_browser.clone();
@@ -287,8 +299,8 @@ pub async fn run_ws(
                                     return;
                                 }
                             };
-                            // Fresh numbered set folder per page-scrape too (see ScrapeRequest).
-                            let dest = match crate::tools::image_search::next_numbered_subdir(&dest) {
+                            // Auto-select a bin per page-scrape too (see ScrapeRequest).
+                            let dest = match crate::tools::image_search::pick_auto_bin(&dest) {
                                 Ok(p) => p,
                                 Err(e) => {
                                     let _ = out_tx.send(serde_json::json!({"type":"scrape_event","kind":"error","message": format!("set folder: {}", e)}).to_string()).await;
@@ -374,13 +386,15 @@ mod tests {
         let v = serde_json::json!({"type":"scrape_request","query":"cats","count":15,"dest_dir":"C:\\x"});
         let parsed: InboundMsg = serde_json::from_value(v).unwrap();
         match parsed {
-            InboundMsg::ScrapeRequest { query, count, dest_dir, sources, delay_ms, verify, .. } => {
+            InboundMsg::ScrapeRequest { query, count, dest_dir, sources, delay_ms, verify, bin, dedupe, .. } => {
                 assert_eq!(query, "cats");
                 assert_eq!(count, 15);
                 assert_eq!(dest_dir, "C:\\x");
                 assert!(sources.is_none());
                 assert_eq!(delay_ms, 0);
                 assert!(!verify);
+                assert!(bin.is_none(), "bin defaults to None (auto)");
+                assert!(dedupe, "dedupe defaults to ON");
             }
             _ => panic!("wrong variant"),
         }

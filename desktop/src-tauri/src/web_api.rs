@@ -156,7 +156,7 @@ pub async fn open_folder(State(s): State<HttpState>, Json(b): Json<OpenBody>) ->
 }
 
 /// Immediate subdirectories of `base` whose name is all ASCII digits, sorted
-/// numerically. These are the scrape "set" folders created by `next_numbered_subdir`.
+/// numerically. These are the scrape "bin" folders created by `pick_auto_bin`.
 pub(crate) fn numeric_slot_dirs(base: &Path) -> Vec<(u64, String, PathBuf)> {
     let mut slots: Vec<(u64, String, PathBuf)> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(base) {

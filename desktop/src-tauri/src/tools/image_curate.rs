@@ -41,6 +41,19 @@ pub(crate) fn collect_images(dir: &Path, recursive: bool, out: &mut Vec<PathBuf>
     }
 }
 
+/// Max Hamming distance between two 64-bit pHashes for the images to count as the
+/// same. Shared by `image_dedupe` and the download-time dedup in `image_search`.
+pub(crate) const DEDUPE_DIST: u32 = 10;
+
+/// Perceptual hash (Mean + DCT = classic pHash) of encoded image bytes. Returns
+/// `None` when the bytes don't decode. Lets callers dedup downloaded images in-memory
+/// without writing them to disk first.
+pub(crate) fn phash_bytes(bytes: &[u8]) -> Option<ImageHash<Box<[u8]>>> {
+    let img = image::load_from_memory(bytes).ok()?;
+    let hasher = HasherConfig::new().hash_alg(HashAlg::Mean).preproc_dct().to_hasher();
+    Some(hasher.hash_image(&img))
+}
+
 // ── Dedupe ──────────────────────────────────────────────────────────────────────
 
 struct Hashed {
