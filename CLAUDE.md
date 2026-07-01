@@ -61,5 +61,9 @@ general AI agent is secondary.
 - Local LLM only — never reintroduce Anthropic/cloud model calls.
 - Fix compiler/linter warnings even when non-fatal.
 - Shell execution by the agent must stay silent (no popup window).
-- Commit only when explicitly asked.
+- Commit only when explicitly asked — **except**: at the end of any redesign
+  task (a visual/UI rebrand or restyling pass), commit the finished work
+  locally and push to `origin master` without asking first. This exception is
+  scoped to redesign work; all other commit/push activity still requires
+  explicit sign-off.
 - Keep `.bat`/launcher files in the repo root, never buried in subdirectories.
