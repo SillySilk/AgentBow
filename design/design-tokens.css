@@ -1,0 +1,97 @@
+/* ============================================================
+   AGENT 008 "BOJANGLES HORNSNAILER" — IMAGE FORGE
+   Design tokens extracted from the Thing-o-Matic Design System
+   (speakeasy base + forge layer). These are the ONLY values the
+   cockpit redesign uses. Drop into the webapp, or map to your
+   existing theme. Authoritative source: the design system's
+   tokens/colors.css + tokens/forge.css.
+   ============================================================ */
+
+:root {
+  /* ---- fonts (Google Fonts CDN) ---- */
+  --font-display: 'Pirata One', cursive;      /* blackletter — headlines, wordmark */
+  --font-marker:  'Permanent Marker', cursive;/* hand-paint — stamps, margin notes */
+  --font-type:    'Special Elite', monospace; /* typewriter — eyebrows, labels, buttons, meta */
+  --font-body:    'Crimson Pro', Georgia, serif; /* aged serif — body copy, field text */
+
+  /* ---- ink / neutrals ---- */
+  --ink-900: #0a0a0c;
+  --ink-800: #101013;
+  --soot:    #34323a;
+
+  /* ---- gold (the crucible light) ---- */
+  --gold-300: #ffe085;
+  --gold-400: #f4d160;
+  --gold-500: #d4af37;   /* PRIMARY gold */
+  --gold-600: #d4972b;
+  --gold-700: #8a5a12;
+  --gold-800: #4a3a12;   /* frame border (local fallback, not a DS token) */
+
+  /* ---- ember (burnt-red graffiti / danger) ---- */
+  --ember-300: #d9613f;
+  --ember-400: #c14529;
+  --ember-500: #a8311e;  /* PRIMARY burnt red */
+  --ember-600: #842316;
+  --ember-700: #5e160d;
+
+  /* ---- flame (forge fire — hotter/oranger than ember) ---- */
+  --flame-300: #ffc090;
+  --flame-400: #ff9a5c;
+  --flame-500: #ff7a18;  /* the forge fire — "running" / heat accents */
+  --flame-600: #d9531c;
+
+  /* ---- parchment (the only light) ---- */
+  --parchment-100: #f1ead8;
+  --parchment-200: #e9e0cc;
+  --parchment-300: #cfc4a6;
+
+  /* ---- midnight (bruised blue — avatars, chips) ---- */
+  --midnight-700: #122146;
+  --midnight-800: #0c1530;
+
+  /* ---- support ---- */
+  --absinthe: #8fa86b;   /* success / "line secure" / go */
+
+  /* ---- FORGE surfaces (workshop mode — cooler, tighter than the speakeasy rooms) ---- */
+  --surface-forge-base: #0a0a0b;   /* app window bg */
+  --surface-forge-side: #08080a;   /* sidebar */
+  --surface-forge-head: #0d0c0a;   /* header bar */
+  --surface-forge-card: #141312;   /* cards, panels */
+  --surface-forge-well: #100f0d;   /* inputs, logs, wells */
+  --surface-forge-lit:  #161208;   /* gold-tinted active/selected */
+
+  /* ---- forge text ---- */
+  --text-forge-body:  #c6c6ce;
+  --text-forge-cream: #e8e0c8;
+  --text-forge-mute:  #8a8a93;
+  --text-forge-faint: #4a4a44;
+
+  /* ---- forge borders (signature olive-gold hairline) ---- */
+  --border-forge:      #2a2a1e;
+  --border-forge-btn:  #3a3a1f;
+  --border-forge-cool: #3a3a3f;   /* inputs */
+
+  /* ---- forge radii (this workshop is rounded, not cut) ---- */
+  --radius-forge-sm: 5px;
+  --radius-forge-md: 6px;   /* buttons */
+  --radius-forge-lg: 8px;
+  --radius-forge-xl: 10px;  /* app frame, hero */
+
+  /* ---- forge state colors ---- */
+  --forge-ok:   #d4af37;
+  --forge-err:  #d9534f;
+  --forge-idle: #6a6a72;
+
+  /* ---- molten gradients (top-lit, from the crucible) ---- */
+  --grad-ingot:    linear-gradient(180deg, #f6c453 0%, #b8860b 100%);              /* forge button (rest) */
+  --grad-molten-hot: linear-gradient(180deg, #ffd874 0%, #a8701a 100%);            /* forge button (hover) */
+  --grad-progress: linear-gradient(90deg, #8a5a12 0%, #d4972b 50%, #f6c453 100%);  /* progress fill */
+  --rule-gold:     linear-gradient(90deg, transparent, #8a5a12 15%, #d4af37 50%, #8a5a12 85%, transparent); /* gold hairline divider */
+
+  /* ---- glows ---- */
+  --glow-gold:  0 0 18px rgba(212,151,43,0.45);
+  --glow-ember: 0 0 16px rgba(168,49,30,0.5);
+}
+
+/* Google Fonts import — mirror of the DS tokens/fonts.css */
+@import url('https://fonts.googleapis.com/css2?family=Crimson+Pro:ital,wght@0,400;0,500;0,600;0,700;1,400;1,600&family=Permanent+Marker&family=Pirata+One&family=Special+Elite&display=swap');

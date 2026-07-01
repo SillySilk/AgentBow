@@ -1,5 +1,7 @@
 import { useState } from "react";
+import { Lock } from "lucide-react";
 import { useStore } from "../store";
+import Button from "./ui/Button";
 
 export default function PageScrapePanel() {
   const openBrowser = useStore((s) => s.openBrowser);
@@ -12,26 +14,39 @@ export default function PageScrapePanel() {
   const [scrolls, setScrolls] = useState(5);
   const [destDir, setDestDir] = useState("C:\\AI\\workspace\\");
   const ready = status === "connected";
+
   return (
-    <div style={{ display: "grid", gap: 8, maxWidth: 560, marginTop: 24, borderTop: "1px solid #2a2a4a", paddingTop: 16 }}>
-      <strong style={{ color: "#a8b2d8" }}>Scrape a page / gallery</strong>
-      {browserUrl && <div style={{ fontSize: "0.8em", color: "#a8b2d8" }}>Browser open at: {browserUrl}</div>}
-      <div style={{ display: "flex", gap: 8 }}>
-        <input placeholder="Page URL (log in / navigate first)" value={url} onChange={(e) => setUrl(e.target.value)} style={inp} />
-        <button disabled={!ready || !url.trim()} onClick={() => openBrowser(url)} style={btn2}>Open browser</button>
+    <div style={{ background: "var(--surface-forge-card)", border: "1px solid var(--border-forge)", borderRadius: "var(--radius-forge-lg)", padding: 16 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+        <span style={{ fontFamily: "var(--font-type)", color: "var(--gold-500)", fontSize: 12, letterSpacing: ".2em" }}>FIELD JOB</span>
+        <span style={{ fontFamily: "var(--font-type)", fontSize: 9.5, letterSpacing: ".06em", color: "var(--text-forge-mute)" }}>WORK A GALLERY</span>
       </div>
-      <div style={{ display: "flex", gap: 8 }}>
-        <input type="number" min={1} max={500} value={count} onChange={(e) => setCount(Math.max(1, Math.min(500, Number(e.target.value) || 1)))} style={{ ...inp, width: 80 }} title="max images" />
-        <input type="number" min={0} max={50} value={scrolls} onChange={(e) => setScrolls(Math.max(0, Math.min(50, Number(e.target.value) || 0)))} style={{ ...inp, width: 80 }} title="scroll passes" />
-        <input placeholder="Destination folder" value={destDir} onChange={(e) => setDestDir(e.target.value)} style={{ ...inp, flex: 1 }} />
+
+      <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+        <input placeholder="gallery.example.net/db5 (log in / navigate first)" value={url} onChange={(e) => setUrl(e.target.value)}
+          className="forge-input" style={{ flex: 1, fontSize: 13, minWidth: 0 }} />
+        <Button variant="ember" size="sm" disabled={!ready || !url.trim()} onClick={() => openBrowser(url)}>Ghost car</Button>
       </div>
-      <button disabled={!ready || running || !destDir.trim()} onClick={() => pageScrape({ count, destDir, scrolls })} style={btn}>
-        {running ? "Scraping…" : "Scrape images from current page"}
-      </button>
+
+      {browserUrl && (
+        <div style={{ display: "flex", alignItems: "center", gap: 8, fontFamily: "var(--font-type)", fontSize: 9.5, letterSpacing: ".06em", color: "var(--absinthe)", marginBottom: 12 }}>
+          <Lock size={13} />
+          TAIL OPEN · {browserUrl}
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+        <input type="number" min={1} max={500} value={count} onChange={(e) => setCount(Math.max(1, Math.min(500, Number(e.target.value) || 1)))}
+          className="forge-input" style={{ width: 70, fontSize: 13 }} title="max images" />
+        <input type="number" min={0} max={50} value={scrolls} onChange={(e) => setScrolls(Math.max(0, Math.min(50, Number(e.target.value) || 0)))}
+          className="forge-input" style={{ width: 70, fontSize: 13 }} title="scroll passes" />
+        <input placeholder="Destination folder" value={destDir} onChange={(e) => setDestDir(e.target.value)}
+          className="forge-input" style={{ flex: 1, fontSize: 13, minWidth: 0 }} />
+      </div>
+
+      <Button variant="ghost" size="sm" block disabled={!ready || running || !destDir.trim()} onClick={() => pageScrape({ count, destDir, scrolls })}>
+        {running ? "Working…" : `Work the gallery · ${count} rounds`}
+      </Button>
     </div>
   );
 }
-
-const inp: React.CSSProperties = { background: "#16213e", color: "#a8b2d8", border: "1px solid #2a2a4a", borderRadius: 8, padding: "8px 10px" };
-const btn: React.CSSProperties = { background: "#e94560", color: "white", border: "none", borderRadius: 8, padding: "10px 14px", cursor: "pointer" };
-const btn2: React.CSSProperties = { background: "#0f3460", color: "#a8b2d8", border: "1px solid #2a2a4a", borderRadius: 8, padding: "8px 12px", cursor: "pointer" };

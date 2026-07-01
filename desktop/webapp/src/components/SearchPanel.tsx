@@ -1,10 +1,13 @@
 import { useState } from "react";
 import { useStore } from "../store";
+import Button from "./ui/Button";
+import Switch from "./ui/Switch";
+import Tag from "./ui/Tag";
 
 const ALL_SOURCES = [
+  { key: "yandex", label: "Yandex" },
   { key: "brave", label: "Brave" },
   { key: "ddg", label: "DuckDuckGo" },
-  { key: "yandex", label: "Yandex" },
   { key: "bing", label: "Bing" },
 ];
 // Default to Yandex only: its safe-search-off cookie is confirmed working (uncensored
@@ -13,7 +16,7 @@ const ALL_SOURCES = [
 const DEFAULT_ENABLED = ["yandex"];
 
 const DEFAULT_PROMPT_HINT =
-  "Leave blank to use the default: judges relevance to the query, technical quality, and rejects watermarks/collages/text overlays.";
+  "Leave blank to use the default: judges relevance to the subject, technical quality, and rejects watermarks/collages/text overlays.";
 
 export default function SearchPanel() {
   const startScrape = useStore((s) => s.startScrape);
@@ -31,71 +34,114 @@ export default function SearchPanel() {
   const [dedupe, setDedupe] = useState(true);
 
   const disabled = running || status !== "connected" || !query.trim() || !destDir.trim() || enabled.size === 0;
+  const toggleSource = (key: string) => setEnabled((prev) => {
+    const n = new Set(prev);
+    if (n.has(key)) n.delete(key); else n.add(key);
+    return n;
+  });
+
   return (
-    <div style={{ display: "grid", gap: 8, maxWidth: 560 }}>
-      <input placeholder="Search query (e.g. golden retriever puppies)" value={query}
-        onChange={(e) => setQuery(e.target.value)} style={inp} />
-      <div style={{ display: "flex", gap: 8 }}>
-        <input type="number" min={1} max={200} value={count}
-          onChange={(e) => setCount(Math.max(1, Math.min(200, Number(e.target.value) || 1)))}
-          style={{ ...inp, width: 90 }} />
-        <input placeholder="Destination folder" value={destDir}
-          onChange={(e) => setDestDir(e.target.value)} style={{ ...inp, flex: 1 }} />
+    <div
+      style={{
+        height: "100%",
+        backgroundColor: "var(--surface-forge-card)",
+        backgroundImage: "linear-gradient(180deg, rgba(20,19,18,.6), rgba(20,19,18,.92)), url('./panel_metal.png')",
+        backgroundSize: "cover",
+        border: "1px solid var(--border-forge)",
+        borderRadius: "var(--radius-forge-lg)",
+        padding: 20,
+        display: "flex",
+        flexDirection: "column",
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
+        <span style={{ fontFamily: "var(--font-type)", color: "var(--gold-500)", fontSize: 12, letterSpacing: ".2em" }}>THE MARK</span>
+        <span style={{ fontFamily: "var(--font-marker)", color: "var(--ember-400)", fontSize: 15, transform: "rotate(-3deg)" }}>what are we after?</span>
       </div>
-      <div style={{ display: "flex", gap: 10, flexWrap: "wrap", fontSize: 12, color: "#a8b2d8" }}>
+
+      <label className="forge-label">The subject</label>
+      <input
+        className="forge-input"
+        placeholder="e.g. 1965 aston martin db5, silver, studio"
+        value={query}
+        onChange={(e) => setQuery(e.target.value)}
+        style={{ width: "100%", margin: "5px 0 14px" }}
+      />
+
+      <div style={{ display: "grid", gridTemplateColumns: "96px 1fr", gap: 12, marginBottom: 14 }}>
+        <div>
+          <label className="forge-label">Haul size</label>
+          <input type="number" min={1} max={200} className="forge-input" style={{ width: "100%", marginTop: 5 }}
+            value={count} onChange={(e) => setCount(Math.max(1, Math.min(200, Number(e.target.value) || 1)))} />
+        </div>
+        <div>
+          <label className="forge-label">The vault (drop point)</label>
+          <input className="forge-input" style={{ width: "100%", marginTop: 5 }}
+            value={destDir} onChange={(e) => setDestDir(e.target.value)} placeholder="Destination folder" />
+        </div>
+      </div>
+
+      <label className="forge-label" style={{ marginBottom: 8 }}>Informants</label>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 16 }}>
         {ALL_SOURCES.map((s) => (
-          <label key={s.key} style={{ display: "flex", gap: 4, alignItems: "center" }}>
-            <input type="checkbox" checked={enabled.has(s.key)}
-              onChange={(e) => setEnabled((prev) => { const n = new Set(prev); e.target.checked ? n.add(s.key) : n.delete(s.key); return n; })} />
-            {s.label}
-          </label>
+          <Tag key={s.key} active={enabled.has(s.key)} onClick={() => toggleSource(s.key)}>{s.label}</Tag>
         ))}
       </div>
 
-      {/* Bin selection: auto by default; check to target a specific bin (resume/append). */}
-      <div style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 13, color: "#a8b2d8" }}>
-        <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
-          <input type="checkbox" checked={useBin} onChange={(e) => setUseBin(e.target.checked)} />
-          Add to a specific bin
-        </label>
-        <select disabled={!useBin} value={bin} onChange={(e) => setBin(Number(e.target.value))}
-          style={{ ...inp, padding: "6px 8px", opacity: useBin ? 1 : 0.5 }}>
-          {Array.from({ length: 10 }, (_, i) => i + 1).map((n) => (
-            <option key={n} value={n}>Bin {n}</option>
-          ))}
-        </select>
+      <div style={{ display: "flex", flexDirection: "column", gap: 12, padding: "14px 0", borderTop: "1px solid var(--border-forge)", borderBottom: "1px solid var(--border-forge)", marginBottom: 16 }}>
+        <OptionRow title="The Inspector" sublabel="LOCAL EYES CHECK EVERY FRAME">
+          <Switch checked={verify} onChange={setVerify} label="The Inspector" />
+        </OptionRow>
+        {verify && (
+          <textarea placeholder={DEFAULT_PROMPT_HINT} value={visionPrompt} onChange={(e) => setVisionPrompt(e.target.value)}
+            rows={3} className="forge-input" style={{ width: "100%", resize: "vertical", fontFamily: "var(--font-body)" }} />
+        )}
+
+        <OptionRow title="No doubles" sublabel="DITCH VISUAL DUPES IN THE VAULT">
+          <Switch checked={dedupe} onChange={setDedupe} label="No doubles" />
+        </OptionRow>
+
+        <OptionRow title="Target a vault" sublabel="APPEND TO A SPECIFIC NUMBERED VAULT">
+          <Switch checked={useBin} onChange={setUseBin} label="Target a vault" />
+        </OptionRow>
+        {useBin && (
+          <select className="forge-input" value={bin} onChange={(e) => setBin(Number(e.target.value))} style={{ width: 120 }}>
+            {Array.from({ length: 10 }, (_, i) => i + 1).map((n) => (
+              <option key={n} value={n}>Vault {n}</option>
+            ))}
+          </select>
+        )}
+
+        <div>
+          <div style={{ display: "flex", justifyContent: "space-between", fontFamily: "var(--font-type)", fontSize: 10, letterSpacing: ".08em", color: "var(--text-forge-mute)", marginBottom: 6 }}>
+            <span>CADENCE · BETWEEN GRABS</span>
+            <span style={{ color: "var(--gold-400)" }}>{(delayMs / 1000).toFixed(1)}s{delayMs === 0 ? " (fastest)" : ""}</span>
+          </div>
+          <input type="range" min={0} max={10000} step={250} value={delayMs} onChange={(e) => setDelayMs(Number(e.target.value))} className="forge-range" />
+        </div>
       </div>
 
-      {/* Content dedup gate (default on). */}
-      <label style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 13, color: "#a8b2d8" }}>
-        <input type="checkbox" checked={dedupe} onChange={(e) => setDedupe(e.target.checked)} />
-        Skip duplicates already in the bin (visual match, ignores filename)
-      </label>
-
-      {/* Vision-QA gate */}
-      <label style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 13, color: "#a8b2d8" }}>
-        <input type="checkbox" checked={verify} onChange={(e) => setVerify(e.target.checked)} />
-        Vision-QA: have the local model check each image (slower, higher quality)
-      </label>
-      {verify && (
-        <textarea placeholder={DEFAULT_PROMPT_HINT} value={visionPrompt}
-          onChange={(e) => setVisionPrompt(e.target.value)} rows={3}
-          style={{ ...inp, resize: "vertical", fontFamily: "inherit" }} />
-      )}
-
-      {/* Pacing */}
-      <label style={{ display: "grid", gap: 2, fontSize: 12, color: "#a8b2d8" }}>
-        <span>Delay between downloads: {(delayMs / 1000).toFixed(1)}s {delayMs === 0 ? "(fastest)" : ""}</span>
-        <input type="range" min={0} max={10000} step={250} value={delayMs}
-          onChange={(e) => setDelayMs(Number(e.target.value))} />
-      </label>
-
-      <button disabled={disabled} onClick={() => startScrape({ query, count, destDir, sources: [...enabled], delayMs, verify, visionPrompt, bin: useBin ? bin : null, dedupe })}
-        style={{ ...btn, opacity: disabled ? 0.5 : 1 }}>
-        {running ? "Scraping…" : "Download images"}
-      </button>
+      <div className="forge-cta" style={{ marginTop: "auto" }}>
+        <Button
+          variant="forge" size="lg" block
+          disabled={disabled}
+          onClick={() => startScrape({ query, count, destDir, sources: [...enabled], delayMs, verify, visionPrompt, bin: useBin ? bin : null, dedupe })}
+        >
+          {running ? "▾ STOKING…" : "▾ STOKE THE FORGE — RUN THE HAUL"}
+        </Button>
+      </div>
     </div>
   );
 }
-const inp: React.CSSProperties = { background: "#16213e", color: "#a8b2d8", border: "1px solid #2a2a4a", borderRadius: 8, padding: "8px 10px" };
-const btn: React.CSSProperties = { background: "#e94560", color: "white", border: "none", borderRadius: 8, padding: "10px 14px", cursor: "pointer" };
+
+function OptionRow({ title, sublabel, children }: { title: string; sublabel: string; children: React.ReactNode }) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+      <div style={{ lineHeight: 1.3 }}>
+        <div style={{ fontFamily: "var(--font-body)", color: "var(--text-forge-cream)", fontSize: 14 }}>{title}</div>
+        <div style={{ fontFamily: "var(--font-type)", fontSize: 9.5, letterSpacing: ".06em", color: "var(--text-forge-mute)" }}>{sublabel}</div>
+      </div>
+      {children}
+    </div>
+  );
+}

@@ -1,6 +1,96 @@
+/* ============================================================
+   AGENT 008 "BOJANGLES HORNSNAILER" — IMAGE FORGE
+   Design tokens ported from design/design-tokens.css.
+   ============================================================ */
+@import url('https://fonts.googleapis.com/css2?family=Crimson+Pro:ital,wght@0,400;0,500;0,600;0,700;1,400;1,600&family=Permanent+Marker&family=Pirata+One&family=Special+Elite&display=swap');
+
 :root {
   --sans: system-ui, 'Segoe UI', Roboto, sans-serif;
   --mono: ui-monospace, Consolas, monospace;
+
+  /* ---- fonts ---- */
+  --font-display: 'Pirata One', cursive;
+  --font-marker:  'Permanent Marker', cursive;
+  --font-type:    'Special Elite', monospace;
+  --font-body:    'Crimson Pro', Georgia, serif;
+
+  /* ---- ink / neutrals ---- */
+  --ink-900: #0a0a0c;
+  --ink-800: #101013;
+  --soot:    #34323a;
+
+  /* ---- gold ---- */
+  --gold-300: #ffe085;
+  --gold-400: #f4d160;
+  --gold-500: #d4af37;
+  --gold-600: #d4972b;
+  --gold-700: #8a5a12;
+  --gold-800: #4a3a12;
+
+  /* ---- ember ---- */
+  --ember-300: #d9613f;
+  --ember-400: #c14529;
+  --ember-500: #a8311e;
+  --ember-600: #842316;
+  --ember-700: #5e160d;
+
+  /* ---- flame ---- */
+  --flame-300: #ffc090;
+  --flame-400: #ff9a5c;
+  --flame-500: #ff7a18;
+  --flame-600: #d9531c;
+
+  /* ---- parchment ---- */
+  --parchment-100: #f1ead8;
+  --parchment-200: #e9e0cc;
+  --parchment-300: #cfc4a6;
+
+  /* ---- midnight ---- */
+  --midnight-700: #122146;
+  --midnight-800: #0c1530;
+
+  /* ---- support ---- */
+  --absinthe: #8fa86b;
+
+  /* ---- forge surfaces ---- */
+  --surface-forge-base: #0a0a0b;
+  --surface-forge-side: #08080a;
+  --surface-forge-head: #0d0c0a;
+  --surface-forge-card: #141312;
+  --surface-forge-well: #100f0d;
+  --surface-forge-lit:  #161208;
+
+  /* ---- forge text ---- */
+  --text-forge-body:  #c6c6ce;
+  --text-forge-cream: #e8e0c8;
+  --text-forge-mute:  #8a8a93;
+  --text-forge-faint: #4a4a44;
+
+  /* ---- forge borders ---- */
+  --border-forge:      #2a2a1e;
+  --border-forge-btn:  #3a3a1f;
+  --border-forge-cool: #3a3a3f;
+
+  /* ---- forge radii ---- */
+  --radius-forge-sm: 5px;
+  --radius-forge-md: 6px;
+  --radius-forge-lg: 8px;
+  --radius-forge-xl: 10px;
+
+  /* ---- forge state colors ---- */
+  --forge-ok:   #d4af37;
+  --forge-err:  #d9534f;
+  --forge-idle: #6a6a72;
+
+  /* ---- molten gradients ---- */
+  --grad-ingot:      linear-gradient(180deg, #f6c453 0%, #b8860b 100%);
+  --grad-molten-hot: linear-gradient(180deg, #ffd874 0%, #a8701a 100%);
+  --grad-progress:   linear-gradient(90deg, #8a5a12 0%, #d4972b 50%, #f6c453 100%);
+  --rule-gold:       linear-gradient(90deg, transparent, #8a5a12 15%, #d4af37 50%, #8a5a12 85%, transparent);
+
+  /* ---- glows ---- */
+  --glow-gold:  0 0 18px rgba(212,151,43,0.45);
+  --glow-ember: 0 0 16px rgba(168,49,30,0.5);
 
   font: 16px/1.5 var(--sans);
   -webkit-font-smoothing: antialiased;
@@ -9,4 +99,107 @@
 
 body {
   margin: 0;
+  background: var(--surface-forge-base);
 }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: var(--surface-forge-well); }
+::-webkit-scrollbar-thumb { background: var(--gold-700); border-radius: 6px; }
+
+@keyframes forgeGlow {
+  0%, 100% { box-shadow: 0 0 0 1px var(--gold-600), 0 0 18px rgba(255,122,24,.35), inset 0 1px 0 rgba(255,240,192,.5); }
+  50%      { box-shadow: 0 0 0 1px #fff0c0, 0 0 34px rgba(255,122,24,.7), inset 0 1px 0 rgba(255,240,192,.6); }
+}
+.forge-cta { animation: forgeGlow 2.4s ease-out infinite; border-radius: var(--radius-forge-md); }
+@media (prefers-reduced-motion: reduce) { .forge-cta { animation: none; } }
+
+/* ---- Buttons ---- */
+.btn {
+  font-family: var(--font-type);
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  border-radius: var(--radius-forge-md);
+  cursor: pointer;
+  border: 1px solid transparent;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  white-space: nowrap;
+  transition: filter 120ms ease-out, transform 120ms ease-out, opacity 120ms ease-out, box-shadow 120ms ease-out, background 120ms ease-out;
+}
+.btn:disabled { opacity: .4; filter: grayscale(1); cursor: default; box-shadow: none !important; }
+.btn:not(:disabled):hover { filter: brightness(1.08); }
+.btn:not(:disabled):active { transform: translateY(1px) scale(0.99); filter: brightness(0.96); }
+.btn:focus-visible { outline: 2px solid var(--gold-500); outline-offset: 2px; }
+.btn-block { width: 100%; }
+
+.btn-sm { height: 30px; padding: 0 12px; font-size: 10.5px; }
+.btn-md { height: 40px; padding: 0 16px; font-size: 11.5px; }
+.btn-lg { height: 52px; padding: 0 20px; font-size: 13px; }
+
+.btn-forge {
+  background: var(--grad-ingot); color: #1a1206; border-color: var(--gold-600);
+  box-shadow: inset 0 1px 0 rgba(255,240,192,.5);
+}
+.btn-forge:not(:disabled):hover { background: var(--grad-molten-hot); box-shadow: var(--glow-gold), inset 0 1px 0 rgba(255,240,192,.6); }
+
+.btn-ember { background: var(--ember-500); color: var(--parchment-100); border-color: var(--ember-700); }
+.btn-ember:not(:disabled):hover { background: var(--ember-400); box-shadow: var(--glow-ember); }
+
+.btn-ghost { background: transparent; color: var(--gold-400); border-color: var(--border-forge-btn); }
+.btn-ghost:not(:disabled):hover { background: var(--surface-forge-lit); box-shadow: var(--glow-gold); }
+
+.btn-danger { background: transparent; color: var(--ember-400); border-color: var(--ember-600); }
+.btn-danger:not(:disabled):hover { background: rgba(168,49,30,.14); box-shadow: var(--glow-ember); }
+
+/* ---- Switch ---- */
+.switch {
+  position: relative; width: 40px; height: 22px; flex: none; padding: 0;
+  border-radius: 99px; border: 1px solid var(--border-forge-cool);
+  background: var(--surface-forge-well); cursor: pointer;
+  transition: background 200ms ease-out, border-color 200ms ease-out, box-shadow 200ms ease-out;
+}
+.switch::after {
+  content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
+  border-radius: 50%; background: var(--text-forge-mute);
+  transition: transform 200ms ease-out, background 200ms ease-out;
+}
+.switch.on { background: var(--ember-600); border-color: var(--ember-500); box-shadow: var(--glow-ember); }
+.switch.on::after { transform: translateX(18px); background: var(--gold-400); }
+.switch:disabled { opacity: .4; cursor: default; }
+.switch:focus-visible { outline: 2px solid var(--gold-500); outline-offset: 2px; }
+
+/* ---- Tag chip ---- */
+.tag {
+  font-family: var(--font-type); font-size: 11px; letter-spacing: .04em;
+  padding: 5px 12px; border-radius: 99px; cursor: pointer;
+  border: 1px solid var(--border-forge-btn); background: transparent; color: var(--text-forge-mute);
+  transition: transform 120ms ease-out, filter 120ms ease-out, background 120ms ease-out, color 120ms ease-out;
+}
+.tag:hover { filter: brightness(1.15); }
+.tag.on { background: var(--gold-500); color: #1a1206; border-color: var(--gold-600); transform: rotate(-1.5deg); }
+.tag.on:nth-of-type(even) { transform: rotate(1.5deg); }
+
+/* ---- Forge input pattern ---- */
+.forge-input {
+  background: var(--surface-forge-well); color: var(--text-forge-cream);
+  border: 1px solid var(--border-forge-cool); border-radius: var(--radius-forge-sm);
+  padding: 10px 11px; font-size: 14px; font-family: var(--font-body); box-sizing: border-box;
+  transition: border-color 120ms ease-out, box-shadow 120ms ease-out;
+}
+.forge-input:focus { outline: none; border-color: var(--gold-600); box-shadow: inset 0 0 0 1px var(--gold-700); }
+.forge-label {
+  font-family: var(--font-type); font-size: 10px; letter-spacing: .12em;
+  color: var(--text-forge-mute); text-transform: uppercase; display: block;
+}
+
+/* ---- Cadence range ---- */
+.forge-range { -webkit-appearance: none; appearance: none; width: 100%; height: 6px; background: transparent; margin: 0; }
+.forge-range::-webkit-slider-runnable-track { height: 6px; border-radius: 99px; background: var(--surface-forge-well); border: 1px solid var(--border-forge); }
+.forge-range::-webkit-slider-thumb {
+  -webkit-appearance: none; width: 14px; height: 14px; margin-top: -4.5px; border-radius: 50%;
+  background: var(--gold-400); border: 1px solid var(--gold-700); cursor: pointer;
+}
+.forge-range::-moz-range-track { height: 6px; border-radius: 99px; background: var(--surface-forge-well); border: 1px solid var(--border-forge); }
+.forge-range::-moz-range-thumb { width: 14px; height: 14px; border-radius: 50%; background: var(--gold-400); border: 1px solid var(--gold-700); cursor: pointer; }

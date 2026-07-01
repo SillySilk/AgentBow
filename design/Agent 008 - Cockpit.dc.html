@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <link rel="stylesheet" href="_ds/thing-o-matic-design-system-bcced19a-3c3f-414f-9514-459e0684a0fa/tokens/fonts.css">
+  <link rel="stylesheet" href="_ds/thing-o-matic-design-system-bcced19a-3c3f-414f-9514-459e0684a0fa/tokens/colors.css">
+  <link rel="stylesheet" href="_ds/thing-o-matic-design-system-bcced19a-3c3f-414f-9514-459e0684a0fa/tokens/typography.css">
+  <link rel="stylesheet" href="_ds/thing-o-matic-design-system-bcced19a-3c3f-414f-9514-459e0684a0fa/tokens/spacing.css">
+  <link rel="stylesheet" href="_ds/thing-o-matic-design-system-bcced19a-3c3f-414f-9514-459e0684a0fa/tokens/effects.css">
+  <link rel="stylesheet" href="_ds/thing-o-matic-design-system-bcced19a-3c3f-414f-9514-459e0684a0fa/tokens/forge.css">
+  <link rel="stylesheet" href="_ds/thing-o-matic-design-system-bcced19a-3c3f-414f-9514-459e0684a0fa/tokens/base.css">
+  <link rel="stylesheet" href="_ds/thing-o-matic-design-system-bcced19a-3c3f-414f-9514-459e0684a0fa/styles.css">
+  <script src="_ds/thing-o-matic-design-system-bcced19a-3c3f-414f-9514-459e0684a0fa/_ds_bundle.js"></script>
+  <script src="https://unpkg.com/lucide@0.544.0/dist/umd/lucide.min.js"></script>
+  <style>
+    @keyframes forgeGlow { 0%,100% { box-shadow: 0 0 0 1px var(--gold-600), 0 0 18px rgba(255,122,24,.35), inset 0 1px 0 rgba(255,240,192,.5); } 50% { box-shadow: 0 0 0 1px #fff0c0, 0 0 34px rgba(255,122,24,.7), inset 0 1px 0 rgba(255,240,192,.7); } }
+    .forge-cta { animation: forgeGlow 2.4s var(--ease-out) infinite; }
+    @media (prefers-reduced-motion: reduce) { .forge-cta { animation: none; } }
+    ::-webkit-scrollbar { width: 10px; height: 10px; }
+    ::-webkit-scrollbar-track { background: var(--surface-forge-well); }
+    ::-webkit-scrollbar-thumb { background: var(--gold-700); border-radius: 6px; }
+  </style>
+</helmet>
+
+<div style="width:100vw; height:100vh; display:grid; grid-template-columns:232px 1fr; background:var(--surface-forge-base); overflow:hidden; color:var(--text-forge-body); font-family:var(--font-body);">
+
+  <!-- SIDEBAR -->
+  <aside style="background:var(--surface-forge-side); border-right:1px solid var(--border-forge); display:flex; flex-direction:column;">
+    <div style="padding:20px 18px 12px; display:flex; align-items:center; gap:11px;">
+      <img src="assets/emblem.png" alt="Agent 008" style="height:44px;">
+      <div style="line-height:1.1;">
+        <div style="font-family:var(--font-display); color:var(--gold-500); font-size:21px; white-space:nowrap;">Agent 008</div>
+        <div style="font-family:var(--font-type); color:var(--text-forge-mute); font-size:9.5px; letter-spacing:.16em; margin-top:5px; white-space:nowrap;">IMAGE FORGE</div>
+      </div>
+    </div>
+    <div style="height:1px; background:var(--rule-gold); opacity:.5; margin:4px 14px 8px;"></div>
+
+    <div style="font-family:var(--font-type); font-size:9.5px; letter-spacing:.2em; color:var(--text-forge-faint); padding:8px 20px 4px;">THE JOB</div>
+    <div style="display:flex; align-items:center; gap:11px; height:44px; padding:0 20px; background:var(--surface-forge-lit); color:var(--gold-400); border-left:3px solid var(--gold-500); font-family:var(--font-type); font-size:12.5px; letter-spacing:.06em;"><i data-lucide="crosshair" style="width:18px;height:18px;"></i>The Hunt</div>
+    <div style="display:flex; align-items:center; gap:11px; height:44px; padding:0 20px; color:var(--text-forge-mute); border-left:3px solid transparent; font-family:var(--font-type); font-size:12.5px; letter-spacing:.06em;"><i data-lucide="binoculars" style="width:18px;height:18px;"></i>Field Job</div>
+    <div style="display:flex; align-items:center; gap:11px; height:44px; padding:0 20px; color:var(--text-forge-mute); border-left:3px solid transparent; font-family:var(--font-type); font-size:12.5px; letter-spacing:.06em;"><i data-lucide="radio" style="width:18px;height:18px;"></i>The Wire</div>
+    <div style="display:flex; align-items:center; gap:11px; height:44px; padding:0 20px; color:var(--text-forge-mute); border-left:3px solid transparent; font-family:var(--font-type); font-size:12.5px; letter-spacing:.06em;"><i data-lucide="layout-grid" style="width:18px;height:18px;"></i>The Lineup</div>
+
+    <div style="font-family:var(--font-type); font-size:9.5px; letter-spacing:.2em; color:var(--text-forge-faint); padding:16px 20px 4px;">THE HOUSE</div>
+    <div style="display:flex; align-items:center; gap:11px; height:44px; padding:0 20px; color:var(--text-forge-mute); border-left:3px solid transparent; font-family:var(--font-type); font-size:12.5px; letter-spacing:.06em;"><i data-lucide="archive" style="width:18px;height:18px;"></i>The Vault</div>
+    <div style="display:flex; align-items:center; gap:11px; height:44px; padding:0 20px; color:var(--text-forge-mute); border-left:3px solid transparent; font-family:var(--font-type); font-size:12.5px; letter-spacing:.06em;"><i data-lucide="message-square-more" style="width:18px;height:18px;"></i>Console</div>
+
+    <div style="margin-top:auto; padding:14px; border-top:1px solid var(--border-forge); display:flex; align-items:center; gap:11px;">
+      <span style="width:36px; height:36px; border-radius:50%; background:var(--midnight-700); border:1.5px solid var(--gold-700); color:var(--gold-400); font-family:var(--font-display); font-size:17px; display:flex; align-items:center; justify-content:center;">08</span>
+      <div style="line-height:1.25;">
+        <div style="font-family:var(--font-body); color:var(--text-forge-cream); font-size:13px;">Bojangles</div>
+        <div style="display:flex; align-items:center; gap:5px; font-family:var(--font-type); color:var(--absinthe); font-size:9px; letter-spacing:.1em;"><span style="width:6px;height:6px;border-radius:50%;background:var(--absinthe);box-shadow:0 0 7px var(--absinthe);"></span>LINE SECURE</div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- MAIN -->
+  <div style="position:relative; background-color:var(--surface-forge-base); background-image:linear-gradient(180deg, rgba(10,10,11,.72), rgba(10,10,11,.88)), url('assets/bg_embers.png'); background-size:cover; background-position:center; display:flex; flex-direction:column; overflow:hidden;">
+
+    <!-- header -->
+    <div style="display:flex; align-items:flex-end; justify-content:space-between; padding:18px 26px 14px; background:var(--surface-forge-head); border-bottom:1px solid var(--border-forge);">
+      <div>
+        <div style="font-family:var(--font-type); font-size:10px; letter-spacing:.2em; text-transform:uppercase; color:var(--ember-400);">Assignment &middot; live</div>
+        <h2 style="font-family:var(--font-display); color:var(--gold-500); font-size:34px; line-height:1; margin:3px 0 0; font-weight:400;">The Hunt</h2>
+      </div>
+      <div style="display:flex; align-items:center; gap:14px;">
+        <span style="display:inline-flex; align-items:center; gap:7px; font-family:var(--font-type); font-size:10px; letter-spacing:.1em; text-transform:uppercase; color:var(--text-forge-mute);"><span style="width:7px;height:7px;border-radius:50%;background:var(--flame-500);box-shadow:0 0 8px var(--flame-500);"></span>machine warm</span>
+        <x-import component-from-global-scope="ThingOMaticDesignSystem_bcced1.Button" variant="ghost" size="sm" hint-size="110px,30px">New haul</x-import>
+      </div>
+    </div>
+
+    <!-- pipeline rail -->
+    <div style="display:flex; gap:8px; padding:12px 26px; border-bottom:1px solid var(--border-forge);">
+      <div style="flex:1; display:flex; align-items:center; gap:9px; padding:9px 12px; background:var(--surface-forge-lit); border:1px solid var(--gold-700); border-radius:var(--radius-forge-md);"><span style="width:20px;height:20px;border-radius:50%;background:var(--gold-500);color:#1a1206;font-size:12px;font-weight:800;display:flex;align-items:center;justify-content:center;">&#10003;</span><span style="color:var(--gold-400); font-family:var(--font-type); font-size:11px; letter-spacing:.08em;">THE MARK</span></div>
+      <div style="flex:1; display:flex; align-items:center; gap:9px; padding:9px 12px; background:var(--surface-forge-well); border:1px solid var(--gold-700); border-radius:var(--radius-forge-md);"><span style="width:20px;height:20px;border-radius:50%;background:var(--surface-forge-card);color:var(--flame-500);font-size:11px;border:1px solid var(--flame-500);display:flex;align-items:center;justify-content:center;font-family:var(--font-type);">2</span><span style="color:var(--text-forge-cream); font-family:var(--font-type); font-size:11px; letter-spacing:.08em;">THE HAUL</span></div>
+      <div style="flex:1; display:flex; align-items:center; gap:9px; padding:9px 12px; background:var(--surface-forge-well); border:1px solid var(--border-forge); border-radius:var(--radius-forge-md);"><span style="width:20px;height:20px;border-radius:50%;background:var(--surface-forge-card);color:var(--forge-idle);font-size:11px;border:1px solid var(--border-forge);display:flex;align-items:center;justify-content:center;font-family:var(--font-type);">3</span><span style="color:var(--text-forge-mute); font-family:var(--font-type); font-size:11px; letter-spacing:.08em;">INSPECT</span></div>
+      <div style="flex:1; display:flex; align-items:center; gap:9px; padding:9px 12px; background:var(--surface-forge-well); border:1px solid var(--border-forge); border-radius:var(--radius-forge-md);"><span style="width:20px;height:20px;border-radius:50%;background:var(--surface-forge-card);color:var(--forge-idle);font-size:11px;border:1px solid var(--border-forge);display:flex;align-items:center;justify-content:center;font-family:var(--font-type);">4</span><span style="color:var(--text-forge-mute); font-family:var(--font-type); font-size:11px; letter-spacing:.08em;">CULL</span></div>
+    </div>
+
+    <!-- body -->
+    <div style="flex:1; overflow:auto; padding:18px 26px 22px; display:grid; grid-template-columns:1.5fr 1fr; grid-template-rows:auto 1fr; gap:18px; min-height:0;">
+
+      <!-- THE MARK panel -->
+      <div style="grid-column:1; grid-row:1 / span 2; background-color:var(--surface-forge-card); background-image:linear-gradient(180deg, rgba(20,19,18,.6), rgba(20,19,18,.92)), url('assets/panel_metal.png'); background-size:cover; border:1px solid var(--border-forge); border-radius:var(--radius-forge-lg); padding:20px; display:flex; flex-direction:column;">
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:16px;">
+          <span style="font-family:var(--font-type); color:var(--gold-500); font-size:12px; letter-spacing:.2em;">THE MARK</span>
+          <span style="font-family:var(--font-marker); color:var(--ember-400); font-size:15px; transform:rotate(-3deg);">what are we after?</span>
+        </div>
+
+        <label style="font-family:var(--font-type); font-size:10px; letter-spacing:.12em; color:var(--text-forge-mute); text-transform:uppercase;">The subject</label>
+        <input value="1965 aston martin db5, silver, studio" readonly style="width:100%; margin:5px 0 14px; background:var(--surface-forge-well); color:var(--text-forge-cream); border:1px solid var(--border-forge-cool); border-radius:var(--radius-forge-sm); padding:10px 11px; font-size:14px; font-family:var(--font-body); box-sizing:border-box;">
+
+        <div style="display:grid; grid-template-columns:96px 1fr; gap:12px; margin-bottom:14px;">
+          <div>
+            <label style="font-family:var(--font-type); font-size:10px; letter-spacing:.12em; color:var(--text-forge-mute); text-transform:uppercase;">Haul size</label>
+            <input value="48" readonly style="width:100%; margin-top:5px; background:var(--surface-forge-well); color:var(--text-forge-cream); border:1px solid var(--border-forge-cool); border-radius:var(--radius-forge-sm); padding:10px 11px; font-size:14px; font-family:var(--font-body); box-sizing:border-box;">
+          </div>
+          <div>
+            <label style="font-family:var(--font-type); font-size:10px; letter-spacing:.12em; color:var(--text-forge-mute); text-transform:uppercase;">The vault (drop point)</label>
+            <input value="C:\AI\workspace\db5" readonly style="width:100%; margin-top:5px; background:var(--surface-forge-well); color:var(--text-forge-cream); border:1px solid var(--border-forge-cool); border-radius:var(--radius-forge-sm); padding:10px 11px; font-size:14px; font-family:var(--font-body); box-sizing:border-box;">
+          </div>
+        </div>
+
+        <label style="font-family:var(--font-type); font-size:10px; letter-spacing:.12em; color:var(--text-forge-mute); text-transform:uppercase; margin-bottom:8px;">Informants</label>
+        <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:16px;">
+          <x-import component-from-global-scope="ThingOMaticDesignSystem_bcced1.Tag" hint-size="88px,26px">Yandex</x-import>
+          <x-import component-from-global-scope="ThingOMaticDesignSystem_bcced1.Tag" hint-size="72px,26px">Brave</x-import>
+          <x-import component-from-global-scope="ThingOMaticDesignSystem_bcced1.Tag" variant="plain" hint-size="110px,26px">DuckDuckGo</x-import>
+          <x-import component-from-global-scope="ThingOMaticDesignSystem_bcced1.Tag" variant="plain" hint-size="64px,26px">Bing</x-import>
+        </div>
+
+        <div style="display:flex; flex-direction:column; gap:12px; padding:14px 0; border-top:1px solid var(--border-forge); border-bottom:1px solid var(--border-forge); margin-bottom:16px;">
+          <div style="display:flex; align-items:center; justify-content:space-between;">
+            <div style="line-height:1.3;"><div style="font-family:var(--font-body); color:var(--text-forge-cream); font-size:14px;">The Inspector</div><div style="font-family:var(--font-type); font-size:9.5px; letter-spacing:.06em; color:var(--text-forge-mute);">LOCAL EYES CHECK EVERY FRAME</div></div>
+            <x-import component-from-global-scope="ThingOMaticDesignSystem_bcced1.Switch" checked="true" hint-size="52px,26px"></x-import>
+          </div>
+          <div style="display:flex; align-items:center; justify-content:space-between;">
+            <div style="line-height:1.3;"><div style="font-family:var(--font-body); color:var(--text-forge-cream); font-size:14px;">No doubles</div><div style="font-family:var(--font-type); font-size:9.5px; letter-spacing:.06em; color:var(--text-forge-mute);">DITCH VISUAL DUPES IN THE VAULT</div></div>
+            <x-import component-from-global-scope="ThingOMaticDesignSystem_bcced1.Switch" checked="true" hint-size="52px,26px"></x-import>
+          </div>
+          <div>
+            <div style="display:flex; justify-content:space-between; font-family:var(--font-type); font-size:10px; letter-spacing:.08em; color:var(--text-forge-mute); margin-bottom:6px;"><span>CADENCE &middot; BETWEEN GRABS</span><span style="color:var(--gold-400);">1.5s</span></div>
+            <div style="height:6px; background:var(--surface-forge-well); border-radius:99px; border:1px solid var(--border-forge); overflow:hidden;"><div style="width:32%; height:100%; background:var(--grad-progress);"></div></div>
+          </div>
+        </div>
+
+        <div style="margin-top:auto;" class="forge-cta">
+          <x-import component-from-global-scope="ThingOMaticDesignSystem_bcced1.Button" variant="forge" size="lg" block="true" hint-size="100%,52px">&#9662; STOKE THE FORGE &mdash; RUN THE HAUL</x-import>
+        </div>
+      </div>
+
+      <!-- FIELD JOB -->
+      <div style="grid-column:2; grid-row:1; background:var(--surface-forge-card); border:1px solid var(--border-forge); border-radius:var(--radius-forge-lg); padding:16px;">
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:12px;">
+          <span style="font-family:var(--font-type); color:var(--gold-500); font-size:12px; letter-spacing:.2em;">FIELD JOB</span>
+          <span style="font-family:var(--font-type); font-size:9.5px; letter-spacing:.06em; color:var(--text-forge-mute);">WORK A GALLERY</span>
+        </div>
+        <div style="display:flex; gap:8px; margin-bottom:10px;">
+          <input value="gallery.example.net/db5" readonly style="flex:1; background:var(--surface-forge-well); color:var(--text-forge-cream); border:1px solid var(--border-forge-cool); border-radius:var(--radius-forge-sm); padding:9px 10px; font-size:13px; font-family:var(--font-body); box-sizing:border-box; min-width:0;">
+          <x-import component-from-global-scope="ThingOMaticDesignSystem_bcced1.Button" variant="ember" size="sm" hint-size="130px,32px">Ghost car</x-import>
+        </div>
+        <div style="display:flex; align-items:center; gap:8px; font-family:var(--font-type); font-size:9.5px; letter-spacing:.06em; color:var(--absinthe); margin-bottom:12px;"><i data-lucide="lock" style="width:13px;height:13px;"></i>TAIL OPEN &middot; PROFILE PERSISTS</div>
+        <x-import component-from-global-scope="ThingOMaticDesignSystem_bcced1.Button" variant="ghost" size="sm" block="true" hint-size="100%,32px">Work the gallery &middot; 30 rounds</x-import>
+      </div>
+
+      <!-- THE WIRE + THE LINEUP -->
+      <div style="grid-column:2; grid-row:2; display:flex; flex-direction:column; gap:14px; min-height:0;">
+        <div style="background:var(--surface-forge-well); border:1px solid var(--border-forge); border-radius:var(--radius-forge-lg); padding:12px 14px;">
+          <div style="display:flex; align-items:center; gap:7px; font-family:var(--font-type); color:var(--gold-500); font-size:11px; letter-spacing:.16em; margin-bottom:8px;"><i data-lucide="radio" style="width:14px;height:14px;"></i>THE WIRE</div>
+          <div style="font-family:var(--font-type); font-size:11px; line-height:1.85; color:var(--text-forge-mute);">
+            <div><span style="color:var(--absinthe);">yandex</span> &rarr; 61 candidates <span style="color:var(--text-forge-faint);">(filtered 44)</span></div>
+            <div><span style="color:var(--absinthe);">brave</span> &rarr; 38 candidates</div>
+            <div><span style="color:var(--gold-400);">inspector</span> rejected 6 &middot; watermark, collage</div>
+            <div style="color:var(--text-forge-cream);">44 / 48 forged &middot; <span style="color:var(--flame-400);">running&hellip;</span></div>
+          </div>
+        </div>
+        <div style="flex:1; background:var(--surface-forge-card); border:1px solid var(--border-forge); border-radius:var(--radius-forge-lg); padding:12px 14px; display:flex; flex-direction:column; min-height:0;">
+          <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:10px;">
+            <span style="font-family:var(--font-type); color:var(--gold-500); font-size:11px; letter-spacing:.16em;">THE LINEUP</span>
+            <div style="display:flex; gap:5px;">
+              <span style="font-family:var(--font-type); font-size:9px; letter-spacing:.06em; color:#1a1206; background:var(--gold-500); padding:3px 8px; border-radius:99px;">VAULT 1 &middot; 44</span>
+              <span style="font-family:var(--font-type); font-size:9px; letter-spacing:.06em; color:var(--text-forge-mute); background:var(--surface-forge-well); border:1px solid var(--border-forge); padding:3px 8px; border-radius:99px;">2 &middot; 12</span>
+            </div>
+          </div>
+          <div style="flex:1; display:grid; grid-template-columns:repeat(5,1fr); grid-auto-rows:minmax(52px,1fr); gap:6px; overflow:auto; min-height:0;">
+            <div style="border-radius:4px; border:2px solid var(--gold-500); background:linear-gradient(150deg,#5a4632,#241a12); filter:saturate(.85);"></div>
+            <div style="border-radius:4px; border:1px solid var(--border-forge); background:linear-gradient(150deg,#4a4a52,#1c1c22); filter:saturate(.85);"></div>
+            <div style="border-radius:4px; border:2px solid var(--gold-500); background:linear-gradient(150deg,#6a5238,#2a2018); filter:saturate(.85);"></div>
+            <div style="border-radius:4px; border:1px solid var(--border-forge); background:linear-gradient(150deg,#3a4450,#161c22); filter:saturate(.85);"></div>
+            <div style="position:relative; border-radius:4px; border:1px solid var(--ember-600); background:linear-gradient(150deg,#4a3038,#20141a); filter:saturate(.85); overflow:hidden;"><div style="position:absolute; inset:auto 0 8px 0; height:11px; background:var(--ink-900); transform:rotate(-4deg);"></div></div>
+            <div style="border-radius:4px; border:1px solid var(--border-forge); background:linear-gradient(150deg,#5a5040,#241f16); filter:saturate(.85);"></div>
+            <div style="border-radius:4px; border:1px solid var(--border-forge); background:linear-gradient(150deg,#42484f,#181c20); filter:saturate(.85);"></div>
+            <div style="border-radius:4px; border:2px solid var(--gold-500); background:linear-gradient(150deg,#63503a,#271e15); filter:saturate(.85);"></div>
+            <div style="border-radius:4px; border:1px solid var(--border-forge); background:linear-gradient(150deg,#4c4438,#1e1a14); filter:saturate(.85);"></div>
+            <div style="border-radius:4px; border:1px solid var(--border-forge); background:linear-gradient(150deg,#3e4650,#171b20); filter:saturate(.85);"></div>
+          </div>
+          <div style="display:flex; gap:6px; margin-top:10px; flex-wrap:wrap;">
+            <x-import component-from-global-scope="ThingOMaticDesignSystem_bcced1.Button" variant="danger" size="sm" hint-size="120px,30px">Burn (3)</x-import>
+            <x-import component-from-global-scope="ThingOMaticDesignSystem_bcced1.Button" variant="ghost" size="sm" hint-size="120px,30px">Cull doubles</x-import>
+            <x-import component-from-global-scope="ThingOMaticDesignSystem_bcced1.Button" variant="ghost" size="sm" hint-size="110px,30px">Open vault</x-import>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script>
+class Component extends DCLogic {
+  componentDidMount() { this._paint(); }
+  componentDidUpdate() { this._paint(); }
+  _paint() {
+    let t = 0;
+    const go = () => {
+      if (window.lucide) { try { window.lucide.createIcons(); } catch (e) {} return; }
+      if (t++ < 50) setTimeout(go, 80);
+    };
+    go();
+  }
+}
+</script>
+</body>
+</html>
