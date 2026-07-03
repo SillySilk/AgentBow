@@ -183,6 +183,50 @@ pub fn scan_models(dir: &Path) -> Vec<ModelEntry> {
     out
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[allow(dead_code)]
+pub struct EnginePersist {
+    pub model_path: Option<PathBuf>,
+    pub ctx_size: u32,
+}
+
+impl Default for EnginePersist {
+    fn default() -> Self {
+        EnginePersist {
+            model_path: None,
+            ctx_size: 8192,
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub fn persist_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.join("engine.json")))
+        .unwrap_or_else(|| PathBuf::from("engine.json"))
+}
+
+#[allow(dead_code)]
+pub fn load_persist(path: &Path) -> EnginePersist {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+#[allow(dead_code)]
+pub fn save_persist(path: &Path, p: &EnginePersist) {
+    match serde_json::to_string_pretty(p) {
+        Ok(s) => {
+            if let Err(e) = std::fs::write(path, s) {
+                tracing::warn!("engine.json write failed: {}", e);
+            }
+        }
+        Err(e) => tracing::warn!("engine.json serialize failed: {}", e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,5 +320,20 @@ mod tests {
         assert!(bare.mmproj.is_none());
         assert!(!is_loadable_quant(&bare.quant));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn persist_round_trips_and_defaults() {
+        let f = std::env::temp_dir().join("bow_engine_test.json");
+        std::fs::remove_file(&f).ok();
+        assert_eq!(load_persist(&f).ctx_size, 8192); // missing → default
+        let p = EnginePersist { model_path: Some(PathBuf::from(r"C:\m\a.gguf")), ctx_size: 4096 };
+        save_persist(&f, &p);
+        let back = load_persist(&f);
+        assert_eq!(back.model_path, p.model_path);
+        assert_eq!(back.ctx_size, 4096);
+        std::fs::write(&f, "not json").unwrap();
+        assert_eq!(load_persist(&f).ctx_size, 8192); // corrupt → default
+        std::fs::remove_file(&f).ok();
     }
 }
