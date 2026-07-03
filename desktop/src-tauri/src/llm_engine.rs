@@ -239,6 +239,10 @@ struct EngineInner {
     error: Option<String>,
     model: Option<ModelEntry>,
     port: Option<u16>,
+    /// Bumped by every `load()` takeover and every `stop()`. In-flight `load()` calls
+    /// remember the generation they started under and refuse to touch shared state
+    /// once it has moved on, so overlapping loads/stops cannot stomp each other.
+    generation: u64,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -263,6 +267,7 @@ impl LlmEngine {
         LlmEngine {
             inner: Arc::new(Mutex::new(EngineInner {
                 child: None, state: "stopped".into(), error: None, model: None, port: None,
+                generation: 0,
             })),
             bin_dir,
         }
@@ -270,6 +275,8 @@ impl LlmEngine {
 
     fn server_exe(&self) -> PathBuf { self.bin_dir.join("llama-server.exe") }
 
+    /// Bind-then-drop has a TOCTOU window (another process could grab the port before
+    /// llama-server binds it) — accepted tradeoff for a local, single-user tool.
     async fn free_port() -> Result<u16> {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         Ok(l.local_addr()?.port())
@@ -288,6 +295,7 @@ impl LlmEngine {
 
     pub async fn stop(&self) {
         let mut g = self.inner.lock().await;
+        g.generation += 1; // invalidate any in-flight load()
         if let Some(mut c) = g.child.take() {
             let _ = c.kill().await;
         }
@@ -314,12 +322,14 @@ impl LlmEngine {
         }
         self.stop().await;
         let port = Self::free_port().await?;
-        {
+        let my_gen = {
             let mut g = self.inner.lock().await;
+            g.generation += 1; // take over: any older in-flight load() is now superseded
             g.state = "starting".into();
             g.port = Some(port);
             g.model = Some(entry.clone());
-        }
+            g.generation
+        };
         let mut cmd = tokio::process::Command::new(&exe);
         cmd.arg("-m").arg(&entry.path)
             .arg("--host").arg("127.0.0.1")
@@ -338,9 +348,16 @@ impl LlmEngine {
         if let Some(mm) = &entry.mmproj {
             cmd.arg("--mmproj").arg(mm);
         }
-        let child = cmd.spawn().map_err(|e| anyhow!("spawn llama-server: {}", e))?;
+        let mut child = cmd.spawn().map_err(|e| anyhow!("spawn llama-server: {}", e))?;
         {
             let mut g = self.inner.lock().await;
+            if g.generation != my_gen {
+                // A newer load()/stop() took over while we were spawning: this child
+                // belongs to no one — kill it and bail without touching shared state.
+                drop(g);
+                let _ = child.kill().await;
+                return Err(anyhow!("superseded by a newer load"));
+            }
             g.child = Some(child);
         }
         // Poll /health until ready (model load can take a while on first touch).
@@ -351,8 +368,14 @@ impl LlmEngine {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             if let Ok(r) = client.get(&url).send().await {
                 if r.status().is_success() {
-                    let mut g = self.inner.lock().await;
-                    g.state = "ready".into();
+                    {
+                        let mut g = self.inner.lock().await;
+                        if g.generation != my_gen {
+                            return Err(anyhow!("superseded by a newer load"));
+                        }
+                        g.state = "ready".into();
+                    }
+                    // Persist outside the lock — file I/O must not block status()/stop().
                     save_persist(&persist_path(), &EnginePersist {
                         model_path: Some(entry.path.clone()), ctx_size,
                     });
@@ -362,6 +385,9 @@ impl LlmEngine {
             // Child died?
             {
                 let mut g = self.inner.lock().await;
+                if g.generation != my_gen {
+                    return Err(anyhow!("superseded by a newer load"));
+                }
                 if let Some(c) = g.child.as_mut() {
                     if let Ok(Some(status)) = c.try_wait() {
                         g.state = "failed".into();
@@ -373,10 +399,16 @@ impl LlmEngine {
                 }
             }
             if std::time::Instant::now() > deadline {
-                self.stop().await;
                 let mut g = self.inner.lock().await;
+                if g.generation != my_gen {
+                    return Err(anyhow!("superseded by a newer load"));
+                }
+                if let Some(mut c) = g.child.take() {
+                    let _ = c.kill().await;
+                }
                 g.state = "failed".into();
                 g.error = Some("startup timed out after 180s".into());
+                g.port = None;
                 return Err(anyhow!("llama-server startup timed out"));
             }
         }
@@ -490,6 +522,28 @@ mod tests {
         };
         let err = eng.load(bad, 8192).await.unwrap_err().to_string();
         assert!(err.contains("unquantized"), "err was: {}", err);
+    }
+
+    #[tokio::test]
+    async fn failed_load_then_stop_reports_clean_stopped() {
+        let eng = LlmEngine::new(std::env::temp_dir().join("no_bin_dir_seq"));
+        let good = ModelEntry {
+            path: PathBuf::from(r"C:\m\ok-Q4_K_M.gguf"), name: "ok-Q4_K_M".into(),
+            size_bytes: 1, quant: Some("Q4_K_M".into()), mmproj: None,
+        };
+        // Two sequential loads, both failing on the missing llama-server.exe.
+        let e1 = eng.load(good.clone(), 4096).await.unwrap_err().to_string();
+        assert!(e1.contains("not found"), "e1 was: {}", e1);
+        let e2 = eng.load(good, 4096).await.unwrap_err().to_string();
+        assert!(e2.contains("not found"), "e2 was: {}", e2);
+        // After failed loads, stop() must leave a clean "stopped" status.
+        eng.stop().await;
+        let st = eng.status().await;
+        assert_eq!(st.state, "stopped");
+        assert!(st.error.is_none(), "stale error: {:?}", st.error);
+        assert!(st.model.is_none(), "stale model");
+        assert!(st.base_url.is_none());
+        assert!(!st.vision);
     }
 
     #[tokio::test]
