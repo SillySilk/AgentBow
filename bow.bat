@@ -11,6 +11,9 @@ cargo build || goto :err
 REM Copy built web assets next to the exe so release runs find them.
 if not exist "target\debug\web" mkdir "target\debug\web"
 xcopy /E /I /Y "..\webapp\dist\*" "target\debug\web\" >nul || goto :err
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0get-llama.ps1" || goto :err
+if not exist "target\debug\llama" mkdir "target\debug\llama"
+xcopy /E /I /Y "bin\llama\*" "target\debug\llama\" >nul || goto :err
 start "" "target\debug\bow-desktop.exe"
 popd
 exit /b 0

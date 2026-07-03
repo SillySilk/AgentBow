@@ -14,6 +14,9 @@ desktop/dist/
 desktop/webapp/dist/
 extension/dist/
 
+# Downloaded llama.cpp server binaries (fetched by get-llama.ps1)
+desktop/src-tauri/bin/
+
 # Claude Code local settings
 .claude/
 
