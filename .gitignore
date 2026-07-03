@@ -25,3 +25,4 @@ Thumbs.db
 *.lnk
 stderr.log
 *.log
+.superpowers/

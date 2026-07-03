@@ -1,6 +1,7 @@
 mod auth;
 mod host;
 mod http;
+mod llm_engine;
 mod local_llm;
 mod server;
 mod state;
