@@ -1,29 +1,47 @@
 import { useEffect, useState } from "react";
-import { Crosshair, Binoculars, Radio, LayoutGrid, Archive, MessageSquareMore } from "lucide-react";
+import { Crosshair, Binoculars, Radio, LayoutGrid, Archive, MessageSquareMore, Settings } from "lucide-react";
 import { useStore } from "./store";
+import { engineStatus } from "./api";
 import SearchPanel from "./components/SearchPanel";
 import PageScrapePanel from "./components/PageScrapePanel";
 import ProgressLog from "./components/ProgressLog";
 import CurationGrid from "./components/CurationGrid";
+import SettingsPanel from "./components/SettingsPanel";
 import Button from "./components/ui/Button";
 
+type ViewName = "job" | "settings";
+
 const NAV_ITEMS = [
-  { icon: Crosshair, label: "The Hunt", active: true },
-  { icon: Binoculars, label: "Field Job", active: false },
-  { icon: Radio, label: "The Wire", active: false },
-  { icon: LayoutGrid, label: "The Lineup", active: false },
+  { icon: Crosshair, label: "The Hunt", view: "job" as ViewName | null },
+  { icon: Binoculars, label: "Field Job", view: null },
+  { icon: Radio, label: "The Wire", view: null },
+  { icon: LayoutGrid, label: "The Lineup", view: null },
 ] as const;
 const HOUSE_ITEMS = [
-  { icon: Archive, label: "The Vault" },
-  { icon: MessageSquareMore, label: "Console" },
+  { icon: Archive, label: "The Vault", view: null },
+  { icon: MessageSquareMore, label: "Console", view: null },
+  { icon: Settings, label: "The Workshop", view: "settings" as ViewName | null },
 ] as const;
 
 export default function App() {
   const connect = useStore((s) => s.connect);
   const status = useStore((s) => s.status);
   const running = useStore((s) => s.scrape.running);
+  const setEngine = useStore((s) => s.setEngine);
   const [resetKey, setResetKey] = useState(0);
+  const [view, setView] = useState<ViewName>("job");
   useEffect(() => { connect(); }, [connect]);
+
+  // Keep the engine slice fresh app-wide (e.g. so SearchPanel can grey out the
+  // Verify toggle) — state is set only inside the promise callback, never
+  // synchronously in the effect body (react-hooks/set-state-in-effect).
+  useEffect(() => {
+    let cancelled = false;
+    const poll = () => { engineStatus().then((s) => { if (!cancelled) setEngine(s); }); };
+    Promise.resolve().then(poll);
+    const id = setInterval(poll, 5000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [setEngine]);
 
   const lineSecure = status === "connected";
 
@@ -52,16 +70,28 @@ export default function App() {
         <div style={{ height: 1, background: "var(--rule-gold)", opacity: 0.5, margin: "4px 14px 8px" }} />
 
         <div style={navGroupLabel}>THE JOB</div>
-        {NAV_ITEMS.map(({ icon: Icon, label, active }) => (
-          <div key={label} style={active ? navItemActive : navItemInactive}>
+        {NAV_ITEMS.map(({ icon: Icon, label, view: itemView }) => (
+          <div
+            key={label}
+            style={{ ...(itemView && view === itemView ? navItemActive : navItemInactive), cursor: itemView ? "pointer" : "default" }}
+            onClick={itemView ? () => setView(itemView) : undefined}
+            role={itemView ? "button" : undefined}
+            tabIndex={itemView ? 0 : undefined}
+          >
             <Icon size={18} />
             {label}
           </div>
         ))}
 
         <div style={{ ...navGroupLabel, padding: "16px 20px 4px" }}>THE HOUSE</div>
-        {HOUSE_ITEMS.map(({ icon: Icon, label }) => (
-          <div key={label} style={navItemInactive}>
+        {HOUSE_ITEMS.map(({ icon: Icon, label, view: itemView }) => (
+          <div
+            key={label}
+            style={{ ...(itemView && view === itemView ? navItemActive : navItemInactive), cursor: itemView ? "pointer" : "default" }}
+            onClick={itemView ? () => setView(itemView) : undefined}
+            role={itemView ? "button" : undefined}
+            tabIndex={itemView ? 0 : undefined}
+          >
             <Icon size={18} />
             {label}
           </div>
@@ -94,39 +124,53 @@ export default function App() {
         {/* header */}
         <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", padding: "18px 26px 14px", background: "var(--surface-forge-head)", borderBottom: "1px solid var(--border-forge)" }}>
           <div>
-            <div style={{ fontFamily: "var(--font-type)", fontSize: 10, letterSpacing: ".2em", textTransform: "uppercase", color: "var(--ember-400)" }}>Assignment · live</div>
-            <h2 style={{ fontFamily: "var(--font-display)", color: "var(--gold-500)", fontSize: 34, lineHeight: 1, margin: "3px 0 0", fontWeight: 400 }}>The Hunt</h2>
+            <div style={{ fontFamily: "var(--font-type)", fontSize: 10, letterSpacing: ".2em", textTransform: "uppercase", color: "var(--ember-400)" }}>
+              {view === "settings" ? "Maintenance · engine" : "Assignment · live"}
+            </div>
+            <h2 style={{ fontFamily: "var(--font-display)", color: "var(--gold-500)", fontSize: 34, lineHeight: 1, margin: "3px 0 0", fontWeight: 400 }}>
+              {view === "settings" ? "The Workshop" : "The Hunt"}
+            </h2>
           </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-            <span style={{ display: "inline-flex", alignItems: "center", gap: 7, fontFamily: "var(--font-type)", fontSize: 10, letterSpacing: ".1em", textTransform: "uppercase", color: "var(--text-forge-mute)" }}>
-              <span style={{ width: 7, height: 7, borderRadius: "50%", background: "var(--flame-500)", boxShadow: "0 0 8px var(--flame-500)" }} />
-              {running ? "machine hot" : "machine warm"}
-            </span>
-            <Button variant="ghost" size="sm" onClick={() => setResetKey((k) => k + 1)}>New haul</Button>
-          </div>
+          {view === "job" && (
+            <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+              <span style={{ display: "inline-flex", alignItems: "center", gap: 7, fontFamily: "var(--font-type)", fontSize: 10, letterSpacing: ".1em", textTransform: "uppercase", color: "var(--text-forge-mute)" }}>
+                <span style={{ width: 7, height: 7, borderRadius: "50%", background: "var(--flame-500)", boxShadow: "0 0 8px var(--flame-500)" }} />
+                {running ? "machine hot" : "machine warm"}
+              </span>
+              <Button variant="ghost" size="sm" onClick={() => setResetKey((k) => k + 1)}>New haul</Button>
+            </div>
+          )}
         </div>
 
-        {/* pipeline rail */}
-        <div style={{ display: "flex", gap: 8, padding: "12px 26px", borderBottom: "1px solid var(--border-forge)" }}>
-          <PipelineCell state="done" n="✓" label="THE MARK" />
-          <PipelineCell state="active" n="2" label="THE HAUL" />
-          <PipelineCell state="pending" n="3" label="INSPECT" />
-          <PipelineCell state="pending" n="4" label="CULL" />
-        </div>
+        {view === "job" ? (
+          <>
+            {/* pipeline rail */}
+            <div style={{ display: "flex", gap: 8, padding: "12px 26px", borderBottom: "1px solid var(--border-forge)" }}>
+              <PipelineCell state="done" n="✓" label="THE MARK" />
+              <PipelineCell state="active" n="2" label="THE HAUL" />
+              <PipelineCell state="pending" n="3" label="INSPECT" />
+              <PipelineCell state="pending" n="4" label="CULL" />
+            </div>
 
-        {/* body */}
-        <div style={{ flex: 1, overflow: "auto", padding: "18px 26px 22px", display: "grid", gridTemplateColumns: "1.5fr 1fr", gridTemplateRows: "auto 1fr", gap: 18, minHeight: 0 }}>
-          <div style={{ gridColumn: 1, gridRow: "1 / span 2", minHeight: 0 }}>
-            <SearchPanel key={resetKey} />
+            {/* body */}
+            <div style={{ flex: 1, overflow: "auto", padding: "18px 26px 22px", display: "grid", gridTemplateColumns: "1.5fr 1fr", gridTemplateRows: "auto 1fr", gap: 18, minHeight: 0 }}>
+              <div style={{ gridColumn: 1, gridRow: "1 / span 2", minHeight: 0 }}>
+                <SearchPanel key={resetKey} />
+              </div>
+              <div style={{ gridColumn: 2, gridRow: 1 }}>
+                <PageScrapePanel />
+              </div>
+              <div style={{ gridColumn: 2, gridRow: 2, display: "flex", flexDirection: "column", gap: 14, minHeight: 0 }}>
+                <ProgressLog />
+                <CurationGrid />
+              </div>
+            </div>
+          </>
+        ) : (
+          <div style={{ flex: 1, overflow: "auto", padding: "18px 26px 22px", minHeight: 0, display: "flex" }}>
+            <SettingsPanel />
           </div>
-          <div style={{ gridColumn: 2, gridRow: 1 }}>
-            <PageScrapePanel />
-          </div>
-          <div style={{ gridColumn: 2, gridRow: 2, display: "flex", flexDirection: "column", gap: 14, minHeight: 0 }}>
-            <ProgressLog />
-            <CurationGrid />
-          </div>
-        </div>
+        )}
       </div>
     </div>
   );

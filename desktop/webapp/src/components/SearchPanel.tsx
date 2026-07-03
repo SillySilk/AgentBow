@@ -22,6 +22,8 @@ export default function SearchPanel() {
   const startScrape = useStore((s) => s.startScrape);
   const status = useStore((s) => s.status);
   const running = useStore((s) => s.scrape.running);
+  const engine = useStore((s) => s.engine);
+  const visionDisabled = !!engine && !engine.vision;
   const [query, setQuery] = useState("");
   const [count, setCount] = useState(15);
   const [destDir, setDestDir] = useState("C:\\AI\\workspace\\");
@@ -89,8 +91,10 @@ export default function SearchPanel() {
       </div>
 
       <div style={{ display: "flex", flexDirection: "column", gap: 12, padding: "14px 0", borderTop: "1px solid var(--border-forge)", borderBottom: "1px solid var(--border-forge)", marginBottom: 16 }}>
-        <OptionRow title="The Inspector" sublabel="LOCAL EYES CHECK EVERY FRAME">
-          <Switch checked={verify} onChange={setVerify} label="The Inspector" />
+        <OptionRow title="The Inspector" sublabel={visionDisabled ? "LOADED MODEL HAS NO VISION" : "LOCAL EYES CHECK EVERY FRAME"}>
+          <span title={visionDisabled ? "Loaded model has no vision" : undefined}>
+            <Switch checked={verify} onChange={setVerify} disabled={visionDisabled} label="The Inspector" />
+          </span>
         </OptionRow>
         {verify && (
           <textarea placeholder={DEFAULT_PROMPT_HINT} value={visionPrompt} onChange={(e) => setVisionPrompt(e.target.value)}

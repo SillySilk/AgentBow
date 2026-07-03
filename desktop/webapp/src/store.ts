@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import type { EngineStatus } from "./api";
 
 export type ScrapeEventMsg =
   | { type: "scrape_event"; kind: "phase"; label: string }
@@ -52,11 +53,15 @@ interface Store {
   /** Folder currently shown in the preview (the active "working slot"). */
   workingSlotDir: string;
   browserUrl?: string;
+  /** Latest local-LLM engine status, polled from the Workshop and used app-wide
+   * (e.g. to grey out the Verify toggle when the loaded model has no vision). */
+  engine: EngineStatus | null;
   connect: () => void;
   startScrape: (a: { query: string; count: number; destDir: string; sources: string[]; delayMs: number; verify: boolean; visionPrompt: string; bin: number | null; dedupe: boolean }) => void;
   setWorkingSlot: (dir: string) => void;
   openBrowser: (url: string) => void;
   pageScrape: (a: { count: number; destDir: string; scrolls: number }) => void;
+  setEngine: (engine: EngineStatus | null) => void;
   _ws?: WebSocket;
 }
 
@@ -65,6 +70,7 @@ export const useStore = create<Store>((set, get) => ({
   scrape: initialScrapeState(),
   lastDestDir: "",
   workingSlotDir: "",
+  engine: null,
   connect: () => {
     fetch("/api/config").then(r => r.json()).then(cfg => {
       const token: string = cfg.token ?? "";
@@ -113,4 +119,5 @@ export const useStore = create<Store>((set, get) => ({
     set({ scrape: { ...initialScrapeState(), running: true, target: count }, lastDestDir: destDir });
     ws.send(JSON.stringify({ type: "page_scrape_request", count, dest_dir: destDir, scrolls }));
   },
+  setEngine: (engine: EngineStatus | null) => set({ engine }),
 }));
