@@ -1,5 +1,48 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+/// Chromium-based executables that chromiumoxide can drive over CDP.
+fn is_chromium_based(path: &Path) -> bool {
+    matches!(
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.to_ascii_lowercase())
+            .as_deref(),
+        Some("chrome.exe" | "msedge.exe" | "brave.exe" | "vivaldi.exe" | "chromium.exe" | "opera.exe")
+    )
+}
+
+/// Extract the executable path from a registry `shell\open\command` value,
+/// e.g. `"C:\...\msedge.exe" --single-argument %1`.
+fn exe_from_command(command: &str) -> Option<String> {
+    if let Some(rest) = command.strip_prefix('"') {
+        rest.split('"').next().map(str::to_string)
+    } else {
+        command.split_whitespace().next().map(str::to_string)
+    }
+}
+
+/// The user's default browser per the Windows registry, if it is Chromium-based
+/// (CDP automation can't drive Firefox and friends).
+fn default_browser_executable() -> Option<PathBuf> {
+    use winreg::enums::{HKEY_CLASSES_ROOT, HKEY_CURRENT_USER};
+    use winreg::RegKey;
+    let prog_id: String = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\http\UserChoice")
+        .ok()?
+        .get_value("ProgId")
+        .ok()?;
+    let command: String = RegKey::predef(HKEY_CLASSES_ROOT)
+        .open_subkey(format!(r"{}\shell\open\command", prog_id))
+        .ok()?
+        .get_value("")
+        .ok()?;
+    let pb = PathBuf::from(exe_from_command(&command)?);
+    (pb.exists() && is_chromium_based(&pb)).then_some(pb)
+}
+
+/// Pick the browser for CDP automation: explicit `CHROME_PATH` override, then the
+/// user's default browser (when Chromium-based), then known install locations —
+/// Edge first, since it ships with Windows.
 pub fn chrome_executable() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("CHROME_PATH") {
         let pb = PathBuf::from(&p);
@@ -7,18 +50,23 @@ pub fn chrome_executable() -> Option<PathBuf> {
             return Some(pb);
         }
     }
+    if let Some(pb) = default_browser_executable() {
+        return Some(pb);
+    }
     const CANDIDATES: &[&str] = &[
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
         r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
     ];
     CANDIDATES.iter().map(PathBuf::from).find(|p| p.exists())
 }
 
 use anyhow::{anyhow, Result};
 use base64::Engine as _;
-use chromiumoxide::cdp::browser_protocol::network::{CookieParam, DeleteCookiesParams};
+use chromiumoxide::cdp::browser_protocol::network::{
+    CookieParam, DeleteCookiesParams, GetCookiesParams,
+};
 use chromiumoxide::{Browser, BrowserConfig, Page};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -125,9 +173,12 @@ impl ControlledBrowser {
     /// — the per-engine parsers need the embedded JSON intact). Used by the
     /// browser-primary scraper.
     ///
-    /// `cookies` (name, value, domain) are set **before** navigation — this is how we
-    /// force safe-search OFF, since these engines honour their cookie/account setting
-    /// over URL params.
+    /// `cookies` (name, value, domain) are seeded **before** navigation — this is how
+    /// we default safe-search OFF, since these engines honour their cookie/account
+    /// setting over URL params. Seeding is non-destructive: if the persistent profile
+    /// already holds a cookie with that name (e.g. Bing rewrote `SRCHHPGUSR` after the
+    /// user signed in and set their own preferences), the existing cookie wins —
+    /// clobbering it would silently undo a logged-in account's SafeSearch setting.
     pub async fn scrape_search_page(
         &self,
         url: &str,
@@ -141,8 +192,17 @@ impl ControlledBrowser {
             .map(|(n, v, d)| (n.to_string(), v.to_string(), d.to_string()))
             .collect();
         self.with_page(|page| async move {
-            // Force safe-search-off cookies before the page loads.
+            // Seed safe-search-off cookies before the page loads, skipping any the
+            // profile already has (a logged-in session's own prefs take precedence).
+            let existing: std::collections::HashSet<String> = page
+                .execute(GetCookiesParams { urls: Some(vec![u.clone()]) })
+                .await
+                .map(|r| r.result.cookies.iter().map(|c| c.name.clone()).collect())
+                .unwrap_or_default();
             for (n, v, d) in &owned_cookies {
+                if existing.contains(n) {
+                    continue;
+                }
                 if let Ok(cp) = serde_json::from_value::<CookieParam>(
                     json!({ "name": n, "value": v, "domain": d, "path": "/" }),
                 ) {
@@ -524,6 +584,26 @@ mod tests {
         std::env::set_var("CHROME_PATH", &me);
         assert_eq!(chrome_executable(), Some(me));
         std::env::remove_var("CHROME_PATH");
+    }
+
+    #[test]
+    fn exe_from_command_handles_quoted_and_bare() {
+        assert_eq!(
+            exe_from_command(r#""C:\Program Files\Microsoft\Edge\Application\msedge.exe" --single-argument %1"#),
+            Some(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe".to_string())
+        );
+        assert_eq!(
+            exe_from_command(r"C:\Tools\chrome.exe %1"),
+            Some(r"C:\Tools\chrome.exe".to_string())
+        );
+        assert_eq!(exe_from_command(""), None);
+    }
+
+    #[test]
+    fn is_chromium_based_filters_by_exe_name() {
+        assert!(is_chromium_based(Path::new(r"C:\x\msedge.exe")));
+        assert!(is_chromium_based(Path::new(r"C:\x\CHROME.EXE")));
+        assert!(!is_chromium_based(Path::new(r"C:\x\firefox.exe")));
     }
 
     #[test]
