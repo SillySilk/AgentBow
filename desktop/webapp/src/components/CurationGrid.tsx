@@ -26,22 +26,26 @@ export default function CurationGrid() {
   const [note, setNote] = useState("");
 
   const refresh = useCallback(async () => {
-    if (!dir) { setItems([]); setSelected(new Set()); return; }
-    setItems(await listImages(dir));
+    const next = dir ? await listImages(dir) : [];
+    setItems(next);
     setSelected(new Set());
   }, [dir]);
 
   const refreshSlots = useCallback(async () => {
     if (!baseDir) return;
-    setSlots(await listSlots(baseDir));
+    const next = await listSlots(baseDir);
+    setSlots(next);
   }, [baseDir]);
 
-  // Reload the previewed slot whenever it changes.
-  useEffect(() => { refresh(); }, [refresh]);
+  // Reload the previewed slot whenever it changes. State is set from the promise
+  // callback, never synchronously in the effect (react-hooks/set-state-in-effect).
+  useEffect(() => { Promise.resolve().then(refresh); }, [refresh]);
   // Reload images + the slot list when a scrape finishes.
-  useEffect(() => { if (finished) { refresh(); refreshSlots(); } }, [finished, refresh, refreshSlots]);
+  useEffect(() => {
+    if (finished) Promise.resolve().then(() => { refresh(); refreshSlots(); });
+  }, [finished, refresh, refreshSlots]);
   // Populate the slot list on first mount once we know the base dir.
-  useEffect(() => { refreshSlots(); }, [refreshSlots]);
+  useEffect(() => { Promise.resolve().then(refreshSlots); }, [refreshSlots]);
 
   if (!baseDir) return null;
 

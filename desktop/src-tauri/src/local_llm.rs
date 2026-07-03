@@ -2,7 +2,6 @@ use crate::types::{AgentEvent, PageContext};
 use crate::state::Config;
 use crate::tools;
 use anyhow::Result;
-use rusqlite;
 use futures_util::StreamExt;
 use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
@@ -214,18 +213,25 @@ async fn generate_reflection(
 
 // ── Main entry point ──────────────────────────────────────────────────────────
 
+/// Config + long-lived tool runtimes a chat turn needs; cheap to clone.
+#[derive(Clone)]
+pub struct ChatRuntime {
+    pub config: Arc<Config>,
+    pub shell_session: crate::tools::shell_session::ShellSessionManager,
+    pub browser: crate::tools::controlled_browser::ControlledBrowser,
+    pub mcp: crate::tools::mcp::McpManager,
+}
+
 pub async fn run_local_chat(
-    config: Arc<Config>,
+    rt: ChatRuntime,
     history: &mut Vec<OaiMessage>,
     user_message: String,
     message_id: String,
     page_ctx: Option<PageContext>,
     interrupt: Arc<AtomicBool>,
     event_tx: mpsc::Sender<AgentEvent>,
-    shell_session: crate::tools::shell_session::ShellSessionManager,
-    browser: crate::tools::controlled_browser::ControlledBrowser,
-    mcp: crate::tools::mcp::McpManager,
 ) -> Result<()> {
+    let ChatRuntime { config, shell_session, browser, mcp } = rt;
     history.push(OaiMessage {
         role: "user".to_string(),
         content: Some(user_message),
@@ -364,7 +370,7 @@ pub async fn run_local_chat(
         debug!("Sending streaming request to LM Studio, iteration {}", iterations);
 
         let resp = client
-            .post(&format!("{}/v1/chat/completions", config.lm_studio_url))
+            .post(format!("{}/v1/chat/completions", config.lm_studio_url))
             .json(&body)
             .send()
             .await
@@ -557,7 +563,7 @@ pub async fn run_local_chat(
 
         // Emit ToolStart for all calls
         for p in &parsed {
-            let input_val = p.input.as_ref().map(|v| v.clone()).unwrap_or(Value::Null);
+            let input_val = p.input.clone().unwrap_or(Value::Null);
             let _ = event_tx.send(AgentEvent::ToolStart {
                 tool_name: p.name.clone(),
                 tool_use_id: p.id.clone(),
@@ -646,14 +652,16 @@ pub async fn run_local_chat(
                     _ => match tools::dispatch(
                         &p.name,
                         &tool_input,
-                        &config.tavily_api_key,
-                        &config.lm_studio_url,
-                        &config.lm_studio_model,
-                        &config.workspace_root.to_string_lossy(),
-                        &config.searxng_url,
-                        &shell_session,
-                        &browser,
-                        &memory_db,
+                        &tools::ToolCtx {
+                            tavily_api_key: &config.tavily_api_key,
+                            lm_studio_url: &config.lm_studio_url,
+                            lm_studio_model: &config.lm_studio_model,
+                            workspace_root: &config.workspace_root.to_string_lossy(),
+                            searxng_url: &config.searxng_url,
+                            shell_session: &shell_session,
+                            browser: &browser,
+                            memory_db: &memory_db,
+                        },
                     ).await {
                         Ok(r) => (r, false),
                         Err(e) => (json!(e.to_string()), true),
@@ -696,8 +704,18 @@ pub async fn run_local_chat(
                         mcp.dispatch(&name, &tool_input).await
                     } else {
                         tools::dispatch(
-                            &name, &tool_input, &tavily, &lm_url, &lm_model, &ws_root,
-                            &searxng, &sess, &brow, &mem,
+                            &name,
+                            &tool_input,
+                            &tools::ToolCtx {
+                                tavily_api_key: &tavily,
+                                lm_studio_url: &lm_url,
+                                lm_studio_model: &lm_model,
+                                workspace_root: &ws_root,
+                                searxng_url: &searxng,
+                                shell_session: &sess,
+                                browser: &brow,
+                                memory_db: &mem,
+                            },
                         ).await
                     };
                     match result {

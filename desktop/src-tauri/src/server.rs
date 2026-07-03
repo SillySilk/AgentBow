@@ -179,9 +179,14 @@ pub async fn run_ws(
 
                             let mut hist = hist_snapshot;
                             if let Err(e) = local_llm::run_local_chat(
-                                config, &mut hist, content, message_id,
-                                ctx_snapshot, interrupt, event_tx, shell_session_clone,
-                                browser_clone, mcp_clone,
+                                local_llm::ChatRuntime {
+                                    config,
+                                    shell_session: shell_session_clone,
+                                    browser: browser_clone,
+                                    mcp: mcp_clone,
+                                },
+                                &mut hist, content, message_id,
+                                ctx_snapshot, interrupt, event_tx,
                             ).await {
                                 error!("local_llm: {}", e);
                             }
@@ -238,6 +243,7 @@ pub async fn run_ws(
                             vision_model_override: config.lm_studio_vision_model.clone(),
                             chat_model: config.lm_studio_model.clone(),
                             dedupe,
+                            sources,
                         };
                         let out_tx = out_tx.clone();
                         let cb = controlled_browser.clone();
@@ -254,7 +260,7 @@ pub async fn run_ws(
                                 }
                             });
                             let result = crate::tools::image_search::image_download(
-                                &query, count, &dest_dir, &log_dir, sources, tuning, &cb, Some(tx),
+                                &query, count, &dest_dir, &log_dir, tuning, &cb, Some(tx),
                             ).await;
                             // tx dropped here → forwarder drains and exits.
                             let _ = forwarder.await;
@@ -327,7 +333,11 @@ pub async fn run_ws(
                             let urls = cb.extract_image_urls().await.unwrap_or_default();
                             let _ = tx.send(crate::tools::image_search::ScrapeEvent::Candidates { total: urls.len(), filtered: 0 });
                             let mut log = crate::tools::image_search::SessionLog::new(&log_dir, "page_scrape");
-                            let result = crate::tools::image_search::download_urls_to_dir(urls, count, &dest, "page", 0, None, &mut log, &Some(tx.clone())).await;
+                            let result = crate::tools::image_search::download_urls_to_dir(
+                                urls, count, &dest, "page",
+                                crate::tools::image_search::DownloadOpts::default(),
+                                &mut log, &Some(tx.clone()),
+                            ).await;
                             let log_note = log.flush();
                             let downloaded = result.unwrap_or_default();
                             let _ = tx.send(crate::tools::image_search::ScrapeEvent::Done { downloaded, log_note, dest_dir: dest.clone() });

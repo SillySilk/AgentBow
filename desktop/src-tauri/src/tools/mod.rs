@@ -493,18 +493,29 @@ pub fn tool_schemas() -> Vec<Value> {
     ]
 }
 
-pub async fn dispatch(
-    tool_name: &str,
-    input: &Value,
-    tavily_api_key: &str,
-    lm_studio_url: &str,
-    lm_studio_model: &str,
-    workspace_root: &str,
-    searxng_url: &str,
-    shell_session: &shell_session::ShellSessionManager,
-    browser: &controlled_browser::ControlledBrowser,
-    memory_db: &memory::MemoryDb,
-) -> Result<Value> {
+/// App config + shared runtimes threaded into every tool call.
+pub struct ToolCtx<'a> {
+    pub tavily_api_key: &'a str,
+    pub lm_studio_url: &'a str,
+    pub lm_studio_model: &'a str,
+    pub workspace_root: &'a str,
+    pub searxng_url: &'a str,
+    pub shell_session: &'a shell_session::ShellSessionManager,
+    pub browser: &'a controlled_browser::ControlledBrowser,
+    pub memory_db: &'a memory::MemoryDb,
+}
+
+pub async fn dispatch(tool_name: &str, input: &Value, ctx: &ToolCtx<'_>) -> Result<Value> {
+    let &ToolCtx {
+        tavily_api_key,
+        lm_studio_url,
+        lm_studio_model,
+        workspace_root,
+        searxng_url,
+        shell_session,
+        browser,
+        memory_db,
+    } = ctx;
     match tool_name {
         "file_download" => {
             let url = input["url"]
@@ -682,7 +693,7 @@ pub async fn dispatch(
                 .ok_or_else(|| anyhow::anyhow!("image_download: missing 'dest_dir'"))?;
             let log_dir = format!("{}\\logs", workspace_root.trim_end_matches(['\\', '/']));
             let s = crate::tools::image_search::image_download(
-                query, count, dest_dir, &log_dir, None,
+                query, count, dest_dir, &log_dir,
                 crate::tools::image_search::ScrapeTuning::default(), browser, None,
             ).await?;
             Ok(json!(s))

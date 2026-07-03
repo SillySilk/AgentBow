@@ -120,7 +120,7 @@ fn dedupe_blocking(dir: &str, threshold: u32, recursive: bool, apply: bool) -> R
     // Union-find clustering over all pairs within the distance threshold.
     let n = items.len();
     let mut parent: Vec<usize> = (0..n).collect();
-    fn find(parent: &mut Vec<usize>, mut x: usize) -> usize {
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
         while parent[x] != x {
             parent[x] = parent[parent[x]];
             x = parent[x];
@@ -147,7 +147,7 @@ fn dedupe_blocking(dir: &str, threshold: u32, recursive: bool, apply: bool) -> R
 
     let mut dup_groups: Vec<Vec<usize>> = clusters.into_values().filter(|g| g.len() > 1).collect();
     // Stable, readable ordering: largest groups first.
-    dup_groups.sort_by(|a, b| b.len().cmp(&a.len()));
+    dup_groups.sort_by_key(|g| std::cmp::Reverse(g.len()));
 
     let total_dupes: usize = dup_groups.iter().map(|g| g.len() - 1).sum();
 

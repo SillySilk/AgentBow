@@ -135,7 +135,7 @@ impl SessionLog {
             Some(f) => {
                 // &File implements Write; rebind as a mutable place for writeln!.
                 let mut fh = f;
-                let _ = writeln!(fh, "");
+                let _ = writeln!(fh);
                 format!("Log: {}", self.path)
             }
         }
@@ -226,7 +226,7 @@ async fn call_vision_model(
 
     let client = reqwest::Client::new();
     let resp = client
-        .post(&format!("{}/v1/chat/completions", lm_studio_url))
+        .post(format!("{}/v1/chat/completions", lm_studio_url))
         .json(&body).send().await
         .map_err(|e| anyhow::anyhow!("LM Studio request failed: {}", e))?;
 
@@ -436,6 +436,9 @@ pub struct ScrapeTuning {
     /// Skip images that perceptually match an image already in the bin or kept earlier
     /// this run. Forces the sequential download path so hashing stays ordered.
     pub dedupe: bool,
+    /// Which scrapers to run. `None`/empty ⇒ all. Canonical keys: `bing`, `ddg`,
+    /// `yandex`, `brave`.
+    pub sources: Option<Vec<String>>,
 }
 
 /// Choose the vision model id from LM Studio's `/api/v0/models` JSON. Prefers a
@@ -561,18 +564,17 @@ async fn vision_judge(bytes: &[u8], ext: &str, cfg: &VerifyConfig) -> (bool, Str
 
 /// Download images matching `query` into `dest_dir`, up to `count` files.
 /// Writes a session log to `{log_dir}\\bow_downloads.log`.
-/// `sources` is `None`/empty → run all scrapers; otherwise only the named ones.
-/// Canonical keys: `bing`, `ddg`, `yandex`, `brave`.
+/// Source selection lives in `tuning.sources` (`None`/empty → run all scrapers).
 pub async fn image_download(
     query: &str,
     count: usize,
     dest_dir: &str,
     log_dir: &str,
-    sources: Option<Vec<String>>,
     tuning: ScrapeTuning,
     browser: &crate::tools::controlled_browser::ControlledBrowser,
     progress: Option<UnboundedSender<ScrapeEvent>>,
 ) -> Result<String> {
+    let sources = tuning.sources.clone();
     let emit = |e: ScrapeEvent| { if let Some(tx) = &progress { let _ = tx.send(e); } };
 
     std::fs::create_dir_all(dest_dir)
@@ -678,11 +680,12 @@ pub async fn image_download(
 
         // Scrape this page from every enabled source.
         let mut results: Vec<ScrapeResult> = Vec::new();
+        let fetch = BrowserFetch { browser, log_dir, progress: &progress };
         for (key, name, page_url, parse, cookies) in browser_engines {
             if source_enabled(&sources, key) {
                 let url = page_url(&encoded, page);
                 results.push(
-                    scrape_via_browser(browser, *name, &url, per_page_max, *parse, cookies, log_dir, &progress).await,
+                    scrape_via_browser(&fetch, name, &url, per_page_max, *parse, cookies).await,
                 );
             }
         }
@@ -759,19 +762,26 @@ pub async fn image_download(
 
 // ── Scrapers ──────────────────────────────────────────────────────────────────
 
+/// Shared context for fetching engine pages through the controlled browser:
+/// the browser itself, where to dump debug HTML, and the progress channel.
+struct BrowserFetch<'a> {
+    browser: &'a crate::tools::controlled_browser::ControlledBrowser,
+    log_dir: &'a str,
+    progress: &'a Option<UnboundedSender<ScrapeEvent>>,
+}
+
 /// Fetch an engine's results page through the real headed browser and parse it with
 /// `parse`. If the page is a captcha challenge, prompt the user (via a Phase event)
 /// and wait for them to solve it before extracting.
 async fn scrape_via_browser(
-    browser: &crate::tools::controlled_browser::ControlledBrowser,
+    fetch: &BrowserFetch<'_>,
     source: &'static str,
     url: &str,
     max: usize,
     parse: fn(&str, usize) -> Vec<String>,
     cookies: &[(&str, &str, &str)],
-    log_dir: &str,
-    progress: &Option<UnboundedSender<ScrapeEvent>>,
 ) -> ScrapeResult {
+    let BrowserFetch { browser, log_dir, progress } = *fetch;
     let emit = |e: ScrapeEvent| { if let Some(tx) = progress { let _ = tx.send(e); } };
 
     let html = match browser.scrape_search_page(url, 3, cookies).await {
@@ -1271,7 +1281,7 @@ fn extract_vqd(html: &str) -> Option<String> {
     for needle in &["vqd='", "vqd=\"", "vqd="] {
         if let Some(pos) = html.find(needle) {
             let rest = &html[pos + needle.len()..];
-            let end = rest.find(|c: char| c == '\'' || c == '"' || c == '&' || c == ' ' || c == '\n')
+            let end = rest.find(['\'', '"', '&', ' ', '\n'])
                 .unwrap_or_else(|| rest.len().min(80));
             let token = rest[..end].trim_matches(|c| c == '\'' || c == '"').to_string();
             if token.len() > 3 { return Some(token); }
@@ -1305,6 +1315,15 @@ pub fn filter_candidates(urls: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+/// Pacing + verification knobs for a bulk download run.
+#[derive(Default)]
+pub struct DownloadOpts {
+    /// Delay between downloads, in milliseconds. 0 + no verify ⇒ fast concurrent path.
+    pub delay_ms: u64,
+    /// Vision-QA keep/discard gate; `None` ⇒ keep everything.
+    pub verify: Option<VerifyConfig>,
+}
+
 /// Download a list of URLs into `dest_dir`, stopping once `count` succeed.
 /// Files are named `<name_hint>_NNN.ext` (name_hint is sanitized).
 /// Emits `Downloaded`/`Failed` events; logs results into `log`.
@@ -1314,11 +1333,11 @@ pub async fn download_urls_to_dir(
     count: usize,
     dest_dir: &str,
     name_hint: &str,
-    delay_ms: u64,
-    verify: Option<VerifyConfig>,
+    opts: DownloadOpts,
     log: &mut SessionLog,
     progress: &Option<UnboundedSender<ScrapeEvent>>,
 ) -> Result<Vec<String>> {
+    let DownloadOpts { delay_ms, verify } = opts;
     let emit = |e: ScrapeEvent| { if let Some(tx) = progress { let _ = tx.send(e); } };
 
     emit(ScrapeEvent::Phase { label: "Downloading".into() });

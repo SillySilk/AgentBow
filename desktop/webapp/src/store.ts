@@ -41,7 +41,9 @@ export function applyEvent(s: ScrapeState, m: ScrapeEventMsg): ScrapeState {
   }
 }
 
-export function isBrowserOpened(m: any): boolean { return m?.type === "browser_opened"; }
+export function isBrowserOpened(m: unknown): m is { type: "browser_opened"; url: string } {
+  return typeof m === "object" && m !== null && (m as { type?: unknown }).type === "browser_opened";
+}
 
 interface Store {
   status: string;
@@ -69,7 +71,7 @@ export const useStore = create<Store>((set, get) => ({
       if (!token) { set({ status: "no token in /api/config" }); return; }
       // Close previous socket atomically, immediately before opening the new one.
       const prev = get()._ws;
-      if (prev) { try { prev.close(); } catch {} }
+      if (prev) { try { prev.close(); } catch { /* already closed */ } }
       const wsUrl = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`;
       const ws = new WebSocket(wsUrl);
       ws.onopen = () => ws.send(JSON.stringify({ type: "auth", token, session_id: crypto.randomUUID() }));
