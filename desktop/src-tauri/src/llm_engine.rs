@@ -83,11 +83,17 @@ fn model_base_name(stem: &str) -> String {
     let bytes = upper.as_bytes();
     for i in (0..bytes.len()).rev() {
         if bytes[i] == b'-' || bytes[i] == b'_' {
-            // Check if what follows looks like a quant tag
+            // Check if what follows looks like a quant tag (Q4_K_M, IQ4_XS, ...)
             let after = &upper[i + 1..];
-            if (after.starts_with('Q') || after.starts_with("IQ"))
-                && after.len() > 1
-                && after[1..].chars().next().is_some_and(|c| c.is_ascii_digit())
+            let prefix_len = if after.starts_with("IQ") {
+                2
+            } else if after.starts_with('Q') {
+                1
+            } else {
+                0
+            };
+            if prefix_len > 0
+                && after[prefix_len..].chars().next().is_some_and(|c| c.is_ascii_digit())
             {
                 // This looks like a quant tag, trim it
                 return stem[..i].to_ascii_lowercase();
@@ -116,6 +122,16 @@ pub fn scan_models(dir: &Path) -> Vec<ModelEntry> {
             })
             .map(|e| (e.file_name().to_string_lossy().to_string(), e.path()))
             .collect();
+        // Count model (non-mmproj) GGUF files here — enables the single-model fallback below.
+        let model_count = entries
+            .iter()
+            .filter(|e| {
+                let f = e.file_name().to_string_lossy().to_string();
+                e.path().is_file()
+                    && f.to_ascii_lowercase().ends_with(".gguf")
+                    && !is_mmproj(&f)
+            })
+            .count();
 
         for e in &entries {
             let p = e.path();
@@ -131,11 +147,27 @@ pub fn scan_models(dir: &Path) -> Vec<ModelEntry> {
             // Find matching mmproj by comparing base model names (without quant)
             let model_base = fname.trim_end_matches(".gguf");
             let model_name = model_base_name(model_base);
-            let mmproj = mmprojs.iter().find(|(mmproj_name, _)| {
-                let mmproj_stem = mmproj_name.trim_end_matches(".gguf").strip_prefix("mmproj-").unwrap_or("");
-                let mmproj_name_normalized = model_base_name(mmproj_stem);
-                model_name == mmproj_name_normalized
-            }).map(|(_, path)| path.clone());
+            let mmproj = mmprojs
+                .iter()
+                .find(|(mmproj_name, _)| {
+                    // Drop the leading "mmproj" marker (any case) plus separators.
+                    let stem = mmproj_name.trim_end_matches(".gguf");
+                    let rest = stem
+                        .get("mmproj".len()..)
+                        .unwrap_or("")
+                        .trim_start_matches(['-', '_', '.']);
+                    model_base_name(rest) == model_name
+                })
+                .map(|(_, path)| path.clone())
+                // HF-style layout: one model per directory — pair the sole model with the
+                // sole mmproj even when their names don't match (e.g. "mmproj-model-f16").
+                .or_else(|| {
+                    if model_count == 1 && mmprojs.len() == 1 {
+                        Some(mmprojs[0].1.clone())
+                    } else {
+                        None
+                    }
+                });
 
             let size_bytes = e.metadata().map(|m| m.len()).unwrap_or(0);
             out.push(ModelEntry {
@@ -173,6 +205,59 @@ mod tests {
         assert!(!is_loadable_quant(&Some("BF16".into())));
         assert!(!is_loadable_quant(&Some("F32".into())));
         assert!(!is_loadable_quant(&None));
+    }
+
+    #[test]
+    fn scan_pairs_iq_quant_model_with_mmproj() {
+        // Regression: IQ-tagged quant suffixes must strip so name-based pairing works.
+        let dir = std::env::temp_dir().join("bow_scan_test_iq");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Gemma-4-E4B-Aggressive-IQ4_XS.gguf"), b"x").unwrap();
+        std::fs::write(dir.join("mmproj-Gemma-4-E4B-Aggressive-f16.gguf"), b"x").unwrap();
+        std::fs::write(dir.join("Other-2B-Q8_0.gguf"), b"x").unwrap(); // defeats single-model fallback
+        let models = scan_models(&dir);
+        assert_eq!(models.len(), 2);
+        let gemma = models.iter().find(|m| m.name.contains("Gemma")).unwrap();
+        assert!(gemma.mmproj.is_some(), "IQ4_XS model must pair with its mmproj");
+        let other = models.iter().find(|m| m.name.contains("Other")).unwrap();
+        assert!(other.mmproj.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn scan_pairs_two_families_to_their_own_mmproj() {
+        let dir = std::env::temp_dir().join("bow_scan_test_families");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Alpha-7B-Q4_K_M.gguf"), b"x").unwrap();
+        std::fs::write(dir.join("mmproj-Alpha-7B-f16.gguf"), b"x").unwrap();
+        std::fs::write(dir.join("Beta-2B-IQ2_M.gguf"), b"x").unwrap();
+        std::fs::write(dir.join("mmproj-Beta-2B-f16.gguf"), b"x").unwrap();
+        let models = scan_models(&dir);
+        assert_eq!(models.len(), 2);
+        let alpha = models.iter().find(|m| m.name.contains("Alpha")).unwrap();
+        let beta = models.iter().find(|m| m.name.contains("Beta")).unwrap();
+        let alpha_proj = alpha.mmproj.as_ref().expect("Alpha must have an mmproj");
+        let beta_proj = beta.mmproj.as_ref().expect("Beta must have an mmproj");
+        assert!(alpha_proj.to_string_lossy().contains("Alpha"), "Alpha paired with wrong mmproj");
+        assert!(beta_proj.to_string_lossy().contains("Beta"), "Beta paired with wrong mmproj");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn scan_pairs_hf_style_single_model_directory() {
+        // HF-style layout: one model per directory, mmproj name need not match the model name.
+        let dir = std::env::temp_dir().join("bow_scan_test_hf");
+        std::fs::remove_dir_all(&dir).ok();
+        let sub = dir.join("Qwen2.5-VL-7B-Instruct-GGUF");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf"), b"x").unwrap();
+        std::fs::write(sub.join("mmproj-model-f16.gguf"), b"x").unwrap();
+        let models = scan_models(&dir);
+        assert_eq!(models.len(), 1);
+        assert!(models[0].mmproj.is_some(), "sole model in dir must pair with sole mmproj");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
