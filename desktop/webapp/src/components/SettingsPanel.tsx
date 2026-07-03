@@ -17,6 +17,7 @@ export default function SettingsPanel() {
   const [models, setModels] = useState<EngineModel[]>([]);
   const [rescanning, setRescanning] = useState(false);
   const [busyPath, setBusyPath] = useState<string | null>(null);
+  const [stopping, setStopping] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
 
   const refreshModels = useCallback(() => {
@@ -48,12 +49,16 @@ export default function SettingsPanel() {
       const res = await setModelsDir(dirInput.trim());
       setDir(res.dir);
       setModels(res.models);
+      // Backend may normalize the submitted path — reflect it, but don't wipe
+      // the user's text when the request failed (fallback returns dir: "").
+      if (res.dir) setDirInput(res.dir);
     } finally {
       setRescanning(false);
     }
   };
 
   const onLoad = async (path: string) => {
+    if (busyPath) return; // one load at a time — ignore clicks while in flight
     setLoadError(null);
     setBusyPath(path);
     try {
@@ -66,8 +71,14 @@ export default function SettingsPanel() {
   };
 
   const onStop = async () => {
-    await stopEngine();
-    setEngine(await engineStatus());
+    if (stopping) return; // ignore repeated clicks while the POST is in flight
+    setStopping(true);
+    try {
+      await stopEngine();
+      setEngine(await engineStatus());
+    } finally {
+      setStopping(false);
+    }
   };
 
   const state = engine?.state ?? "stopped";
@@ -143,9 +154,9 @@ export default function SettingsPanel() {
           </div>
         </div>
         {state === "ready" && (
-          <Button variant="danger" size="sm" onClick={onStop}>
+          <Button variant="danger" size="sm" disabled={stopping} onClick={onStop}>
             <Square size={12} />
-            Stop
+            {stopping ? "Stopping…" : "Stop"}
           </Button>
         )}
       </div>
@@ -193,7 +204,7 @@ export default function SettingsPanel() {
                 <Button
                   variant={isLoaded ? "ghost" : "forge"}
                   size="sm"
-                  disabled={!m.loadable || busyPath === m.path || isLoaded}
+                  disabled={!m.loadable || busyPath !== null || isLoaded}
                   title={!m.loadable ? "unquantized — not loadable" : undefined}
                   onClick={() => onLoad(m.path)}
                 >

@@ -75,6 +75,7 @@ export default function App() {
             key={label}
             style={{ ...(itemView && view === itemView ? navItemActive : navItemInactive), cursor: itemView ? "pointer" : "default" }}
             onClick={itemView ? () => setView(itemView) : undefined}
+            onKeyDown={itemView ? (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setView(itemView); } } : undefined}
             role={itemView ? "button" : undefined}
             tabIndex={itemView ? 0 : undefined}
           >
@@ -89,6 +90,7 @@ export default function App() {
             key={label}
             style={{ ...(itemView && view === itemView ? navItemActive : navItemInactive), cursor: itemView ? "pointer" : "default" }}
             onClick={itemView ? () => setView(itemView) : undefined}
+            onKeyDown={itemView ? (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setView(itemView); } } : undefined}
             role={itemView ? "button" : undefined}
             tabIndex={itemView ? 0 : undefined}
           >
