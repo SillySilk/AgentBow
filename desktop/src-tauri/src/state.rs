@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use crate::tools::shell_session::ShellSessionManager;
 use crate::tools::controlled_browser::ControlledBrowser;
+use crate::llm_engine::LlmEngine;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -21,6 +23,10 @@ pub struct Config {
     /// Token budget for reasoning. Passed as reasoning_tokens in chat completions.
     /// Leave unset to omit the field (model default).
     pub reasoning_tokens: Option<u32>,
+    /// Directory scanned for local GGUF models (Bow-managed llama-server engine).
+    pub models_dir: PathBuf,
+    /// Context size (tokens) used when loading a model into the local engine.
+    pub ctx_size: u32,
 }
 
 impl Config {
@@ -37,6 +43,8 @@ impl Config {
             searxng_url: "http://localhost:8888".to_string(),
             reasoning_effort: None,
             reasoning_tokens: None,
+            models_dir: PathBuf::from(r"C:\AI\models"),
+            ctx_size: 8192,
         }
     }
 
@@ -86,6 +94,14 @@ impl Config {
             }).ok()
         });
 
+        let models_dir = std::env::var("BOW_MODELS_DIR")
+            .unwrap_or_else(|_| r"C:\AI\models".to_string())
+            .into();
+        let ctx_size = std::env::var("BOW_CTX_SIZE")
+            .unwrap_or_else(|_| "8192".to_string())
+            .parse::<u32>()
+            .context("BOW_CTX_SIZE must be a valid u32")?;
+
         Ok(Config {
             tavily_api_key,
             bow_secret,
@@ -97,6 +113,8 @@ impl Config {
             searxng_url,
             reasoning_effort,
             reasoning_tokens,
+            models_dir,
+            ctx_size,
         })
     }
 }
@@ -125,15 +143,39 @@ pub struct AppState {
     pub config: Config,
     pub shell_session: ShellSessionManager,
     pub controlled_browser: ControlledBrowser,
+    pub llm_engine: LlmEngine,
+    /// Consumed by the model-management REST endpoints (Task 6).
+    #[allow(dead_code)]
+    pub models_dir: Arc<Mutex<PathBuf>>,
 }
 
 impl AppState {
     pub fn new(config: Config) -> Self {
         let browser_profile = config.workspace_root.join(".bow_browser_profile");
+        let bin_dir = std::env::current_exe()
+            .ok()
+            .and_then(|e| e.parent().map(|d| d.join("llama")))
+            .unwrap_or_else(|| PathBuf::from("llama"));
+        let models_dir = config.models_dir.clone();
         Self {
             shell_session: ShellSessionManager::new(),
             controlled_browser: ControlledBrowser::new(browser_profile),
+            llm_engine: LlmEngine::new(bin_dir),
+            models_dir: Arc::new(Mutex::new(models_dir)),
             config,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_default_models_dir() {
+        std::env::remove_var("BOW_MODELS_DIR");
+        let c = Config::test_default(std::path::PathBuf::from(r"C:\tmp"));
+        assert_eq!(c.models_dir, std::path::PathBuf::from(r"C:\AI\models"));
+        assert_eq!(c.ctx_size, 8192);
     }
 }

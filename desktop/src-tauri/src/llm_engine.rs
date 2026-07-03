@@ -348,7 +348,19 @@ impl LlmEngine {
         if let Some(mm) = &entry.mmproj {
             cmd.arg("--mmproj").arg(mm);
         }
-        let mut child = cmd.spawn().map_err(|e| anyhow!("spawn llama-server: {}", e))?;
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let msg = format!("spawn llama-server: {}", e);
+                let mut g = self.inner.lock().await;
+                if g.generation == my_gen {
+                    g.state = "failed".into();
+                    g.error = Some(msg.clone());
+                    g.port = None;
+                }
+                return Err(anyhow!(msg));
+            }
+        };
         {
             let mut g = self.inner.lock().await;
             if g.generation != my_gen {
@@ -544,6 +556,31 @@ mod tests {
         assert!(st.model.is_none(), "stale model");
         assert!(st.base_url.is_none());
         assert!(!st.vision);
+    }
+
+    #[tokio::test]
+    async fn spawn_failure_resets_state_to_failed() {
+        // llama-server.exe exists but is not a valid PE — spawn() itself errors on
+        // Windows, exercising the previously-unhandled early-return path.
+        let dir = std::env::temp_dir().join("bow_engine_test_bad_exe");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("llama-server.exe"), b"not a real executable").unwrap();
+
+        let eng = LlmEngine::new(dir.clone());
+        let entry = ModelEntry {
+            path: PathBuf::from(r"C:\m\ok-Q4_K_M.gguf"), name: "ok-Q4_K_M".into(),
+            size_bytes: 1, quant: Some("Q4_K_M".into()), mmproj: None,
+        };
+        let err = eng.load(entry, 4096).await.unwrap_err().to_string();
+        assert!(err.contains("spawn"), "err was: {}", err);
+
+        let st = eng.status().await;
+        assert_eq!(st.state, "failed");
+        assert!(st.error.is_some(), "expected error to be set on failed spawn");
+        assert!(st.base_url.is_none(), "port must be cleared on failed spawn");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

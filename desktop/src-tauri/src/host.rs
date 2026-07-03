@@ -178,6 +178,27 @@ pub fn run() {
         }
     });
 
+    // Auto-load the last-used model (engine.json), if it still exists.
+    {
+        let engine = app_state.llm_engine.clone();
+        let ctx = config.ctx_size;
+        let models_dir = config.models_dir.clone();
+        rt.spawn(async move {
+            let p = crate::llm_engine::load_persist(&crate::llm_engine::persist_path());
+            if let Some(path) = p.model_path {
+                if path.exists() {
+                    if let Some(entry) = crate::llm_engine::scan_models(&models_dir)
+                        .into_iter().find(|m| m.path == path)
+                    {
+                        if let Err(e) = engine.load(entry, ctx).await {
+                            tracing::warn!("auto-load failed: {}", e);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // Open the browser once the server is up.
     let url = format!("http://127.0.0.1:{}", actual_port);
     std::thread::spawn({
@@ -217,6 +238,7 @@ pub fn run() {
     let event_loop = EventLoopBuilder::new().build();
     let menu_channel = MenuEvent::receiver();
     let workspace_path = config.workspace_root.clone();
+    let quit_state = app_state.clone();
     event_loop.run(move |_event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
         if let Ok(ev) = menu_channel.try_recv() {
@@ -233,6 +255,8 @@ pub fn run() {
                     .arg(r"C:\AI\agent Bow\desktop\.env")
                     .spawn();
             } else if ev.id == quit_i.id() {
+                info!("Quit requested — stopping local LLM engine before exit");
+                rt.block_on(quit_state.llm_engine.stop());
                 std::process::exit(0);
             }
         }
