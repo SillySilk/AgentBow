@@ -67,8 +67,10 @@ process:
 `scan_models(dir)` returns `ModelEntry { path, name, size_bytes, quant,
 vision: bool }`.
 
-- `quant` parsed from GGUF metadata (`general.file_type`) with filename-tag
-  fallback (`Q4_K_M`, `Q5_K_S`, `IQ4_XS`, …).
+- `quant` parsed from the filename tag (`Q4_K_M`, `Q5_K_S`, `IQ4_XS`, …).
+  Files with no recognizable tag are treated as unquantized and refused —
+  conservative and far simpler than parsing GGUF metadata; HF-distributed
+  GGUFs carry the tag in practice.
 - **Quantized is enforced:** entries whose primary weights are F16/BF16/F32 are
   listed but marked *"unquantized — not loadable"* and refused at load time.
   mmproj projector files are exempt (they're auxiliary) and are hidden from the
