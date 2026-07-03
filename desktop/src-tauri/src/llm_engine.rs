@@ -227,6 +227,162 @@ pub fn save_persist(path: &Path, p: &EnginePersist) {
     }
 }
 
+use anyhow::{anyhow, Result};
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+struct EngineInner {
+    child: Option<tokio::process::Child>,
+    state: String,
+    error: Option<String>,
+    model: Option<ModelEntry>,
+    port: Option<u16>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct EngineStatus {
+    pub state: String,
+    pub error: Option<String>,
+    pub model: Option<ModelEntry>,
+    pub base_url: Option<String>,
+    pub vision: bool,
+}
+
+#[derive(Clone)]
+#[allow(dead_code)]
+pub struct LlmEngine {
+    inner: Arc<Mutex<EngineInner>>,
+    bin_dir: PathBuf,
+}
+
+#[allow(dead_code)]
+impl LlmEngine {
+    pub fn new(bin_dir: PathBuf) -> Self {
+        LlmEngine {
+            inner: Arc::new(Mutex::new(EngineInner {
+                child: None, state: "stopped".into(), error: None, model: None, port: None,
+            })),
+            bin_dir,
+        }
+    }
+
+    fn server_exe(&self) -> PathBuf { self.bin_dir.join("llama-server.exe") }
+
+    async fn free_port() -> Result<u16> {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        Ok(l.local_addr()?.port())
+    }
+
+    pub async fn status(&self) -> EngineStatus {
+        let g = self.inner.lock().await;
+        EngineStatus {
+            state: g.state.clone(),
+            error: g.error.clone(),
+            model: g.model.clone(),
+            base_url: g.port.map(|p| format!("http://127.0.0.1:{}", p)),
+            vision: g.model.as_ref().map(|m| m.mmproj.is_some()).unwrap_or(false),
+        }
+    }
+
+    pub async fn stop(&self) {
+        let mut g = self.inner.lock().await;
+        if let Some(mut c) = g.child.take() {
+            let _ = c.kill().await;
+        }
+        g.state = "stopped".into();
+        g.port = None;
+        g.model = None;
+        g.error = None;
+    }
+
+    /// Stop any running server, spawn llama-server on `entry`, wait for /health.
+    pub async fn load(&self, entry: ModelEntry, ctx_size: u32) -> Result<()> {
+        if !is_loadable_quant(&entry.quant) {
+            return Err(anyhow!(
+                "'{}' is unquantized (tag {:?}) — Bow only loads quantized GGUFs (Q*/IQ*)",
+                entry.name, entry.quant
+            ));
+        }
+        let exe = self.server_exe();
+        if !exe.exists() {
+            return Err(anyhow!(
+                "llama-server.exe not found at {} — run get-llama.ps1 (repo root) first",
+                exe.display()
+            ));
+        }
+        self.stop().await;
+        let port = Self::free_port().await?;
+        {
+            let mut g = self.inner.lock().await;
+            g.state = "starting".into();
+            g.port = Some(port);
+            g.model = Some(entry.clone());
+        }
+        let mut cmd = tokio::process::Command::new(&exe);
+        cmd.arg("-m").arg(&entry.path)
+            .arg("--host").arg("127.0.0.1")
+            .arg("--port").arg(port.to_string())
+            .arg("--jinja")
+            .arg("-ngl").arg("999")
+            .arg("-c").arg(ctx_size.to_string())
+            .arg("--no-webui")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        {
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        if let Some(mm) = &entry.mmproj {
+            cmd.arg("--mmproj").arg(mm);
+        }
+        let child = cmd.spawn().map_err(|e| anyhow!("spawn llama-server: {}", e))?;
+        {
+            let mut g = self.inner.lock().await;
+            g.child = Some(child);
+        }
+        // Poll /health until ready (model load can take a while on first touch).
+        let url = format!("http://127.0.0.1:{}/health", port);
+        let client = reqwest::Client::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if let Ok(r) = client.get(&url).send().await {
+                if r.status().is_success() {
+                    let mut g = self.inner.lock().await;
+                    g.state = "ready".into();
+                    save_persist(&persist_path(), &EnginePersist {
+                        model_path: Some(entry.path.clone()), ctx_size,
+                    });
+                    return Ok(());
+                }
+            }
+            // Child died?
+            {
+                let mut g = self.inner.lock().await;
+                if let Some(c) = g.child.as_mut() {
+                    if let Ok(Some(status)) = c.try_wait() {
+                        g.state = "failed".into();
+                        g.error = Some(format!("llama-server exited: {}", status));
+                        g.child = None;
+                        g.port = None;
+                        return Err(anyhow!("llama-server exited during startup ({})", status));
+                    }
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                self.stop().await;
+                let mut g = self.inner.lock().await;
+                g.state = "failed".into();
+                g.error = Some("startup timed out after 180s".into());
+                return Err(anyhow!("llama-server startup timed out"));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,6 +476,31 @@ mod tests {
         assert!(bare.mmproj.is_none());
         assert!(!is_loadable_quant(&bare.quant));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn engine_refuses_unquantized_and_reports_stopped() {
+        let eng = LlmEngine::new(std::env::temp_dir().join("no_bin_dir"));
+        let st = eng.status().await;
+        assert_eq!(st.state, "stopped");
+        assert!(st.base_url.is_none());
+        let bad = ModelEntry {
+            path: PathBuf::from(r"C:\m\big-F16.gguf"), name: "big-F16".into(),
+            size_bytes: 1, quant: Some("F16".into()), mmproj: None,
+        };
+        let err = eng.load(bad, 8192).await.unwrap_err().to_string();
+        assert!(err.contains("unquantized"), "err was: {}", err);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs llama-server.exe + a real GGUF; run manually with --ignored"]
+    async fn engine_loads_real_model_live() {
+        let eng = LlmEngine::new(PathBuf::from(r"C:\AI\agent Bow\desktop\src-tauri\bin\llama"));
+        let models = scan_models(Path::new(r"C:\AI\models"));
+        let m = models.into_iter().find(|m| is_loadable_quant(&m.quant)).expect("a model");
+        eng.load(m, 4096).await.expect("load");
+        assert_eq!(eng.status().await.state, "ready");
+        eng.stop().await;
     }
 
     #[test]
