@@ -17,11 +17,12 @@ pub struct HttpState {
 
 async fn ws_upgrade(State(s): State<HttpState>, ws: WebSocketUpgrade) -> Response {
     let config = Arc::new(s.app.config.clone());
+    let llm_engine = s.app.llm_engine.clone();
     let shell_session = s.app.shell_session.clone();
     let controlled_browser = s.app.controlled_browser.clone();
     let mcp = s.mcp.clone();
     ws.on_upgrade(move |socket| async move {
-        if let Err(e) = crate::server::run_ws(socket, config, shell_session, controlled_browser, mcp).await {
+        if let Err(e) = crate::server::run_ws(socket, config, llm_engine, shell_session, controlled_browser, mcp).await {
             tracing::error!("WS connection error: {}", e);
         }
     })

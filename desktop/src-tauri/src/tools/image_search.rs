@@ -8,18 +8,18 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tracing::{debug, info};
 
-// ── LM Studio types ───────────────────────────────────────────────────────────
+// ── OpenAI-compatible chat-completion response types ─────────────────────────
 
 #[derive(Deserialize)]
-struct LmStudioResponse {
-    choices: Vec<LmStudioChoice>,
+struct ChatResponse {
+    choices: Vec<ChatChoice>,
 }
 #[derive(Deserialize)]
-struct LmStudioChoice {
-    message: LmStudioMessage,
+struct ChatChoice {
+    message: ChatMessage,
 }
 #[derive(Deserialize)]
-struct LmStudioMessage {
+struct ChatMessage {
     content: Option<String>,
     reasoning_content: Option<String>,
 }
@@ -157,7 +157,7 @@ const MAX_VERIFY_BYTES: usize = 4 * 1024 * 1024;
 pub async fn image_verify(
     image_path: &str,
     prompt: &str,
-    lm_studio_url: &str,
+    llm_base_url: &str,
     model: &str,
 ) -> Result<String> {
     let path = Path::new(image_path);
@@ -202,16 +202,16 @@ pub async fn image_verify(
     };
     let data_uri = format!("data:{};base64,{}", mime, b64);
 
-    call_vision_model(&data_uri, prompt, lm_studio_url, model, 300).await
+    call_vision_model(&data_uri, prompt, llm_base_url, model, 300).await
 }
 
-/// POST a vision request (text prompt + one image as a data URI) to LM Studio's
-/// OpenAI-compatible endpoint and return the model's text. Falls back to the
-/// reasoning channel if a reasoning model returned no plain content.
+/// POST a vision request (text prompt + one image as a data URI) to the local
+/// engine's OpenAI-compatible endpoint and return the model's text. Falls back to
+/// the reasoning channel if a reasoning model returned no plain content.
 async fn call_vision_model(
     data_uri: &str,
     prompt: &str,
-    lm_studio_url: &str,
+    llm_base_url: &str,
     model: &str,
     max_tokens: u32,
 ) -> Result<String> {
@@ -226,20 +226,20 @@ async fn call_vision_model(
 
     let client = reqwest::Client::new();
     let resp = client
-        .post(format!("{}/v1/chat/completions", lm_studio_url))
+        .post(format!("{}/v1/chat/completions", llm_base_url))
         .json(&body).send().await
-        .map_err(|e| anyhow::anyhow!("LM Studio request failed: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("LLM engine request failed: {}", e))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow::anyhow!("LM Studio error {}: {}", status, body));
+        return Err(anyhow::anyhow!("LLM engine error {}: {}", status, body));
     }
 
-    let data: LmStudioResponse = resp.json().await
-        .map_err(|e| anyhow::anyhow!("Failed to parse LM Studio response: {}", e))?;
+    let data: ChatResponse = resp.json().await
+        .map_err(|e| anyhow::anyhow!("Failed to parse LLM engine response: {}", e))?;
     let choice = data.choices.first()
-        .ok_or_else(|| anyhow::anyhow!("LM Studio returned no choices"))?;
+        .ok_or_else(|| anyhow::anyhow!("LLM engine returned no choices"))?;
     let result = choice.message.content.as_deref().unwrap_or("");
     let reasoning = choice.message.reasoning_content.as_deref().unwrap_or("");
     if result.is_empty() && !reasoning.is_empty() { Ok(reasoning.to_string()) }
@@ -263,7 +263,7 @@ pub async fn image_autotag(
     trigger: &str,
     recursive: bool,
     overwrite: bool,
-    lm_studio_url: &str,
+    llm_base_url: &str,
     model: &str,
 ) -> Result<String> {
     let root = Path::new(dir);
@@ -305,7 +305,7 @@ pub async fn image_autotag(
         };
 
         // Per-image timeout so one slow/hung inference can't stall the batch.
-        let call = call_vision_model(&data_uri, prompt, lm_studio_url, model, 200);
+        let call = call_vision_model(&data_uri, prompt, llm_base_url, model, 200);
         let raw = match tokio::time::timeout(std::time::Duration::from_secs(120), call).await {
             Ok(Ok(text)) => text,
             _ => { failed += 1; continue; }
@@ -428,11 +428,13 @@ pub struct ScrapeTuning {
     pub verify: bool,
     /// Override the default judging prompt (empty/None ⇒ default).
     pub vision_prompt: Option<String>,
-    pub lm_studio_url: String,
-    /// Manual vision-model override. Empty ⇒ auto-detect the loaded VLM from LM Studio.
-    pub vision_model_override: String,
-    /// Chat model id — used as a last-resort fallback if auto-detect fails.
-    pub chat_model: String,
+    /// Base URL of the embedded engine's OpenAI-compatible server.
+    pub llm_base_url: String,
+    /// Name of the model loaded in the embedded engine.
+    pub llm_model: String,
+    /// Whether the loaded model has vision (an mmproj projector). When false,
+    /// `verify` is skipped with a warning instead of judging blind.
+    pub vision: bool,
     /// Skip images that perceptually match an image already in the bin or kept earlier
     /// this run. Forces the sequential download path so hashing stays ordered.
     pub dedupe: bool,
@@ -441,55 +443,12 @@ pub struct ScrapeTuning {
     pub sources: Option<Vec<String>>,
 }
 
-/// Choose the vision model id from LM Studio's `/api/v0/models` JSON. Prefers a
-/// **loaded** model of `type == "vlm"`; if the loaded model isn't a VLM it's used
-/// anyway with a warning; if nothing is loaded it falls back to `fallback`.
-fn pick_loaded_vision_model(models_json: &serde_json::Value, fallback: &str) -> (String, Option<String>) {
-    let models = match models_json["data"].as_array() {
-        Some(m) => m,
-        None => return (fallback.to_string(), Some("LM Studio returned no model list — using fallback".to_string())),
-    };
-    let loaded: Vec<&serde_json::Value> =
-        models.iter().filter(|m| m["state"].as_str() == Some("loaded")).collect();
-    if let Some(m) = loaded.iter().find(|m| m["type"].as_str() == Some("vlm")) {
-        return (m["id"].as_str().unwrap_or(fallback).to_string(), None);
-    }
-    if let Some(m) = loaded.first() {
-        let id = m["id"].as_str().unwrap_or(fallback).to_string();
-        let ty = m["type"].as_str().unwrap_or("unknown");
-        return (id.clone(), Some(format!(
-            "loaded model '{}' is type '{}', not a vision model — image checks may be unreliable. Load a vision (VLM) model in LM Studio.",
-            id, ty
-        )));
-    }
-    (fallback.to_string(), Some("no model loaded in LM Studio — using fallback; load a vision model".to_string()))
-}
-
-/// Resolve which model to use for the vision gate. A non-empty `override_id` wins;
-/// otherwise auto-detect the loaded VLM from LM Studio's native API. Returns the
-/// chosen id and an optional warning to surface to the user.
-async fn resolve_vision_model(lm_studio_url: &str, override_id: &str, fallback: &str) -> (String, Option<String>) {
-    if !override_id.trim().is_empty() {
-        return (override_id.to_string(), None);
-    }
-    let url = format!("{}/api/v0/models", lm_studio_url.trim_end_matches('/'));
-    let client = reqwest::Client::new();
-    match client.get(&url).timeout(std::time::Duration::from_secs(8)).send().await {
-        Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
-            Ok(data) => pick_loaded_vision_model(&data, fallback),
-            Err(e) => (fallback.to_string(), Some(format!("could not read LM Studio models ({}) — using fallback", e))),
-        },
-        Ok(resp) => (fallback.to_string(), Some(format!("LM Studio /api/v0/models HTTP {} — using fallback", resp.status()))),
-        Err(e) => (fallback.to_string(), Some(format!("LM Studio not reachable for model auto-detect ({}) — using fallback", e))),
-    }
-}
-
 /// Resolved vision-gate settings (prompt already query-interpolated).
 #[derive(Clone)]
 pub struct VerifyConfig {
     pub prompt: String,
-    pub lm_studio_url: String,
-    pub vision_model: String,
+    pub base_url: String,
+    pub model: String,
 }
 
 /// Default judging prompt for the vision gate, with the query interpolated in.
@@ -551,7 +510,7 @@ async fn vision_judge(bytes: &[u8], ext: &str, cfg: &VerifyConfig) -> (bool, Str
         _ => "image/jpeg",
     };
     let data_uri = format!("data:{};base64,{}", mime, b64);
-    match call_vision_model(&data_uri, &cfg.prompt, &cfg.lm_studio_url, &cfg.vision_model, 200).await {
+    match call_vision_model(&data_uri, &cfg.prompt, &cfg.base_url, &cfg.model, 200).await {
         Ok(reply) => {
             debug!("vision verdict: {:.120}", reply.replace('\n', " "));
             parse_verdict(&reply)
@@ -617,25 +576,23 @@ pub async fn image_download(
          &[("safesearch", "off", ".search.brave.com")]),
     ];
 
-    // Resolve the vision gate once (independent of paging).
-    let verify_cfg = if tuning.verify {
-        let (model, warn) = resolve_vision_model(
-            &tuning.lm_studio_url, &tuning.vision_model_override, &tuning.chat_model,
-        ).await;
-        if let Some(w) = &warn {
-            log.push(format!("Vision-QA WARNING: {}", w));
-            emit(ScrapeEvent::Phase { label: format!("Vision-QA: {}", w) });
-        }
+    // Resolve the vision gate once (independent of paging). The gate only runs
+    // when the loaded model actually has vision — no auto-detect, no fallback.
+    let verify_cfg = if tuning.verify && tuning.vision {
         let prompt = tuning.vision_prompt.clone()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| default_verify_prompt(query));
-        log.push(format!("Vision-QA gate ON (model: {})", model));
+        log.push(format!("Vision-QA gate ON (model: {})", tuning.llm_model));
         Some(VerifyConfig {
             prompt,
-            lm_studio_url: tuning.lm_studio_url.clone(),
-            vision_model: model,
+            base_url: tuning.llm_base_url.clone(),
+            model: tuning.llm_model.clone(),
         })
     } else {
+        if tuning.verify && !tuning.vision {
+            log.push("Vision-QA WARNING: loaded model has no vision — verify skipped".to_string());
+            emit(ScrapeEvent::Phase { label: "Loaded model has no vision — verify skipped".into() });
+        }
         None
     };
 
@@ -1850,38 +1807,6 @@ mod tests {
         let p2 = resolve_manual_bin(&base_s, 5).unwrap();
         assert_eq!(p, p2);
         std::fs::remove_dir_all(&base).ok();
-    }
-
-    #[test]
-    fn pick_vision_model_prefers_loaded_vlm() {
-        let json = serde_json::json!({"data": [
-            {"id": "qwen-text", "type": "llm", "state": "loaded"},
-            {"id": "gemma-4-e4b", "type": "vlm", "state": "loaded"},
-            {"id": "other-vlm", "type": "vlm", "state": "not-loaded"},
-        ]});
-        let (model, warn) = pick_loaded_vision_model(&json, "fallback");
-        assert_eq!(model, "gemma-4-e4b");
-        assert!(warn.is_none());
-    }
-
-    #[test]
-    fn pick_vision_model_warns_when_loaded_is_text() {
-        let json = serde_json::json!({"data": [
-            {"id": "qwen-text", "type": "llm", "state": "loaded"},
-        ]});
-        let (model, warn) = pick_loaded_vision_model(&json, "fallback");
-        assert_eq!(model, "qwen-text");
-        assert!(warn.unwrap().contains("not a vision model"));
-    }
-
-    #[test]
-    fn pick_vision_model_falls_back_when_none_loaded() {
-        let json = serde_json::json!({"data": [
-            {"id": "x", "type": "vlm", "state": "not-loaded"},
-        ]});
-        let (model, warn) = pick_loaded_vision_model(&json, "fallback");
-        assert_eq!(model, "fallback");
-        assert!(warn.is_some());
     }
 
     #[test]

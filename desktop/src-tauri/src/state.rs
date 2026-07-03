@@ -11,18 +11,7 @@ pub struct Config {
     pub bow_secret: String,
     pub ws_port: u16,
     pub workspace_root: PathBuf,
-    pub lm_studio_url: String,
-    pub lm_studio_model: String,
-    /// Optional manual override for the image-QA vision model. When empty (the
-    /// default), the app auto-detects the loaded `vlm` from LM Studio at scrape time.
-    pub lm_studio_vision_model: String,
     pub searxng_url: String,
-    /// "low" | "medium" | "high" — passed as reasoning_effort in chat completions.
-    /// Leave unset to omit the field (model default).
-    pub reasoning_effort: Option<String>,
-    /// Token budget for reasoning. Passed as reasoning_tokens in chat completions.
-    /// Leave unset to omit the field (model default).
-    pub reasoning_tokens: Option<u32>,
     /// Directory scanned for local GGUF models (Bow-managed llama-server engine).
     pub models_dir: PathBuf,
     /// Context size (tokens) used when loading a model into the local engine.
@@ -37,12 +26,7 @@ impl Config {
             bow_secret: "test-secret".to_string(),
             ws_port: 9357,
             workspace_root,
-            lm_studio_url: "http://localhost:1234".to_string(),
-            lm_studio_model: "test-model".to_string(),
-            lm_studio_vision_model: String::new(),
             searxng_url: "http://localhost:8888".to_string(),
-            reasoning_effort: None,
-            reasoning_tokens: None,
             models_dir: PathBuf::from(r"C:\AI\models"),
             ctx_size: 8192,
         }
@@ -68,31 +52,8 @@ impl Config {
         let workspace_root = std::env::var("BOW_WORKSPACE")
             .unwrap_or_else(|_| r"C:\AI\workspace".to_string())
             .into();
-        let lm_studio_url = std::env::var("LM_STUDIO_URL")
-            .unwrap_or_else(|_| "http://localhost:1234".to_string());
-        let lm_studio_model = std::env::var("LM_STUDIO_MODEL")
-            .unwrap_or_else(|_| "qwen3.5-9b".to_string());
-        // Empty by default → auto-detect the loaded vision model from LM Studio.
-        let lm_studio_vision_model = std::env::var("LM_STUDIO_VISION_MODEL")
-            .unwrap_or_default();
         let searxng_url = std::env::var("SEARXNG_URL")
             .unwrap_or_else(|_| "http://localhost:8888".to_string());
-
-        let reasoning_effort = std::env::var("LM_STUDIO_REASONING_EFFORT").ok().and_then(|v| {
-            match v.to_lowercase().as_str() {
-                "low" | "medium" | "high" => Some(v.to_lowercase()),
-                other => {
-                    eprintln!("LM_STUDIO_REASONING_EFFORT: invalid value '{}' (use low/medium/high) — ignored", other);
-                    None
-                }
-            }
-        });
-
-        let reasoning_tokens = std::env::var("LM_STUDIO_REASONING_TOKENS").ok().and_then(|v| {
-            v.parse::<u32>().map_err(|_| {
-                eprintln!("LM_STUDIO_REASONING_TOKENS: '{}' is not a valid u32 — ignored", v);
-            }).ok()
-        });
 
         let models_dir = std::env::var("BOW_MODELS_DIR")
             .unwrap_or_else(|_| r"C:\AI\models".to_string())
@@ -107,12 +68,7 @@ impl Config {
             bow_secret,
             ws_port,
             workspace_root,
-            lm_studio_url,
-            lm_studio_model,
-            lm_studio_vision_model,
             searxng_url,
-            reasoning_effort,
-            reasoning_tokens,
             models_dir,
             ctx_size,
         })

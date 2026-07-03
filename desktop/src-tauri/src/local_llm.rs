@@ -129,49 +129,11 @@ fn build_system_prompt(page_ctx: Option<&PageContext>, workspace: &str) -> Strin
     prompt
 }
 
-// ── Model reasoning capability check ─────────────────────────────────────────
-
-/// Queries LM Studio's /api/v1/models endpoint and returns the `reasoning`
-/// field for the currently configured model (if present).
-/// Returns None silently if the endpoint is unavailable or the model isn't listed.
-pub async fn query_model_reasoning(lm_studio_url: &str, model: &str) -> Option<serde_json::Value> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .ok()?;
-    let resp = client
-        .get(format!("{}/api/v1/models", lm_studio_url))
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let v: serde_json::Value = resp.json().await.ok()?;
-    v["data"]
-        .as_array()?
-        .iter()
-        .find(|m| m["id"].as_str() == Some(model))
-        .and_then(|m| m.get("reasoning").cloned())
-}
-
-// ── Reasoning fields helper ───────────────────────────────────────────────────
-
-/// Injects reasoning_effort / reasoning_tokens into a mutable JSON body
-/// when the config has them set.
-fn apply_reasoning_fields(body: &mut serde_json::Value, config: &Config) {
-    if let Some(ref effort) = config.reasoning_effort {
-        body["reasoning_effort"] = json!(effort);
-    }
-    if let Some(tokens) = config.reasoning_tokens {
-        body["reasoning_tokens"] = json!(tokens);
-    }
-}
-
 // ── Reflexion helper ──────────────────────────────────────────────────────────
 
 async fn generate_reflection(
-    config: &Config,
+    base_url: &str,
+    model: &str,
     history: &[OaiMessage],
     system_prompt: &str,
 ) -> Result<String> {
@@ -188,17 +150,16 @@ async fn generate_reflection(
         "content": "The task ran out of iterations and did not complete. In 2-3 sentences: what went wrong, what could be done differently, and what should be remembered for next time?"
     }));
 
-    let mut body = json!({
-        "model": config.lm_studio_model,
+    let body = json!({
+        "model": model,
         "messages": messages,
         "max_tokens": 256,
         "temperature": 0.4,
         "stream": false
     });
-    apply_reasoning_fields(&mut body, config);
 
     let resp = client
-        .post(format!("{}/v1/chat/completions", config.lm_studio_url))
+        .post(format!("{}/v1/chat/completions", base_url))
         .json(&body)
         .send()
         .await?;
@@ -217,6 +178,7 @@ async fn generate_reflection(
 #[derive(Clone)]
 pub struct ChatRuntime {
     pub config: Arc<Config>,
+    pub engine: crate::llm_engine::LlmEngine,
     pub shell_session: crate::tools::shell_session::ShellSessionManager,
     pub browser: crate::tools::controlled_browser::ControlledBrowser,
     pub mcp: crate::tools::mcp::McpManager,
@@ -231,7 +193,22 @@ pub async fn run_local_chat(
     interrupt: Arc<AtomicBool>,
     event_tx: mpsc::Sender<AgentEvent>,
 ) -> Result<()> {
-    let ChatRuntime { config, shell_session, browser, mcp } = rt;
+    let ChatRuntime { config, engine, shell_session, browser, mcp } = rt;
+
+    // Resolve the embedded engine's endpoint + model once per chat turn. If no
+    // model is loaded, surface a clean error to the UI and bail out.
+    let st = engine.status().await;
+    let (base_url, model) = match (st.base_url.clone(), st.model.as_ref().map(|m| m.name.clone())) {
+        (Some(b), Some(m)) if st.state == "ready" => (b, m),
+        _ => {
+            let _ = event_tx.send(AgentEvent::Error {
+                code: "no_model".to_string(),
+                message: "No model loaded — open Settings and load a model".to_string(),
+            }).await;
+            return Ok(());
+        }
+    };
+
     history.push(OaiMessage {
         role: "user".to_string(),
         content: Some(user_message),
@@ -243,11 +220,6 @@ pub async fn run_local_chat(
         page_ctx.as_ref(),
         &config.workspace_root.to_string_lossy(),
     );
-
-    // Log model reasoning capabilities (best-effort, non-blocking)
-    if let Some(reasoning_caps) = query_model_reasoning(&config.lm_studio_url, &config.lm_studio_model).await {
-        debug!("Model '{}' reasoning capabilities: {}", config.lm_studio_model, reasoning_caps);
-    }
 
     // Open (or create) the episodic memory DB in the workspace root
     let memory_db = match crate::tools::memory::open_db(&config.workspace_root.to_string_lossy()) {
@@ -297,7 +269,8 @@ pub async fn run_local_chat(
             // On max_iterations (not interrupt), generate a reflection and store it
             if !interrupt.load(Ordering::Relaxed) && !history.is_empty() {
                 let reflection = generate_reflection(
-                    &config,
+                    &base_url,
+                    &model,
                     history,
                     &system_prompt,
                 ).await;
@@ -308,7 +281,7 @@ pub async fn run_local_chat(
                         .and_then(|m| m.content.as_deref())
                         .unwrap_or("unknown task");
                     let _ = crate::tools::memory::memory_store(
-                        &memory_db, task_desc, "failure", &findings, &config.lm_studio_url
+                        &memory_db, task_desc, "failure", &findings
                     ).await;
                     let _ = event_tx.send(AgentEvent::TextDelta {
                         delta: format!("\n\n**Reflection:** {}", text),
@@ -357,29 +330,28 @@ pub async fn run_local_chat(
             }
         }
 
-        let mut body = json!({
-            "model": config.lm_studio_model,
+        let body = json!({
+            "model": model,
             "messages": messages,
             "tools": tools,
             "max_tokens": 4096,
             "temperature": 0.7,
             "stream": true
         });
-        apply_reasoning_fields(&mut body, &config);
 
-        debug!("Sending streaming request to LM Studio, iteration {}", iterations);
+        debug!("Sending streaming request to the local engine, iteration {}", iterations);
 
         let resp = client
-            .post(format!("{}/v1/chat/completions", config.lm_studio_url))
+            .post(format!("{}/v1/chat/completions", base_url))
             .json(&body)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("LM Studio request failed: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("LLM engine request failed: {}", e))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let err_body = resp.text().await.unwrap_or_default();
-            error!("LM Studio error {}: {}", status, err_body);
+            error!("LLM engine error {}: {}", status, err_body);
             // Extract a cleaner error message for the UI
             let display_msg = if let Ok(v) = serde_json::from_str::<Value>(&err_body) {
                 v["error"].as_str().unwrap_or(&err_body).to_string()
@@ -654,8 +626,8 @@ pub async fn run_local_chat(
                         &tool_input,
                         &tools::ToolCtx {
                             tavily_api_key: &config.tavily_api_key,
-                            lm_studio_url: &config.lm_studio_url,
-                            lm_studio_model: &config.lm_studio_model,
+                            llm_base_url: &base_url,
+                            llm_model: &model,
                             workspace_root: &config.workspace_root.to_string_lossy(),
                             searxng_url: &config.searxng_url,
                             shell_session: &shell_session,
@@ -687,8 +659,8 @@ pub async fn run_local_chat(
                 let id = p.id.clone();
                 let input_res = p.input.clone();
                 let tavily = config.tavily_api_key.clone();
-                let lm_url = config.lm_studio_url.clone();
-                let lm_model = config.lm_studio_model.clone();
+                let llm_url = base_url.clone();
+                let llm_model = model.clone();
                 let ws_root = config.workspace_root.to_string_lossy().to_string();
                 let searxng = config.searxng_url.clone();
                 let sess = shell_session.clone();
@@ -708,8 +680,8 @@ pub async fn run_local_chat(
                             &tool_input,
                             &tools::ToolCtx {
                                 tavily_api_key: &tavily,
-                                lm_studio_url: &lm_url,
-                                lm_studio_model: &lm_model,
+                                llm_base_url: &llm_url,
+                                llm_model: &llm_model,
                                 workspace_root: &ws_root,
                                 searxng_url: &searxng,
                                 shell_session: &sess,

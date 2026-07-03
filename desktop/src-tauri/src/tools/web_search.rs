@@ -207,8 +207,8 @@ pub async fn jina_read(url: &str) -> Result<String> {
 pub async fn search_evaluate(
     original_question: &str,
     current_results_summary: &str,
-    lm_studio_url: &str,
-    lm_studio_model: &str,
+    llm_base_url: &str,
+    llm_model: &str,
 ) -> Result<String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -227,7 +227,7 @@ pub async fn search_evaluate(
     );
 
     let body = serde_json::json!({
-        "model": lm_studio_model,
+        "model": llm_model,
         "messages": [
             {"role": "user", "content": prompt}
         ],
@@ -237,11 +237,11 @@ pub async fn search_evaluate(
     });
 
     let resp = client
-        .post(format!("{}/v1/chat/completions", lm_studio_url))
+        .post(format!("{}/v1/chat/completions", llm_base_url))
         .json(&body)
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("search_evaluate LM Studio call failed: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("search_evaluate LLM call failed: {}", e))?;
 
     let v: serde_json::Value = resp.json().await?;
     let text = v["choices"][0]["message"]["content"]
@@ -255,16 +255,16 @@ pub async fn search_evaluate(
 
 // ── Multi-query expansion ─────────────────────────────────────────────────────
 
-/// Generate 2 alternative query phrasings via LM Studio, then run all 3
+/// Generate 2 alternative query phrasings via the local LLM, then run all 3
 /// in parallel against Tavily, merge and deduplicate by URL.
 pub async fn web_search_deep(
     query: &str,
     api_key: &str,
-    lm_studio_url: &str,
-    lm_studio_model: &str,
+    llm_base_url: &str,
+    llm_model: &str,
 ) -> Result<String> {
     // Step 1: expand query into variants
-    let variants = expand_queries(query, lm_studio_url, lm_studio_model).await;
+    let variants = expand_queries(query, llm_base_url, llm_model).await;
 
     // Step 2: parallel Tavily searches
     let futures: Vec<_> = variants
@@ -314,12 +314,12 @@ pub async fn web_search_deep(
     Ok(output)
 }
 
-/// Ask LM Studio to generate 2 alternative phrasings of the query.
+/// Ask the local LLM to generate 2 alternative phrasings of the query.
 /// Returns original + up to 2 variants (always at least 1 element).
 async fn expand_queries(
     query: &str,
-    lm_studio_url: &str,
-    lm_studio_model: &str,
+    llm_base_url: &str,
+    llm_model: &str,
 ) -> Vec<String> {
     let mut queries = vec![query.to_string()];
 
@@ -335,7 +335,7 @@ async fn expand_queries(
     );
 
     let body = serde_json::json!({
-        "model": lm_studio_model,
+        "model": llm_model,
         "messages": [
             {"role": "system", "content": "You are a search query rewriter. Output only the queries, one per line."},
             {"role": "user", "content": prompt}
@@ -346,7 +346,7 @@ async fn expand_queries(
     });
 
     if let Ok(resp) = client
-        .post(format!("{}/v1/chat/completions", lm_studio_url))
+        .post(format!("{}/v1/chat/completions", llm_base_url))
         .json(&body)
         .send()
         .await

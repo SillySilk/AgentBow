@@ -377,7 +377,7 @@ pub fn tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "image_autotag",
-            "description": "Caption every image in a folder for LoRA/Stable Diffusion training using the local LM Studio vision model, writing a '<name>.txt' sidecar next to each image (kohya caption convention). Requires a vision-capable model loaded in LM Studio. Skips images that already have a .txt unless overwrite is set.",
+            "description": "Caption every image in a folder for LoRA/Stable Diffusion training using the loaded local vision model, writing a '<name>.txt' sidecar next to each image (kohya caption convention). Requires a vision-capable model loaded in the local engine. Skips images that already have a .txt unless overwrite is set.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -496,8 +496,8 @@ pub fn tool_schemas() -> Vec<Value> {
 /// App config + shared runtimes threaded into every tool call.
 pub struct ToolCtx<'a> {
     pub tavily_api_key: &'a str,
-    pub lm_studio_url: &'a str,
-    pub lm_studio_model: &'a str,
+    pub llm_base_url: &'a str,
+    pub llm_model: &'a str,
     pub workspace_root: &'a str,
     pub searxng_url: &'a str,
     pub shell_session: &'a shell_session::ShellSessionManager,
@@ -508,8 +508,8 @@ pub struct ToolCtx<'a> {
 pub async fn dispatch(tool_name: &str, input: &Value, ctx: &ToolCtx<'_>) -> Result<Value> {
     let &ToolCtx {
         tavily_api_key,
-        lm_studio_url,
-        lm_studio_model,
+        llm_base_url,
+        llm_model,
         workspace_root,
         searxng_url,
         shell_session,
@@ -585,7 +585,7 @@ pub async fn dispatch(tool_name: &str, input: &Value, ctx: &ToolCtx<'_>) -> Resu
             let summary = input["current_results_summary"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("search_evaluate: missing 'current_results_summary'"))?;
-            let s = web_search::search_evaluate(question, summary, lm_studio_url, lm_studio_model).await?;
+            let s = web_search::search_evaluate(question, summary, llm_base_url, llm_model).await?;
             Ok(json!(s))
         }
         "searxng_search" => {
@@ -606,7 +606,7 @@ pub async fn dispatch(tool_name: &str, input: &Value, ctx: &ToolCtx<'_>) -> Resu
             let query = input["query"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("web_search_deep: missing 'query'"))?;
-            let s = web_search::web_search_deep(query, tavily_api_key, lm_studio_url, lm_studio_model).await?;
+            let s = web_search::web_search_deep(query, tavily_api_key, llm_base_url, llm_model).await?;
             Ok(json!(s))
         }
         "image_verify" => {
@@ -616,7 +616,7 @@ pub async fn dispatch(tool_name: &str, input: &Value, ctx: &ToolCtx<'_>) -> Resu
             let prompt = input["prompt"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("image_verify: missing 'prompt'"))?;
-            let s = image_search::image_verify(image_path, prompt, lm_studio_url, lm_studio_model).await?;
+            let s = image_search::image_verify(image_path, prompt, llm_base_url, llm_model).await?;
             Ok(json!(s))
         }
         "browser_screenshot" => browser.screenshot().await,
@@ -739,7 +739,7 @@ pub async fn dispatch(tool_name: &str, input: &Value, ctx: &ToolCtx<'_>) -> Resu
             let recursive = input["recursive"].as_bool().unwrap_or(false);
             let overwrite = input["overwrite"].as_bool().unwrap_or(false);
             let s = image_search::image_autotag(
-                dir, style, trigger, recursive, overwrite, lm_studio_url, lm_studio_model,
+                dir, style, trigger, recursive, overwrite, llm_base_url, llm_model,
             ).await?;
             Ok(json!(s))
         }
@@ -750,13 +750,13 @@ pub async fn dispatch(tool_name: &str, input: &Value, ctx: &ToolCtx<'_>) -> Resu
                 .as_array()
                 .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
                 .unwrap_or_default();
-            let s = memory::memory_store(memory_db, task_desc, outcome, &findings, lm_studio_url).await?;
+            let s = memory::memory_store(memory_db, task_desc, outcome, &findings).await?;
             Ok(json!(s))
         }
         "memory_retrieve" => {
             let query = input["query"].as_str().unwrap_or("");
             let limit = input["limit"].as_u64().unwrap_or(5) as usize;
-            let s = memory::memory_retrieve(memory_db, query, limit, lm_studio_url).await?;
+            let s = memory::memory_retrieve(memory_db, query, limit).await?;
             Ok(json!(s))
         }
         "task_complete" => {

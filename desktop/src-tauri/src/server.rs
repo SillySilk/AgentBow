@@ -62,6 +62,7 @@ pub fn classify(raw: &serde_json::Value) -> Inbound {
 pub async fn run_ws(
     socket: WebSocket,
     config: Arc<crate::state::Config>,
+    llm_engine: crate::llm_engine::LlmEngine,
     shell_session: crate::tools::shell_session::ShellSessionManager,
     controlled_browser: crate::tools::controlled_browser::ControlledBrowser,
     mcp: crate::tools::mcp::McpManager,
@@ -157,6 +158,7 @@ pub async fn run_ws(
                         info!("Processing: {}...", crate::util::char_prefix(&content, 60));
 
                         let config = config.clone();
+                        let engine_clone = llm_engine.clone();
                         let ctx_snapshot = page_ctx.clone();
                         let interrupt = interrupt_flag.clone();
                         let out = out_tx.clone();
@@ -181,6 +183,7 @@ pub async fn run_ws(
                             if let Err(e) = local_llm::run_local_chat(
                                 local_llm::ChatRuntime {
                                     config,
+                                    engine: engine_clone,
                                     shell_session: shell_session_clone,
                                     browser: browser_clone,
                                     mcp: mcp_clone,
@@ -235,13 +238,23 @@ pub async fn run_ws(
                         let count = (count as usize).clamp(1, 500);
                         // Clamp pacing to a sane ceiling (0–30s between downloads).
                         let delay_ms = delay_ms.min(30_000);
+                        // Resolve the embedded engine's endpoint once per scrape.
+                        let st = llm_engine.status().await;
+                        let (llm_base_url, llm_model) = match (st.base_url.clone(), st.model.as_ref().map(|m| m.name.clone())) {
+                            (Some(b), Some(m)) if st.state == "ready" => (b, m),
+                            _ => {
+                                let err = serde_json::json!({"type":"scrape_event","kind":"error","message":"No model loaded — open Settings and load a model"});
+                                let _ = out_tx.send(err.to_string()).await;
+                                continue;
+                            }
+                        };
                         let tuning = crate::tools::image_search::ScrapeTuning {
                             delay_ms,
                             verify,
                             vision_prompt,
-                            lm_studio_url: config.lm_studio_url.clone(),
-                            vision_model_override: config.lm_studio_vision_model.clone(),
-                            chat_model: config.lm_studio_model.clone(),
+                            llm_base_url,
+                            llm_model,
+                            vision: st.vision,
                             dedupe,
                             sources,
                         };
