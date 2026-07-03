@@ -244,6 +244,17 @@ pub struct EngineStatus {
     pub vision: bool,
 }
 
+impl EngineStatus {
+    /// User-facing message for why a model-dependent action can't run right now.
+    pub fn not_ready_message(&self) -> &'static str {
+        if self.state == "starting" {
+            "Model is still loading — try again shortly"
+        } else {
+            "No model loaded — open Settings and load a model"
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct LlmEngine {
     inner: Arc<Mutex<EngineInner>>,
@@ -427,6 +438,16 @@ mod tests {
         assert_eq!(quant_from_filename("model-BF16.gguf").as_deref(), Some("BF16"));
         assert_eq!(quant_from_filename("model-f16.gguf").as_deref(), Some("F16"));
         assert_eq!(quant_from_filename("mystery-model.gguf"), None);
+    }
+
+    #[test]
+    fn not_ready_message_distinguishes_loading_from_no_model() {
+        let mk = |state: &str| EngineStatus {
+            state: state.into(), error: None, model: None, base_url: None, vision: false,
+        };
+        assert_eq!(mk("starting").not_ready_message(), "Model is still loading — try again shortly");
+        assert_eq!(mk("stopped").not_ready_message(), "No model loaded — open Settings and load a model");
+        assert_eq!(mk("failed").not_ready_message(), "No model loaded — open Settings and load a model");
     }
 
     #[test]

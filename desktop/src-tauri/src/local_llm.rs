@@ -203,7 +203,7 @@ pub async fn run_local_chat(
         _ => {
             let _ = event_tx.send(AgentEvent::Error {
                 code: "no_model".to_string(),
-                message: "No model loaded — open Settings and load a model".to_string(),
+                message: st.not_ready_message().to_string(),
             }).await;
             return Ok(());
         }

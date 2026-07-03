@@ -238,15 +238,19 @@ pub async fn run_ws(
                         let count = (count as usize).clamp(1, 500);
                         // Clamp pacing to a sane ceiling (0–30s between downloads).
                         let delay_ms = delay_ms.min(30_000);
-                        // Resolve the embedded engine's endpoint once per scrape.
+                        // Resolve the embedded engine's endpoint once per scrape. Only the
+                        // vision-QA gate needs a model — a plain scrape proceeds without one.
                         let st = llm_engine.status().await;
-                        let (llm_base_url, llm_model) = match (st.base_url.clone(), st.model.as_ref().map(|m| m.name.clone())) {
-                            (Some(b), Some(m)) if st.state == "ready" => (b, m),
-                            _ => {
-                                let err = serde_json::json!({"type":"scrape_event","kind":"error","message":"No model loaded — open Settings and load a model"});
+                        let (llm_base_url, llm_model, vision) = match (st.base_url.clone(), st.model.as_ref().map(|m| m.name.clone())) {
+                            (Some(b), Some(m)) if st.state == "ready" => (b, m, st.vision),
+                            _ if verify => {
+                                let err = serde_json::json!({"type":"scrape_event","kind":"error","message": st.not_ready_message()});
                                 let _ = out_tx.send(err.to_string()).await;
                                 continue;
                             }
+                            // Engine not ready but verify is off: the LLM fields are unused
+                            // on this path, so scrape anyway.
+                            _ => (String::new(), String::new(), false),
                         };
                         let tuning = crate::tools::image_search::ScrapeTuning {
                             delay_ms,
@@ -254,7 +258,7 @@ pub async fn run_ws(
                             vision_prompt,
                             llm_base_url,
                             llm_model,
-                            vision: st.vision,
+                            vision,
                             dedupe,
                             sources,
                         };
