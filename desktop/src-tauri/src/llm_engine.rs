@@ -2,7 +2,6 @@
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, serde::Serialize)]
-#[allow(dead_code)]
 pub struct ModelEntry {
     pub path: PathBuf,
     pub name: String,
@@ -14,7 +13,6 @@ pub struct ModelEntry {
 }
 
 /// Parse a quantization tag out of a GGUF filename. Uppercased on return.
-#[allow(dead_code)]
 pub fn quant_from_filename(name: &str) -> Option<String> {
     let stem = name.trim_end_matches(".gguf");
     let upper = stem.to_ascii_uppercase();
@@ -45,7 +43,6 @@ pub fn quant_from_filename(name: &str) -> Option<String> {
 }
 
 /// Quantized-only rule: full-precision or untagged weights are refused.
-#[allow(dead_code)]
 pub fn is_loadable_quant(quant: &Option<String>) -> bool {
     match quant.as_deref() {
         Some("F16") | Some("BF16") | Some("F32") | None => false,
@@ -53,13 +50,11 @@ pub fn is_loadable_quant(quant: &Option<String>) -> bool {
     }
 }
 
-#[allow(dead_code)]
 fn is_mmproj(file_name: &str) -> bool {
     file_name.to_ascii_lowercase().starts_with("mmproj")
 }
 
 /// Extract base model name without quantization tag
-#[allow(dead_code)]
 fn model_base_name(stem: &str) -> String {
     // Use the same logic as quant_from_filename to detect and remove the quant tag
     let upper = stem.to_ascii_uppercase();
@@ -106,7 +101,6 @@ fn model_base_name(stem: &str) -> String {
 }
 
 /// Recursively scan `dir` for GGUF models; pair each with an mmproj in its directory.
-#[allow(dead_code)]
 pub fn scan_models(dir: &Path) -> Vec<ModelEntry> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -184,7 +178,6 @@ pub fn scan_models(dir: &Path) -> Vec<ModelEntry> {
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-#[allow(dead_code)]
 pub struct EnginePersist {
     pub model_path: Option<PathBuf>,
     pub ctx_size: u32,
@@ -199,7 +192,6 @@ impl Default for EnginePersist {
     }
 }
 
-#[allow(dead_code)]
 pub fn persist_path() -> PathBuf {
     std::env::current_exe()
         .ok()
@@ -207,7 +199,6 @@ pub fn persist_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("engine.json"))
 }
 
-#[allow(dead_code)]
 pub fn load_persist(path: &Path) -> EnginePersist {
     std::fs::read_to_string(path)
         .ok()
@@ -215,7 +206,6 @@ pub fn load_persist(path: &Path) -> EnginePersist {
         .unwrap_or_default()
 }
 
-#[allow(dead_code)]
 pub fn save_persist(path: &Path, p: &EnginePersist) {
     match serde_json::to_string_pretty(p) {
         Ok(s) => {
@@ -255,13 +245,11 @@ pub struct EngineStatus {
 }
 
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct LlmEngine {
     inner: Arc<Mutex<EngineInner>>,
     bin_dir: PathBuf,
 }
 
-#[allow(dead_code)]
 impl LlmEngine {
     pub fn new(bin_dir: PathBuf) -> Self {
         LlmEngine {

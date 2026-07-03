@@ -145,7 +145,6 @@ pub struct AppState {
     pub controlled_browser: ControlledBrowser,
     pub llm_engine: LlmEngine,
     /// Consumed by the model-management REST endpoints (Task 6).
-    #[allow(dead_code)]
     pub models_dir: Arc<Mutex<PathBuf>>,
 }
 

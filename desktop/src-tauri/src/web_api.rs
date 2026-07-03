@@ -194,6 +194,74 @@ pub async fn list_slots(State(s): State<HttpState>, Query(q): Query<DirQuery>) -
     Json(json!({ "base": base.to_string_lossy(), "slots": slots })).into_response()
 }
 
+pub async fn engine_status(State(s): State<HttpState>) -> Json<serde_json::Value> {
+    let st = s.app.llm_engine.status().await;
+    Json(serde_json::to_value(st).unwrap_or_else(|_| json!({"state":"stopped"})))
+}
+
+fn models_payload(dir: &Path) -> serde_json::Value {
+    let models: Vec<serde_json::Value> = crate::llm_engine::scan_models(dir)
+        .into_iter()
+        .map(|m| json!({
+            "name": m.name, "path": m.path, "size_bytes": m.size_bytes,
+            "quant": m.quant, "vision": m.mmproj.is_some(),
+            "loadable": crate::llm_engine::is_loadable_quant(&m.quant),
+        }))
+        .collect();
+    json!({ "dir": dir.to_string_lossy(), "models": models })
+}
+
+pub async fn engine_models(State(s): State<HttpState>) -> Json<serde_json::Value> {
+    let dir = s.app.models_dir.lock().unwrap().clone();
+    Json(models_payload(&dir))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct LoadReq {
+    pub path: String,
+}
+
+pub async fn engine_load(
+    State(s): State<HttpState>,
+    Json(req): Json<LoadReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let dir = s.app.models_dir.lock().unwrap().clone();
+    let entry = crate::llm_engine::scan_models(&dir)
+        .into_iter()
+        .find(|m| m.path == Path::new(&req.path))
+        .ok_or_else(|| {
+            (StatusCode::BAD_REQUEST, Json(json!({"error": "model not found in models dir"})))
+        })?;
+    s.app
+        .llm_engine
+        .load(entry, s.app.config.ctx_size)
+        .await
+        .map(|_| Json(json!({"ok": true})))
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))))
+}
+
+pub async fn engine_stop(State(s): State<HttpState>) -> Json<serde_json::Value> {
+    s.app.llm_engine.stop().await;
+    Json(json!({"ok": true}))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct DirReq {
+    pub dir: String,
+}
+
+pub async fn engine_models_dir(
+    State(s): State<HttpState>,
+    Json(req): Json<DirReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let p = PathBuf::from(&req.dir);
+    if !p.is_dir() {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "not a directory"}))));
+    }
+    *s.app.models_dir.lock().unwrap() = p.clone();
+    Ok(Json(models_payload(&p)))
+}
+
 pub fn routes() -> Router<HttpState> {
     Router::new()
         .route("/api/images", get(list_images))
@@ -202,6 +270,11 @@ pub fn routes() -> Router<HttpState> {
         .route("/api/images/delete", post(delete_images))
         .route("/api/curate/dedupe", post(dedupe))
         .route("/api/open-folder", post(open_folder))
+        .route("/api/engine", get(engine_status))
+        .route("/api/models", get(engine_models))
+        .route("/api/engine/load", post(engine_load))
+        .route("/api/engine/stop", post(engine_stop))
+        .route("/api/engine/models-dir", post(engine_models_dir))
 }
 
 #[cfg(test)]
@@ -341,5 +414,44 @@ mod tests {
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         std::fs::remove_dir_all(&ws).ok();
         std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[tokio::test]
+    async fn engine_status_endpoint_returns_stopped() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let state = crate::http::HttpState::test_state(std::env::temp_dir());
+        let app = routes().with_state(state);
+        let res = app
+            .oneshot(Request::builder().uri("/api/engine").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        assert!(std::str::from_utf8(&body).unwrap().contains("\"state\":\"stopped\""));
+    }
+
+    #[tokio::test]
+    async fn engine_load_rejects_bad_path() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let state = crate::http::HttpState::test_state(std::env::temp_dir());
+        let app = routes().with_state(state);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/engine/load")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"path":"C:\\nope\\missing.gguf"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 }
