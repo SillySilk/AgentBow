@@ -1,8 +1,12 @@
 @echo off
 REM Bow Image Studio launcher — builds web UI + backend, then runs.
 REM Stop any running instance first so the binary can be relinked (no "Access denied").
-taskkill /F /IM bow-desktop.exe >nul 2>&1
-timeout /t 1 /nobreak >nul
+REM /T kills the whole tree so the child llama-server can't be orphaned and lock its exe.
+taskkill /F /T /IM bow-desktop.exe >nul 2>&1
+REM Belt-and-suspenders: reap any orphaned llama-server from a prior crashed/aborted run.
+taskkill /F /IM llama-server.exe >nul 2>&1
+REM ~1s pause that works under a non-interactive shell (timeout needs a real console).
+ping -n 2 127.0.0.1 >nul
 pushd "%~dp0desktop\webapp"
 call npm run build || goto :err
 popd

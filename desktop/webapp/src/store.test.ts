@@ -5,11 +5,19 @@ describe("applyEvent", () => {
   it("accumulates downloaded files and tracks done count", () => {
     let s = initialScrapeState();
     s = applyEvent(s, { type: "scrape_event", kind: "phase", label: "Downloading" });
-    s = applyEvent(s, { type: "scrape_event", kind: "downloaded", done: 1, target: 3, path: "C:\\x\\a.jpg" });
-    s = applyEvent(s, { type: "scrape_event", kind: "downloaded", done: 2, target: 3, path: "C:\\x\\b.jpg" });
+    s = applyEvent(s, { type: "scrape_event", kind: "downloaded", done: 1, target: 3, path: "C:\\x\\a.jpg", source: "Yandex" });
+    s = applyEvent(s, { type: "scrape_event", kind: "downloaded", done: 2, target: 3, path: "C:\\x\\b.jpg", source: "Bing" });
     expect(s.downloaded).toEqual(["C:\\x\\a.jpg", "C:\\x\\b.jpg"]);
     expect(s.done).toBe(2);
     expect(s.target).toBe(3);
+  });
+
+  it("tallies downloads per source", () => {
+    let s = initialScrapeState();
+    s = applyEvent(s, { type: "scrape_event", kind: "downloaded", done: 1, target: 5, path: "a", source: "Yandex" });
+    s = applyEvent(s, { type: "scrape_event", kind: "downloaded", done: 2, target: 5, path: "b", source: "Yandex" });
+    s = applyEvent(s, { type: "scrape_event", kind: "downloaded", done: 3, target: 5, path: "c", source: "DDG" });
+    expect(s.downloadedBySource).toEqual({ Yandex: 2, DDG: 1 });
   });
 
   it("marks finished on done", () => {

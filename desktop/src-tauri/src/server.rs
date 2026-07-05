@@ -39,9 +39,14 @@ enum InboundMsg {
         #[serde(default)] bin: Option<u32>,
         /// Skip images that perceptually match ones already in the bin or this run.
         #[serde(default = "default_true")] dedupe: bool,
+        /// Animus Sorter category (`Character`/`Object`/`Style`). `None` ⇒ legacy naming.
+        #[serde(default)] category: Option<String>,
     },
     BrowserOpen { url: String },
     PageScrapeRequest { count: u32, dest_dir: String, #[serde(default)] scrolls: u32 },
+    /// Cooperatively stop any in-flight scrape (query or page). Downloads already
+    /// completed are kept; the run finishes with a normal `done` event.
+    StopScrape,
 }
 
 /// serde default for the dedup flag (on unless the client explicitly disables it).
@@ -83,6 +88,9 @@ pub async fn run_ws(
     let mut history: Vec<OaiMessage> = Vec::new();
     let mut page_ctx: Option<PageContext> = None;
     let interrupt_flag = Arc::new(AtomicBool::new(false));
+    // Cooperative stop signal for scrapes (query + page). Set by `stop_scrape`,
+    // reset when a fresh scrape starts, checked between downloads by the scraper.
+    let scrape_cancel = Arc::new(AtomicBool::new(false));
     // Guards against two agent runs racing on the same `history`. Each run
     // snapshots history and writes it back on completion; concurrent runs would
     // silently clobber each other (last writer wins).
@@ -205,7 +213,11 @@ pub async fn run_ws(
                         interrupt_flag.store(true, Ordering::Relaxed);
                     }
 
-                    InboundMsg::ScrapeRequest { query, count, dest_dir, sources, delay_ms, verify, vision_prompt, bin, dedupe } => {
+                    InboundMsg::StopScrape => {
+                        scrape_cancel.store(true, Ordering::Relaxed);
+                    }
+
+                    InboundMsg::ScrapeRequest { query, count, dest_dir, sources, delay_ms, verify, vision_prompt, bin, dedupe, category } => {
                         if !authenticated {
                             send_json(&out_tx, json!({"type":"error","code":"unauthenticated","message":"Must authenticate first"})).await;
                             continue;
@@ -261,10 +273,14 @@ pub async fn run_ws(
                             vision,
                             dedupe,
                             sources,
+                            category,
                         };
                         let out_tx = out_tx.clone();
                         let cb = controlled_browser.clone();
                         let log_dir = format!("{}\\logs", config.workspace_root.to_string_lossy().trim_end_matches(['\\', '/']));
+                        // Fresh scrape: clear any prior stop request, then hand a clone to the task.
+                        scrape_cancel.store(false, Ordering::Relaxed);
+                        let cancel = scrape_cancel.clone();
                         tokio::spawn(async move {
                             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::tools::image_search::ScrapeEvent>();
                             // Forward events to the client as they arrive.
@@ -277,7 +293,7 @@ pub async fn run_ws(
                                 }
                             });
                             let result = crate::tools::image_search::image_download(
-                                &query, count, &dest_dir, &log_dir, tuning, &cb, Some(tx),
+                                &query, count, &dest_dir, &log_dir, tuning, &cb, Some(tx), Some(cancel),
                             ).await;
                             // tx dropped here → forwarder drains and exits.
                             let _ = forwarder.await;
@@ -314,6 +330,9 @@ pub async fn run_ws(
                         let workspace = config.workspace_root.clone();
                         let log_dir = format!("{}\\logs", workspace.to_string_lossy().trim_end_matches(['\\', '/']));
                         let count = (count as usize).clamp(1, 500);
+                        // Fresh scrape: clear any prior stop request, then hand a clone to the task.
+                        scrape_cancel.store(false, Ordering::Relaxed);
+                        let cancel = scrape_cancel.clone();
                         tokio::spawn(async move {
                             let dest = match crate::web_api::resolve_within_workspace(&workspace, &dest_dir) {
                                 Some(p) => p.to_string_lossy().to_string(),
@@ -353,7 +372,7 @@ pub async fn run_ws(
                             let result = crate::tools::image_search::download_urls_to_dir(
                                 urls, count, &dest, "page",
                                 crate::tools::image_search::DownloadOpts::default(),
-                                &mut log, &Some(tx.clone()),
+                                &mut log, &Some(tx.clone()), Some(cancel),
                             ).await;
                             let log_note = log.flush();
                             let downloaded = result.unwrap_or_default();
@@ -439,5 +458,11 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn stop_scrape_parses() {
+        let v: InboundMsg = serde_json::from_value(serde_json::json!({"type":"stop_scrape"})).unwrap();
+        assert!(matches!(v, InboundMsg::StopScrape));
     }
 }

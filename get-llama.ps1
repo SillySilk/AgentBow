@@ -15,7 +15,8 @@ foreach ($a in $assets) {
     $url = "https://github.com/ggml-org/llama.cpp/releases/download/$tag/$a"
     $zip = Join-Path $env:TEMP $a
     Write-Host "Downloading $a ..."
-    Invoke-WebRequest -Uri $url -OutFile $zip
+    # -TimeoutSec so a stalled connection fails loudly instead of hanging the build forever.
+    Invoke-WebRequest -Uri $url -OutFile $zip -TimeoutSec 300
     Expand-Archive -Path $zip -DestinationPath $dest -Force
     Remove-Item $zip
 }

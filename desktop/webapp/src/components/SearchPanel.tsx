@@ -20,8 +20,10 @@ const DEFAULT_PROMPT_HINT =
 
 export default function SearchPanel() {
   const startScrape = useStore((s) => s.startScrape);
+  const stopScrape = useStore((s) => s.stopScrape);
   const status = useStore((s) => s.status);
   const running = useStore((s) => s.scrape.running);
+  const stopping = useStore((s) => s.scrape.stopping);
   const engine = useStore((s) => s.engine);
   const visionDisabled = !!engine && !engine.vision;
   const [query, setQuery] = useState("");
@@ -34,6 +36,7 @@ export default function SearchPanel() {
   const [useBin, setUseBin] = useState(false);
   const [bin, setBin] = useState(1);
   const [dedupe, setDedupe] = useState(true);
+  const [category, setCategory] = useState("");   // "" = Off (legacy naming)
 
   const disabled = running || status !== "connected" || !query.trim() || !destDir.trim() || enabled.size === 0;
   const toggleSource = (key: string) => setEnabled((prev) => {
@@ -105,6 +108,15 @@ export default function SearchPanel() {
           <Switch checked={dedupe} onChange={setDedupe} label="No doubles" />
         </OptionRow>
 
+        <OptionRow title="Suite label" sublabel="ANIMUS NAMING · NAME_SERIAL_CATEGORY">
+          <select className="forge-input" value={category} onChange={(e) => setCategory(e.target.value)} style={{ width: 140 }}>
+            <option value="">Off</option>
+            <option value="Character">Character</option>
+            <option value="Object">Object</option>
+            <option value="Style">Style</option>
+          </select>
+        </OptionRow>
+
         <OptionRow title="Target a vault" sublabel="APPEND TO A SPECIFIC NUMBERED VAULT">
           <Switch checked={useBin} onChange={setUseBin} label="Target a vault" />
         </OptionRow>
@@ -126,13 +138,23 @@ export default function SearchPanel() {
       </div>
 
       <div className="forge-cta" style={{ marginTop: "auto" }}>
-        <Button
-          variant="forge" size="lg" block
-          disabled={disabled}
-          onClick={() => startScrape({ query, count, destDir, sources: [...enabled], delayMs, verify, visionPrompt, bin: useBin ? bin : null, dedupe })}
-        >
-          {running ? "▾ STOKING…" : "▾ STOKE THE FORGE — RUN THE HAUL"}
-        </Button>
+        {running ? (
+          <Button
+            variant="danger" size="lg" block
+            disabled={stopping}
+            onClick={() => stopScrape()}
+          >
+            {stopping ? "■ STOPPING…" : "■ STOP THE HAUL"}
+          </Button>
+        ) : (
+          <Button
+            variant="forge" size="lg" block
+            disabled={disabled}
+            onClick={() => startScrape({ query, count, destDir, sources: [...enabled], delayMs, verify, visionPrompt, bin: useBin ? bin : null, dedupe, category: category || null })}
+          >
+            ▾ STOKE THE FORGE — RUN THE HAUL
+          </Button>
+        )}
       </div>
     </div>
   );

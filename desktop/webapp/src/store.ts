@@ -6,25 +6,29 @@ export type ScrapeEventMsg =
   | { type: "scrape_event"; kind: "source"; source: string; count: number; error: string | null }
   | { type: "scrape_event"; kind: "candidates"; total: number; filtered: number }
   | { type: "scrape_event"; kind: "verifying"; url: string; done: number; target: number }
-  | { type: "scrape_event"; kind: "downloaded"; done: number; target: number; path: string }
+  | { type: "scrape_event"; kind: "downloaded"; done: number; target: number; path: string; source: string }
   | { type: "scrape_event"; kind: "failed"; url: string; reason: string }
   | { type: "scrape_event"; kind: "done"; downloaded: string[]; log_note: string; dest_dir: string }
   | { type: "scrape_event"; kind: "error"; message: string };
 
 export interface ScrapeState {
   running: boolean;
+  /** Stop requested, awaiting the backend's final `done` event. */
+  stopping: boolean;
   finished: boolean;
   phase: string;
   done: number;
   target: number;
   downloaded: string[];
   sources: { source: string; count: number; error: string | null }[];
+  /** How many images were actually downloaded from each source (for the tally bar). */
+  downloadedBySource: Record<string, number>;
   log: string[];
   error: string | null;
 }
 
 export function initialScrapeState(): ScrapeState {
-  return { running: false, finished: false, phase: "", done: 0, target: 0, downloaded: [], sources: [], log: [], error: null };
+  return { running: false, stopping: false, finished: false, phase: "", done: 0, target: 0, downloaded: [], sources: [], downloadedBySource: {}, log: [], error: null };
 }
 
 export function applyEvent(s: ScrapeState, m: ScrapeEventMsg): ScrapeState {
@@ -34,10 +38,11 @@ export function applyEvent(s: ScrapeState, m: ScrapeEventMsg): ScrapeState {
                             log: [...s.log, `${m.source}: ${m.error ? "ERROR " + m.error : m.count + " URLs"}`] };
     case "candidates": return { ...s, log: [...s.log, `candidates: ${m.total} (filtered ${m.filtered})`] };
     case "verifying": return { ...s, phase: `Verifying image ${m.done + 1}/${m.target}…` };
-    case "downloaded": return { ...s, phase: "Downloading", done: m.done, target: m.target, downloaded: [...s.downloaded, m.path] };
+    case "downloaded": return { ...s, phase: "Downloading", done: m.done, target: m.target, downloaded: [...s.downloaded, m.path],
+                                downloadedBySource: { ...s.downloadedBySource, [m.source]: (s.downloadedBySource[m.source] ?? 0) + 1 } };
     case "failed": return { ...s, log: [...s.log, `failed: ${m.reason}`] };
-    case "done": return { ...s, running: false, finished: true, log: [...s.log, m.log_note] };
-    case "error": return { ...s, running: false, finished: true, error: m.message, log: [...s.log, "ERROR: " + m.message] };
+    case "done": return { ...s, running: false, stopping: false, finished: true, log: [...s.log, m.log_note] };
+    case "error": return { ...s, running: false, stopping: false, finished: true, error: m.message, log: [...s.log, "ERROR: " + m.message] };
     default: return s;
   }
 }
@@ -57,7 +62,9 @@ interface Store {
    * (e.g. to grey out the Verify toggle when the loaded model has no vision). */
   engine: EngineStatus | null;
   connect: () => void;
-  startScrape: (a: { query: string; count: number; destDir: string; sources: string[]; delayMs: number; verify: boolean; visionPrompt: string; bin: number | null; dedupe: boolean }) => void;
+  startScrape: (a: { query: string; count: number; destDir: string; sources: string[]; delayMs: number; verify: boolean; visionPrompt: string; bin: number | null; dedupe: boolean; category: string | null }) => void;
+  /** Cooperatively stop the in-flight scrape; already-downloaded images are kept. */
+  stopScrape: () => void;
   setWorkingSlot: (dir: string) => void;
   openBrowser: (url: string) => void;
   pageScrape: (a: { count: number; destDir: string; scrolls: number }) => void;
@@ -98,15 +105,22 @@ export const useStore = create<Store>((set, get) => ({
       set({ _ws: ws });
     }).catch(() => set({ status: "config unavailable" }));
   },
-  startScrape: (a: { query: string; count: number; destDir: string; sources: string[]; delayMs: number; verify: boolean; visionPrompt: string; bin: number | null; dedupe: boolean }) => {
+  startScrape: (a: { query: string; count: number; destDir: string; sources: string[]; delayMs: number; verify: boolean; visionPrompt: string; bin: number | null; dedupe: boolean; category: string | null }) => {
     const ws = get()._ws;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     set({ scrape: { ...initialScrapeState(), running: true, target: a.count }, lastDestDir: a.destDir });
     ws.send(JSON.stringify({
       type: "scrape_request", query: a.query, count: a.count, dest_dir: a.destDir, sources: a.sources,
       delay_ms: a.delayMs, verify: a.verify, vision_prompt: a.visionPrompt.trim() || null,
-      bin: a.bin, dedupe: a.dedupe,
+      bin: a.bin, dedupe: a.dedupe, category: a.category,
     }));
+  },
+  stopScrape: () => {
+    const ws = get()._ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (!get().scrape.running) return;
+    set((st) => ({ scrape: { ...st.scrape, stopping: true, phase: "Stopping…" } }));
+    ws.send(JSON.stringify({ type: "stop_scrape" }));
   },
   setWorkingSlot: (dir: string) => set({ workingSlotDir: dir }),
   openBrowser: (url: string) => {

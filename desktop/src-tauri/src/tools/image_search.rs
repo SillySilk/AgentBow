@@ -4,9 +4,18 @@ use serde::Deserialize;
 use serde_json::json;
 use std::io::Write as IoWrite;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tracing::{debug, info};
+
+/// A cooperative stop signal for scrapes. `None` ⇒ this call is never cancelled.
+pub type CancelFlag = Option<Arc<AtomicBool>>;
+
+/// True once the user has asked the current scrape to stop.
+fn is_cancelled(cancel: &CancelFlag) -> bool {
+    cancel.as_ref().is_some_and(|f| f.load(Ordering::Relaxed))
+}
 
 // ── OpenAI-compatible chat-completion response types ─────────────────────────
 
@@ -73,7 +82,7 @@ pub enum ScrapeEvent {
     Source { source: String, count: usize, error: Option<String> },
     Candidates { total: usize, filtered: usize },
     Verifying { url: String, done: usize, target: usize },
-    Downloaded { done: usize, target: usize, path: String },
+    Downloaded { done: usize, target: usize, path: String, source: String },
     Failed { url: String, reason: String },
     Done { downloaded: Vec<String>, log_note: String, dest_dir: String },
 }
@@ -88,8 +97,8 @@ impl ScrapeEvent {
                 json!({ "kind": "candidates", "total": total, "filtered": filtered }),
             ScrapeEvent::Verifying { url, done, target } =>
                 json!({ "kind": "verifying", "url": url, "done": done, "target": target }),
-            ScrapeEvent::Downloaded { done, target, path } =>
-                json!({ "kind": "downloaded", "done": done, "target": target, "path": path }),
+            ScrapeEvent::Downloaded { done, target, path, source } =>
+                json!({ "kind": "downloaded", "done": done, "target": target, "path": path, "source": source }),
             ScrapeEvent::Failed { url, reason } =>
                 json!({ "kind": "failed", "url": url, "reason": reason }),
             ScrapeEvent::Done { downloaded, log_note, dest_dir } =>
@@ -441,6 +450,9 @@ pub struct ScrapeTuning {
     /// Which scrapers to run. `None`/empty ⇒ all. Canonical keys: `bing`, `ddg`,
     /// `yandex`, `brave`.
     pub sources: Option<Vec<String>>,
+    /// Animus Sorter category (`Character`/`Object`/`Style`). `Some` ⇒ files are named
+    /// `<NAME>_NNN_<Category>.ext`; `None` ⇒ legacy `<name>_NNN.ext`.
+    pub category: Option<String>,
 }
 
 /// Resolved vision-gate settings (prompt already query-interpolated).
@@ -532,6 +544,7 @@ pub async fn image_download(
     tuning: ScrapeTuning,
     browser: &crate::tools::controlled_browser::ControlledBrowser,
     progress: Option<UnboundedSender<ScrapeEvent>>,
+    cancel: CancelFlag,
 ) -> Result<String> {
     let sources = tuning.sources.clone();
     let emit = |e: ScrapeEvent| { if let Some(tx) = &progress { let _ = tx.send(e); } };
@@ -608,15 +621,18 @@ pub async fn image_download(
             .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {}", e))?
     );
 
-    let sanitized = sanitize_filename(query);
+    let naming = NamingScheme::new(query, tuning.category.clone());
     let dest_base = dest_dir.trim_end_matches(['\\', '/']).to_string();
 
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Maps each candidate URL to the scraper it came from, so downloads can be tallied
+    // per source. Filled per page as results arrive.
+    let mut url_sources: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut downloaded: Vec<String> = Vec::new();
     let mut failures: Vec<(String, String)> = Vec::new();
     // Continue numbering after any files already in the bin (resume/append) so an
     // existing set is never overwritten.
-    let mut seq = highest_existing_index(&dest_base, &sanitized);
+    let mut seq = naming.highest_serial(&dest_base);
     // Seed the content-dedup set with the bin's existing images so a resumed scrape
     // skips ones it already holds (even under different filenames).
     let mut seen_hashes: Vec<Phash> = if tuning.dedupe {
@@ -632,6 +648,10 @@ pub async fn image_download(
 
     for page in 0..MAX_SCRAPE_PAGES {
         if downloaded.len() >= count {
+            break;
+        }
+        // Stop requested: don't hit the search engines for another page.
+        if is_cancelled(&cancel) {
             break;
         }
 
@@ -650,19 +670,23 @@ pub async fn image_download(
             results.push(scrape_duckduckgo_images(&client, query, per_page_max, page).await);
         }
 
-        // Gather raw URLs, decode/paywall-filter/dedupe within the page, then keep only
-        // candidates not already seen on an earlier page.
-        let mut raw: Vec<String> = Vec::new();
+        // Decode/paywall-filter each source's URLs *per source* so every candidate keeps
+        // an attribution to the scraper it came from (for the per-source download tally),
+        // then keep only candidates not already seen on an earlier page.
+        let mut raw_n = 0usize;
+        let mut decoded_all: Vec<String> = Vec::new();
         for r in &results {
             log.push(format!("p{} {}", page, r.log_line()));
             emit(ScrapeEvent::Source { source: r.source.to_string(), count: r.urls.len(), error: r.error.clone() });
-            raw.extend(r.urls.iter().cloned());
+            raw_n += r.urls.len();
+            for u in filter_candidates(r.urls.clone()) {
+                url_sources.entry(u.clone()).or_insert_with(|| r.source.to_string());
+                decoded_all.push(u);
+            }
         }
-        let raw_n = raw.len();
-        let decoded = filter_candidates(raw);
-        let filtered = raw_n.saturating_sub(decoded.len());
+        let filtered = raw_n.saturating_sub(decoded_all.len());
         let new_candidates: Vec<String> =
-            decoded.into_iter().filter(|u| seen.insert(u.clone())).collect();
+            decoded_all.into_iter().filter(|u| seen.insert(u.clone())).collect();
 
         emit(ScrapeEvent::Candidates { total: seen.len(), filtered });
         log.push(format!(
@@ -676,16 +700,31 @@ pub async fn image_download(
         }
 
         download_batch(
-            &dl_client, new_candidates, count, &dest_base, &sanitized,
+            &dl_client, new_candidates, count, &dest_base, &naming,
             tuning.delay_ms, &verify_cfg, tuning.dedupe, &mut seen_hashes,
-            &mut downloaded, &mut failures, &mut seq, &progress,
+            &mut downloaded, &mut failures, &mut seq, &progress, &cancel,
+            &url_sources, "web",
         ).await;
     }
 
     downloaded.sort();
+    let stopped = is_cancelled(&cancel);
+    if stopped {
+        log.push("-- stopped by user --".to_string());
+    }
     log_download_summary(&mut log, &downloaded, &failures, count, verify_cfg.is_some());
 
     let log_note = log.flush();
+
+    // User-stopped runs always end cleanly with a `done` event (never an error),
+    // so the UI returns to idle and keeps whatever was already downloaded.
+    if stopped {
+        emit(ScrapeEvent::Done { downloaded: downloaded.clone(), log_note: log_note.clone(), dest_dir: dest_dir.to_string() });
+        return Ok(format!(
+            "Stopped — {} image(s) downloaded to {}\n{}",
+            downloaded.len(), dest_dir, log_note
+        ));
+    }
 
     if seen.is_empty() {
         return Err(anyhow::anyhow!("No images found for {:?}. {}", query, log_note));
@@ -892,7 +931,9 @@ async fn scrape_duckduckgo_images(client: &reqwest::Client, query: &str, max: us
     );
     info!("DDG vqd={}", vqd);
     let resp = match client.get(&api_url)
-        .header("Referer", &page_url)
+        // DDG's i.js 403s when the Referer carries the search query; it accepts the
+        // bare origin. (Verified: full page-URL Referer → 403, "https://duckduckgo.com/" → 200.)
+        .header("Referer", "https://duckduckgo.com/")
         .header("Accept", "application/json, text/javascript, */*; q=0.01")
         .header("Accept-Language", "en-US,en;q=0.9")
         .header("X-Requested-With", "XMLHttpRequest")
@@ -1293,6 +1334,7 @@ pub async fn download_urls_to_dir(
     opts: DownloadOpts,
     log: &mut SessionLog,
     progress: &Option<UnboundedSender<ScrapeEvent>>,
+    cancel: CancelFlag,
 ) -> Result<Vec<String>> {
     let DownloadOpts { delay_ms, verify } = opts;
     let emit = |e: ScrapeEvent| { if let Some(tx) = progress { let _ = tx.send(e); } };
@@ -1302,7 +1344,8 @@ pub async fn download_urls_to_dir(
     let candidates = filter_candidates(urls);
     log.push(format!("-- Downloading (target: {}, pool: {}) --", count, candidates.len()));
 
-    let sanitized = sanitize_filename(name_hint);
+    // Page scrape is single-source; keep legacy naming (no Animus category here).
+    let naming = NamingScheme::new(name_hint, None);
     let dest_base = dest_dir.trim_end_matches(['\\', '/']).to_string();
 
     let client = Arc::new(
@@ -1318,12 +1361,13 @@ pub async fn download_urls_to_dir(
 
     let mut downloaded: Vec<String> = Vec::new();
     let mut failures: Vec<(String, String)> = Vec::new(); // (url, reason)
-    let mut seq = highest_existing_index(&dest_base, &sanitized);
+    let mut seq = naming.highest_serial(&dest_base);
 
     download_batch(
-        &client, candidates, count, &dest_base, &sanitized,
+        &client, candidates, count, &dest_base, &naming,
         delay_ms, &verify, false, &mut Vec::new(),
-        &mut downloaded, &mut failures, &mut seq, progress,
+        &mut downloaded, &mut failures, &mut seq, progress, &cancel,
+        &std::collections::HashMap::new(), "page",
     ).await;
 
     downloaded.sort();
@@ -1343,7 +1387,7 @@ async fn download_batch(
     candidates: Vec<String>,
     target_total: usize,
     dest_base: &str,
-    sanitized: &str,
+    naming: &NamingScheme,
     delay_ms: u64,
     verify: &Option<VerifyConfig>,
     dedupe: bool,
@@ -1352,9 +1396,14 @@ async fn download_batch(
     failures: &mut Vec<(String, String)>,
     seq: &mut usize,
     progress: &Option<UnboundedSender<ScrapeEvent>>,
+    cancel: &CancelFlag,
+    url_sources: &std::collections::HashMap<String, String>,
+    default_source: &str,
 ) {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
     let emit = |e: ScrapeEvent| { if let Some(tx) = progress { let _ = tx.send(e); } };
+    // Which scraper a downloaded URL came from (for the per-source tally).
+    let source_of = |url: &str| url_sources.get(url).cloned().unwrap_or_else(|| default_source.to_string());
 
     // The vision gate, content dedup, and any non-zero pacing delay all force the
     // sequential path: download one candidate, optionally judge/hash it, keep or
@@ -1362,6 +1411,7 @@ async fn download_batch(
     if verify.is_some() || dedupe || delay_ms > 0 {
         for url in &candidates {
             if downloaded.len() >= target_total { break; }
+            if is_cancelled(cancel) { break; }
             match download_image_bytes(client, url).await {
                 Ok((bytes, ext)) => {
                     let (keep, reason) = match verify {
@@ -1381,12 +1431,12 @@ async fn download_batch(
                         failures.push((url.clone(), dup.clone()));
                         emit(ScrapeEvent::Failed { url: url.clone(), reason: dup });
                     } else {
-                        let path = next_free_path(dest_base, sanitized, ext, seq);
+                        let path = naming.next_free_path(dest_base, ext, seq);
                         match std::fs::write(&path, &bytes) {
                             Ok(_) => {
                                 debug!("OK  {}", path);
                                 downloaded.push(path.clone());
-                                emit(ScrapeEvent::Downloaded { done: downloaded.len(), target: target_total, path });
+                                emit(ScrapeEvent::Downloaded { done: downloaded.len(), target: target_total, path, source: source_of(url) });
                             }
                             Err(e) => {
                                 let reason = format!("write: {}", e);
@@ -1416,22 +1466,29 @@ async fn download_batch(
     let mut tasks = tokio::task::JoinSet::new();
 
     for url in candidates {
+        // Stop requested: quit handing out new downloads. Tasks already spawned
+        // (≤ concurrency limit in flight) are awaited below, so their files are kept.
+        if is_cancelled(cancel) { break; }
         let client = client.clone();
         let sem = sem.clone();
-        let sanitized = sanitized.to_string();
+        let naming = naming.clone();
         let dest_base = dest_base.to_string();
         let seq_atomic = seq_atomic.clone();
+        let cancel = cancel.clone();
         tasks.spawn(async move {
             let _permit = sem.acquire().await.ok()?;
+            // Re-check after waiting for a permit: a task queued before Stop but not
+            // yet started should skip its download rather than fetch pointlessly.
+            if is_cancelled(&cancel) { return None; }
             match download_image_bytes(&client, &url).await {
                 Ok((bytes, ext)) => {
                     // Unique number per success; skip any number whose file already
                     // exists (resume into a non-empty bin never overwrites).
                     let mut n = seq_atomic.fetch_add(1, Ordering::SeqCst) + 1;
-                    let mut path = format!("{}\\{}_{:03}.{}", dest_base, sanitized, n, ext);
+                    let mut path = format!("{}\\{}", dest_base, naming.file_name(n, &ext));
                     while Path::new(&path).exists() {
                         n = seq_atomic.fetch_add(1, Ordering::SeqCst) + 1;
-                        path = format!("{}\\{}_{:03}.{}", dest_base, sanitized, n, ext);
+                        path = format!("{}\\{}", dest_base, naming.file_name(n, &ext));
                     }
                     match std::fs::write(&path, &bytes) {
                         Ok(_) => Some((true, url, path, String::new())),
@@ -1447,8 +1504,9 @@ async fn download_batch(
         if let Ok(Some((ok, url, path, reason))) = task_result {
             if ok {
                 debug!("OK  {}", path);
+                let source = source_of(&url);
                 downloaded.push(path.clone());
-                emit(ScrapeEvent::Downloaded { done: downloaded.len(), target: target_total, path });
+                emit(ScrapeEvent::Downloaded { done: downloaded.len(), target: target_total, path, source });
                 if downloaded.len() >= target_total {
                     tasks.abort_all();
                     break;
@@ -1606,6 +1664,89 @@ fn sanitize_filename(name: &str) -> String {
         .collect::<String>()
         .trim_matches('_')
         .to_string()
+}
+
+/// How a scrape names its downloaded files.
+///
+/// Legacy mode (`category: None`) keeps Bow's historic `<prefix>_NNN.ext`. Animus mode
+/// (`category: Some`) matches the Animus Sorter suite convention `<NAME>_NNN_<Category>.ext`,
+/// where NAME preserves spaces and the underscore is reserved as the structural separator.
+#[derive(Clone)]
+pub struct NamingScheme {
+    name: String,
+    category: Option<String>,
+}
+
+impl NamingScheme {
+    /// Build from the raw query/subject and an optional category. Unknown category
+    /// strings fall back to legacy naming.
+    pub fn new(query: &str, category: Option<String>) -> Self {
+        let category = category.and_then(normalize_category);
+        let name = if category.is_some() { animus_name(query) } else { sanitize_filename(query) };
+        Self { name, category }
+    }
+
+    /// Filename (no directory) for one serial + extension.
+    fn file_name(&self, serial: usize, ext: &str) -> String {
+        match &self.category {
+            Some(cat) => format!("{}_{:03}_{}.{}", self.name, serial, cat, ext),
+            None => format!("{}_{:03}.{}", self.name, serial, ext),
+        }
+    }
+
+    /// Highest serial already on disk in `dir` for this scheme, so resumes/appends
+    /// continue past existing files instead of colliding.
+    fn highest_serial(&self, dir: &str) -> usize {
+        let Some(cat) = &self.category else { return highest_existing_index(dir, &self.name) };
+        let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+        let prefix = format!("{}_", self.name);
+        let suffix = format!("_{}", cat);
+        let mut max = 0usize;
+        for e in entries.flatten() {
+            let fname = e.file_name();
+            let Some(fname) = fname.to_str() else { continue };
+            if !is_image_name(fname) { continue; }
+            let Some(stem) = Path::new(fname).file_stem().and_then(|s| s.to_str()) else { continue };
+            if let Some(mid) = stem.strip_prefix(&prefix).and_then(|r| r.strip_suffix(&suffix)) {
+                if let Ok(n) = mid.parse::<usize>() { max = max.max(n); }
+            }
+        }
+        max
+    }
+
+    /// Advance `*seq` to the next non-colliding path in `dest_base` and return it.
+    fn next_free_path(&self, dest_base: &str, ext: &str, seq: &mut usize) -> String {
+        if self.category.is_none() {
+            return next_free_path(dest_base, &self.name, ext, seq);
+        }
+        loop {
+            *seq += 1;
+            let path = format!("{}\\{}", dest_base, self.file_name(*seq, ext));
+            if !Path::new(&path).exists() { return path; }
+        }
+    }
+}
+
+/// Accept only the three Animus categories (case-insensitive), normalized to title case.
+fn normalize_category(c: String) -> Option<String> {
+    match c.trim().to_lowercase().as_str() {
+        "character" => Some("Character".to_string()),
+        "object" => Some("Object".to_string()),
+        "style" => Some("Style".to_string()),
+        _ => None,
+    }
+}
+
+/// Build the Animus NAME field: the structural underscore and any Windows-illegal
+/// character become spaces, runs of whitespace collapse, and the result is trimmed.
+/// Spaces and hyphens (the multi-subject separator) survive.
+fn animus_name(query: &str) -> String {
+    let cleaned: String = query
+        .chars()
+        .map(|c| if c == '_' || "<>:\"/\\|?*".contains(c) { ' ' } else { c })
+        .collect();
+    let joined = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if joined.is_empty() { "image".to_string() } else { joined }
 }
 
 #[cfg(test)]
@@ -1875,12 +2016,30 @@ mod tests {
         assert_eq!(v["source"], "Bing");
         assert_eq!(v["count"], 35);
 
-        let d = ScrapeEvent::Downloaded { done: 3, target: 15, path: "C:\\x\\a.jpg".into() };
+        let d = ScrapeEvent::Downloaded { done: 3, target: 15, path: "C:\\x\\a.jpg".into(), source: "Yandex".into() };
         let dv = d.to_json();
         assert_eq!(dv["kind"], "downloaded");
         assert_eq!(dv["done"], 3);
         assert_eq!(dv["target"], 15);
         assert_eq!(dv["path"], "C:\\x\\a.jpg");
+        assert_eq!(dv["source"], "Yandex");
+    }
+
+    #[test]
+    fn naming_scheme_legacy_and_animus() {
+        let legacy = NamingScheme::new("Woman holding a rose", None);
+        assert_eq!(legacy.file_name(1, "jpg"), "Woman_holding_a_rose_001.jpg");
+
+        let animus = NamingScheme::new("Woman holding a rose", Some("character".into()));
+        assert_eq!(animus.file_name(7, "png"), "Woman holding a rose_007_Character.png");
+
+        // Underscore (structural) becomes a space in the Animus NAME field.
+        let underscored = NamingScheme::new("mountain_lake", Some("Object".into()));
+        assert_eq!(underscored.file_name(2, "webp"), "mountain lake_002_Object.webp");
+
+        // Unknown category → legacy naming.
+        let bad = NamingScheme::new("cat", Some("Nonsense".into()));
+        assert_eq!(bad.file_name(1, "jpg"), "cat_001.jpg");
     }
 
     #[test]
