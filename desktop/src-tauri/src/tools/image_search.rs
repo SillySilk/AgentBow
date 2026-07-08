@@ -17,6 +17,11 @@ fn is_cancelled(cancel: &CancelFlag) -> bool {
     cancel.as_ref().is_some_and(|f| f.load(Ordering::Relaxed))
 }
 
+/// Public wrapper over the private cancel check, for the case-run loop in `server.rs`.
+pub fn cancel_check(cancel: &CancelFlag) -> bool {
+    is_cancelled(cancel)
+}
+
 // ── OpenAI-compatible chat-completion response types ─────────────────────────
 
 #[derive(Deserialize)]

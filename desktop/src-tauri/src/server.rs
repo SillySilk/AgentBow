@@ -47,6 +47,28 @@ enum InboundMsg {
     /// Cooperatively stop any in-flight scrape (query or page). Downloads already
     /// completed are kept; the run finishes with a normal `done` event.
     StopScrape,
+    // ── Case the gallery (guided grab) ──
+    /// Extract structured candidates from the current controlled-browser page.
+    CaseExtract,
+    /// Follow a thumbnail's link to its detail page and extract that page's candidates.
+    CaseOpenDetail { href: String },
+    /// Build a recipe from a demonstrated grid example (+ optional detail image).
+    CaseGeneralize {
+        example_id: usize,
+        #[serde(default)] detail_image_id: Option<usize>,
+        #[serde(default)] scrolls: u32,
+    },
+    /// Replay a recipe over `grid_url`, download the batch.
+    CaseRun {
+        recipe: crate::tools::recipe::Recipe,
+        grid_url: String,
+        count: u32,
+        dest_dir: String,
+    },
+    /// Persist a recipe to the per-domain playbook store.
+    PlaybookSave { recipe: crate::tools::recipe::Recipe },
+    /// List saved recipes for a domain.
+    PlaybookList { domain: String },
 }
 
 /// serde default for the dedup flag (on unless the client explicitly disables it).
@@ -87,6 +109,12 @@ pub async fn run_ws(
     let mut authenticated = false;
     let mut history: Vec<OaiMessage> = Vec::new();
     let mut page_ctx: Option<PageContext> = None;
+    // Case-the-gallery scratch state (per connection): the last grid extraction, the
+    // last detail-page extraction, and the URL the grid was cased from. Kept separate
+    // so a detail extraction never clobbers the grid the example id refers to.
+    let mut grid_candidates: Vec<crate::tools::recipe::Candidate> = Vec::new();
+    let mut detail_candidates: Vec<crate::tools::recipe::Candidate> = Vec::new();
+    let mut grid_url: String = String::new();
     let interrupt_flag = Arc::new(AtomicBool::new(false));
     // Cooperative stop signal for scrapes (query + page). Set by `stop_scrape`,
     // reset when a fresh scrape starts, checked between downloads by the scraper.
@@ -381,6 +409,131 @@ pub async fn run_ws(
                             let _ = forwarder.await;
                         });
                     }
+
+                    InboundMsg::CaseExtract => {
+                        if !authenticated { send_json(&out_tx, json!({"type":"error","code":"unauthenticated","message":"Must authenticate first"})).await; continue; }
+                        match controlled_browser.extract_candidates().await {
+                            Ok(cands) => {
+                                grid_url = controlled_browser.get_url().await.ok()
+                                    .and_then(|v| v["url"].as_str().map(str::to_string)).unwrap_or_default();
+                                grid_candidates = cands.clone();
+                                send_json(&out_tx, json!({"type":"case_candidates","stage":"grid","items":cands})).await;
+                            }
+                            Err(e) => send_json(&out_tx, json!({"type":"scrape_event","kind":"error","message": format!("case_extract: {} — open the browser first with Ghost car", e)})).await,
+                        }
+                    }
+
+                    InboundMsg::CaseOpenDetail { href } => {
+                        if !authenticated { send_json(&out_tx, json!({"type":"error","code":"unauthenticated","message":"Must authenticate first"})).await; continue; }
+                        if let Err(e) = controlled_browser.navigate(&href).await {
+                            send_json(&out_tx, json!({"type":"scrape_event","kind":"error","message": format!("open detail: {}", e)})).await;
+                            continue;
+                        }
+                        match controlled_browser.extract_candidates().await {
+                            Ok(cands) => { detail_candidates = cands.clone(); send_json(&out_tx, json!({"type":"case_candidates","stage":"detail","items":cands})).await; }
+                            Err(e) => send_json(&out_tx, json!({"type":"scrape_event","kind":"error","message": format!("detail extract: {}", e)})).await,
+                        }
+                    }
+
+                    InboundMsg::CaseGeneralize { example_id, detail_image_id, scrolls } => {
+                        if !authenticated { send_json(&out_tx, json!({"type":"error","code":"unauthenticated","message":"Must authenticate first"})).await; continue; }
+                        let detail_sel = detail_image_id
+                            .and_then(|id| detail_candidates.iter().find(|c| c.id == id))
+                            .map(crate::tools::recipe::detail_selector_from);
+                        let domain = crate::tools::recipe::domain_of(&grid_url);
+                        match grid_candidates.iter().find(|c| c.id == example_id).cloned() {
+                            Some(example) => {
+                                let (mut recipe, sibs) = crate::tools::recipe::generalize(&example, &grid_candidates, scrolls, &domain);
+                                recipe.detail_image_selector = detail_sel;
+                                send_json(&out_tx, json!({"type":"case_recipe","recipe":recipe,"matched":sibs.len(),"total":grid_candidates.len(),"grid_url":grid_url})).await;
+                            }
+                            None => send_json(&out_tx, json!({"type":"scrape_event","kind":"error","message":"example not found — re-run Case it"})).await,
+                        }
+                    }
+
+                    InboundMsg::PlaybookSave { recipe } => {
+                        if !authenticated { send_json(&out_tx, json!({"type":"error","code":"unauthenticated","message":"Must authenticate first"})).await; continue; }
+                        let dir = config.workspace_root.join("playbooks");
+                        match crate::tools::recipe::save_playbook(&dir, &recipe) {
+                            Ok(_) => send_json(&out_tx, json!({"type":"playbook_saved","domain":recipe.domain})).await,
+                            Err(e) => send_json(&out_tx, json!({"type":"scrape_event","kind":"error","message": format!("save playbook: {}", e)})).await,
+                        }
+                    }
+
+                    InboundMsg::PlaybookList { domain } => {
+                        if !authenticated { send_json(&out_tx, json!({"type":"error","code":"unauthenticated","message":"Must authenticate first"})).await; continue; }
+                        let dir = config.workspace_root.join("playbooks");
+                        let recipes = crate::tools::recipe::load_playbooks(&dir, &domain);
+                        send_json(&out_tx, json!({"type":"playbook_list","domain":domain,"recipes":recipes})).await;
+                    }
+
+                    InboundMsg::CaseRun { recipe, grid_url: run_url, count, dest_dir } => {
+                        if !authenticated { send_json(&out_tx, json!({"type":"error","code":"unauthenticated","message":"Must authenticate first"})).await; continue; }
+                        let cb = controlled_browser.clone();
+                        let out_tx = out_tx.clone();
+                        let workspace = config.workspace_root.clone();
+                        let log_dir = format!("{}\\logs", workspace.to_string_lossy().trim_end_matches(['\\', '/']));
+                        let count = (count as usize).clamp(1, 500);
+                        scrape_cancel.store(false, Ordering::Relaxed);
+                        let cancel = scrape_cancel.clone();
+                        tokio::spawn(async move {
+                            let dest = match crate::web_api::resolve_within_workspace(&workspace, &dest_dir) {
+                                Some(p) => p.to_string_lossy().to_string(),
+                                None => { let _ = out_tx.send(json!({"type":"scrape_event","kind":"error","message":"dest_dir outside workspace"}).to_string()).await; return; }
+                            };
+                            let dest = match crate::tools::image_search::pick_auto_bin(&dest) {
+                                Ok(p) => p,
+                                Err(e) => { let _ = out_tx.send(json!({"type":"scrape_event","kind":"error","message": format!("set folder: {}", e)}).to_string()).await; return; }
+                            };
+                            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::tools::image_search::ScrapeEvent>();
+                            let fwd = out_tx.clone();
+                            let forwarder = tokio::spawn(async move {
+                                while let Some(ev) = rx.recv().await {
+                                    let mut v = ev.to_json();
+                                    v["type"] = Value::String("scrape_event".into());
+                                    let _ = fwd.send(v.to_string()).await;
+                                }
+                            });
+                            let _ = tx.send(crate::tools::image_search::ScrapeEvent::Phase { label: "Casing gallery".into() });
+                            let _ = cb.navigate(&run_url).await;
+                            for _ in 0..recipe.scrolls {
+                                let _ = cb.scroll("down", 1200).await;
+                                tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+                            }
+                            let grid = cb.extract_candidates().await.unwrap_or_default();
+                            let items: Vec<crate::tools::recipe::Candidate> =
+                                crate::tools::recipe::match_pattern(&recipe.grid_selector, &grid).into_iter().cloned().collect();
+                            let _ = tx.send(crate::tools::image_search::ScrapeEvent::Candidates { total: items.len(), filtered: grid.len().saturating_sub(items.len()) });
+
+                            let mut urls: Vec<String> = Vec::new();
+                            if recipe.link_selector.is_some() {
+                                let detail_sel = recipe.detail_image_selector.clone().unwrap_or_default();
+                                for it in &items {
+                                    if crate::tools::image_search::cancel_check(&Some(cancel.clone())) { break; }
+                                    let Some(href) = &it.href else { continue };
+                                    if cb.navigate(href).await.is_err() { continue; }
+                                    let dcands = cb.extract_candidates().await.unwrap_or_default();
+                                    let best = dcands.iter()
+                                        .filter(|c| detail_sel.is_empty() || crate::tools::recipe::structural_pattern(&c.selector) == detail_sel)
+                                        .max_by_key(|c| c.w as u64 * c.h as u64);
+                                    if let Some(b) = best { urls.push(b.preview_url.clone()); }
+                                }
+                            } else {
+                                urls.extend(items.iter().map(|c| c.preview_url.clone()));
+                            }
+
+                            let mut log = crate::tools::image_search::SessionLog::new(&log_dir, "case_run");
+                            let result = crate::tools::image_search::download_urls_to_dir(
+                                urls, count, &dest, "case", crate::tools::image_search::DownloadOpts::default(),
+                                &mut log, &Some(tx.clone()), Some(cancel),
+                            ).await;
+                            let log_note = log.flush();
+                            let downloaded = result.unwrap_or_default();
+                            let _ = tx.send(crate::tools::image_search::ScrapeEvent::Done { downloaded, log_note, dest_dir: dest.clone() });
+                            drop(tx);
+                            let _ = forwarder.await;
+                        });
+                    }
                 }
             }
 
@@ -444,6 +597,17 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn case_messages_parse() {
+        let a: InboundMsg = serde_json::from_value(json!({"type":"case_extract"})).unwrap();
+        assert!(matches!(a, InboundMsg::CaseExtract));
+        let b: InboundMsg = serde_json::from_value(json!({"type":"case_generalize","example_id":3})).unwrap();
+        assert!(matches!(b, InboundMsg::CaseGeneralize { example_id: 3, detail_image_id: None, scrolls: 0 }));
+        let c: InboundMsg = serde_json::from_value(json!({"type":"case_run","grid_url":"https://e.com/g","count":20,"dest_dir":"C:\\x",
+            "recipe":{"domain":"e.com","grid_selector":"div > a > img","link_selector":"div > a > img","detail_image_selector":"main > img","scrolls":3}})).unwrap();
+        assert!(matches!(c, InboundMsg::CaseRun { count: 20, .. }));
     }
 
     #[test]
