@@ -74,6 +74,50 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use url::Url;
 
+use crate::tools::recipe::Candidate;
+
+/// Raw shape the page-extraction JS returns (URLs not yet absolutized).
+#[derive(serde::Deserialize)]
+pub struct RawCandidate {
+    pub preview_url: String,
+    pub href: Option<String>,
+    pub selector: String,
+    #[serde(default)]
+    pub w: u32,
+    #[serde(default)]
+    pub h: u32,
+}
+
+/// Absolutize preview_url/href against `base`, drop `data:`/non-http previews,
+/// and assign stable ids. Pure & unit-tested.
+pub fn resolve_candidate_urls(raw: Vec<RawCandidate>, base: &str) -> Vec<Candidate> {
+    let base_url = Url::parse(base).ok();
+    let abs = |s: &str| -> Option<String> {
+        let s = s.trim();
+        if s.is_empty() || s.starts_with("data:") {
+            return None;
+        }
+        if s.starts_with("http") {
+            return Some(s.to_string());
+        }
+        base_url.as_ref().and_then(|b| b.join(s).ok()).map(|u| u.to_string())
+    };
+    let mut out = Vec::new();
+    for r in raw {
+        let Some(preview_url) = abs(&r.preview_url) else { continue };
+        let href = r.href.as_deref().and_then(abs);
+        out.push(Candidate {
+            id: out.len(),
+            preview_url,
+            href,
+            selector: r.selector,
+            w: r.w,
+            h: r.h,
+        });
+    }
+    out
+}
+
 struct BrowserState {
     // Held alive to keep the browser process running; methods are only needed
     // during launch (ensure_launched) where it is used directly before storage.
@@ -300,8 +344,8 @@ impl ControlledBrowser {
                 JSON.stringify((() => {
                   const out = [];
                   document.querySelectorAll('img').forEach(im => {
-                    if (im.currentSrc) out.push(im.currentSrc);
-                    else if (im.src) out.push(im.src);
+                    const u = im.getAttribute('data-src') || im.getAttribute('data-original') || im.currentSrc || im.src;
+                    if (u) out.push(u);
                     if (im.srcset) im.srcset.split(',').forEach(s => out.push(s.trim().split(' ')[0]));
                   });
                   document.querySelectorAll('a[href]').forEach(a => out.push(a.href));
@@ -321,6 +365,63 @@ impl ControlledBrowser {
                 .or_else(|| serde_json::from_value(raw.clone()).ok())
                 .unwrap_or_default();
             Ok(normalize_image_urls(list, &base))
+        })
+        .await
+    }
+
+    /// Extract structured candidates (img + wrapping link) from the live page,
+    /// reading lazy attributes and recording each repeating unit's CSS path.
+    /// Used by the "Case the gallery" guided-grab flow.
+    pub async fn extract_candidates(&self) -> Result<Vec<Candidate>> {
+        self.ensure_launched(false).await?;
+        self.with_page(|page| async move {
+            let base = page.url().await.ok().flatten().unwrap_or_default();
+            let expr = r#"
+                JSON.stringify((() => {
+                  function cssPath(el) {
+                    const parts = [];
+                    while (el && el.nodeType === 1 && parts.length < 8) {
+                      let seg = el.tagName.toLowerCase();
+                      if (el.id) { parts.unshift(seg + '#' + el.id); break; }
+                      const p = el.parentElement;
+                      if (p) {
+                        const same = Array.from(p.children).filter(c => c.tagName === el.tagName);
+                        if (same.length > 1) seg += ':nth-of-type(' + (same.indexOf(el) + 1) + ')';
+                      }
+                      parts.unshift(seg);
+                      el = el.parentElement;
+                    }
+                    return parts.join(' > ');
+                  }
+                  function pick(im) {
+                    return im.getAttribute('data-src') || im.getAttribute('data-original')
+                      || im.getAttribute('data-lazy') || im.currentSrc || im.src
+                      || (im.srcset ? im.srcset.split(',')[0].trim().split(' ')[0] : '');
+                  }
+                  const out = [];
+                  document.querySelectorAll('img').forEach(im => {
+                    const preview = pick(im);
+                    if (!preview) return;
+                    const a = im.closest('a[href]');
+                    const unit = a || im;
+                    out.push({ preview_url: preview, href: a ? a.href : null,
+                      selector: cssPath(unit), w: im.naturalWidth || im.width || 0, h: im.naturalHeight || im.height || 0 });
+                  });
+                  return out;
+                })())
+            "#
+            .to_string();
+            let raw: Value = page
+                .evaluate(expr)
+                .await
+                .ok()
+                .and_then(|r| r.into_value().ok())
+                .unwrap_or(Value::Null);
+            let list: Vec<RawCandidate> = raw
+                .as_str()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+            Ok(resolve_candidate_urls(list, &base))
         })
         .await
     }
@@ -563,8 +664,13 @@ pub fn normalize_image_urls(raw: Vec<String>, base: &str) -> Vec<String> {
             continue;
         };
         let lower = abs.split('?').next().unwrap_or(&abs).to_lowercase();
+        let last_seg = lower.rsplit('/').next().unwrap_or("");
+        let has_ext = last_seg.contains('.');
         let looks_img = IMG_EXTS.iter().any(|e| lower.ends_with(&format!(".{}", e)));
-        if !looks_img {
+        // Keep known image extensions, OR extensionless paths (CDN image routes
+        // like /image/12345). Reject only URLs whose last path segment carries a
+        // *non-image* extension (.html, .js, .css…).
+        if has_ext && !looks_img {
             continue;
         }
         if seen.insert(abs.clone()) {
@@ -623,6 +729,35 @@ mod tests {
                 "https://e.com/img/b.png".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn resolve_candidate_urls_absolutizes_and_assigns_ids() {
+        let raw = vec![
+            RawCandidate { preview_url: "/img/a".into(), href: Some("/p/1".into()), selector: "div > a:nth-of-type(1) > img".into(), w: 100, h: 90 },
+            RawCandidate { preview_url: "data:image/png;base64,xx".into(), href: None, selector: "img".into(), w: 1, h: 1 }, // dropped
+            RawCandidate { preview_url: "https://cdn.e.com/x".into(), href: None, selector: "img:nth-of-type(2)".into(), w: 50, h: 50 },
+        ];
+        let out = resolve_candidate_urls(raw, "https://e.com/gallery/");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].id, 0);
+        assert_eq!(out[0].preview_url, "https://e.com/img/a");
+        assert_eq!(out[0].href.as_deref(), Some("https://e.com/p/1"));
+        assert_eq!(out[1].id, 1);
+        assert_eq!(out[1].preview_url, "https://cdn.e.com/x");
+    }
+
+    #[test]
+    fn normalize_keeps_extensionless_image_hosts() {
+        let raw = vec![
+            "https://cdn.e.com/image/12345".to_string(), // extensionless, kept
+            "https://e.com/page.html".to_string(),       // .html dropped
+            "https://e.com/a.jpg".to_string(),           // kept
+        ];
+        let out = normalize_image_urls(raw, "https://e.com/");
+        assert!(out.contains(&"https://cdn.e.com/image/12345".to_string()));
+        assert!(out.contains(&"https://e.com/a.jpg".to_string()));
+        assert!(!out.iter().any(|u| u.ends_with("page.html")));
     }
 
     #[tokio::test]
