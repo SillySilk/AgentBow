@@ -4,6 +4,7 @@ pub mod image_curate;
 pub mod image_search;
 pub mod mcp;
 pub mod memory;
+pub mod recipe;
 pub mod shell_exec;
 pub mod shell_session;
 pub mod web_search;
