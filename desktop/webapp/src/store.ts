@@ -51,9 +51,49 @@ export function isBrowserOpened(m: unknown): m is { type: "browser_opened"; url:
   return typeof m === "object" && m !== null && (m as { type?: unknown }).type === "browser_opened";
 }
 
+// ── Case the gallery (guided grab) ──────────────────────────────────────────
+
+export interface Candidate { id: number; preview_url: string; href: string | null; selector: string; w: number; h: number }
+export interface Recipe { domain: string; grid_selector: string; link_selector: string | null; detail_image_selector: string | null; scrolls: number }
+
+export type CaseEventMsg =
+  | { type: "case_candidates"; stage: "grid" | "detail"; items: Candidate[] }
+  | { type: "case_recipe"; recipe: Recipe; matched: number; total: number; grid_url: string }
+  | { type: "playbook_list"; domain: string; recipes: Recipe[] }
+  | { type: "playbook_saved"; domain: string };
+
+export interface CaseState {
+  stage: "idle" | "grid" | "detail" | "recipe";
+  candidates: Candidate[];
+  recipe: Recipe | null;
+  matched: number;
+  total: number;
+  gridUrl: string;
+  playbooks: Recipe[];
+}
+
+export function initialCaseState(): CaseState {
+  return { stage: "idle", candidates: [], recipe: null, matched: 0, total: 0, gridUrl: "", playbooks: [] };
+}
+
+export function applyCaseEvent(s: CaseState, m: CaseEventMsg): CaseState {
+  switch (m.type) {
+    case "case_candidates": return { ...s, stage: m.stage, candidates: m.items };
+    case "case_recipe": return { ...s, stage: "recipe", recipe: m.recipe, matched: m.matched, total: m.total, gridUrl: m.grid_url };
+    case "playbook_list": return { ...s, playbooks: m.recipes };
+    case "playbook_saved": return s;
+    default: return s;
+  }
+}
+
+export function isCaseMsg(m: { type?: unknown }): m is CaseEventMsg {
+  return m.type === "case_candidates" || m.type === "case_recipe" || m.type === "playbook_list" || m.type === "playbook_saved";
+}
+
 interface Store {
   status: string;
   scrape: ScrapeState;
+  caseState: CaseState;
   lastDestDir: string;
   /** Folder currently shown in the preview (the active "working slot"). */
   workingSlotDir: string;
@@ -68,6 +108,12 @@ interface Store {
   setWorkingSlot: (dir: string) => void;
   openBrowser: (url: string) => void;
   pageScrape: (a: { count: number; destDir: string; scrolls: number }) => void;
+  caseExtract: () => void;
+  caseOpenDetail: (href: string) => void;
+  caseGeneralize: (exampleId: number, detailImageId?: number, scrolls?: number) => void;
+  caseRun: (recipe: Recipe, gridUrl: string, count: number, destDir: string) => void;
+  playbookSave: (recipe: Recipe) => void;
+  playbookList: (domain: string) => void;
   setEngine: (engine: EngineStatus | null) => void;
   _ws?: WebSocket;
 }
@@ -75,6 +121,7 @@ interface Store {
 export const useStore = create<Store>((set, get) => ({
   status: "connecting…",
   scrape: initialScrapeState(),
+  caseState: initialCaseState(),
   lastDestDir: "",
   workingSlotDir: "",
   engine: null,
@@ -99,6 +146,7 @@ export const useStore = create<Store>((set, get) => ({
           return next;
         });
         else if (isBrowserOpened(m)) set({ browserUrl: m.url });
+        else if (isCaseMsg(m)) set((st) => ({ caseState: applyCaseEvent(st.caseState, m) }));
       };
       ws.onclose = () => set({ status: "disconnected" });
       ws.onerror = () => set({ status: "error" });
@@ -132,6 +180,32 @@ export const useStore = create<Store>((set, get) => ({
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     set({ scrape: { ...initialScrapeState(), running: true, target: count }, lastDestDir: destDir });
     ws.send(JSON.stringify({ type: "page_scrape_request", count, dest_dir: destDir, scrolls }));
+  },
+  caseExtract: () => {
+    const ws = get()._ws;
+    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "case_extract" }));
+  },
+  caseOpenDetail: (href: string) => {
+    const ws = get()._ws;
+    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "case_open_detail", href }));
+  },
+  caseGeneralize: (exampleId: number, detailImageId?: number, scrolls?: number) => {
+    const ws = get()._ws;
+    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "case_generalize", example_id: exampleId, detail_image_id: detailImageId ?? null, scrolls: scrolls ?? 0 }));
+  },
+  caseRun: (recipe: Recipe, gridUrl: string, count: number, destDir: string) => {
+    const ws = get()._ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    set({ scrape: { ...initialScrapeState(), running: true, target: count }, lastDestDir: destDir });
+    ws.send(JSON.stringify({ type: "case_run", recipe, grid_url: gridUrl, count, dest_dir: destDir }));
+  },
+  playbookSave: (recipe: Recipe) => {
+    const ws = get()._ws;
+    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "playbook_save", recipe }));
+  },
+  playbookList: (domain: string) => {
+    const ws = get()._ws;
+    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "playbook_list", domain }));
   },
   setEngine: (engine: EngineStatus | null) => set({ engine }),
 }));

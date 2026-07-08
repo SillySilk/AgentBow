@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Lock } from "lucide-react";
 import { useStore } from "../store";
 import Button from "./ui/Button";
+import CasePanel from "./CasePanel";
 
 export default function PageScrapePanel() {
   const openBrowser = useStore((s) => s.openBrowser);
@@ -47,6 +48,8 @@ export default function PageScrapePanel() {
       <Button variant="ghost" size="sm" block disabled={!ready || running || !destDir.trim()} onClick={() => pageScrape({ count, destDir, scrolls })}>
         {running ? "Working…" : `Work the gallery · ${count} rounds`}
       </Button>
+
+      <CasePanel url={url} destDir={destDir} count={count} scrolls={scrolls} />
     </div>
   );
 }
