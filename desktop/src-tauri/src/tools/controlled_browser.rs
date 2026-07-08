@@ -768,4 +768,28 @@ mod tests {
         cb.ensure_launched(true).await.expect("launch");
         assert!(cb.is_running().await);
     }
+
+    /// End-to-end drive of the Case pipeline against real Chrome + real DOM:
+    /// build a gallery in the page, extract candidates, generalize one example,
+    /// and confirm only the 3 sibling thumbnails (not the header logo) match.
+    #[tokio::test]
+    #[ignore = "requires a real Chrome install; run manually with --ignored"]
+    async fn extract_and_generalize_live() {
+        let dir = std::env::temp_dir().join("bow_cb_extract");
+        let cb = ControlledBrowser::new(dir);
+        cb.ensure_launched(true).await.expect("launch");
+        cb.navigate("about:blank").await.expect("navigate");
+        let html = "<div id='g'>\
+            <div><a href='https://e.com/p/1'><img src='https://e.com/t1.jpg'></a></div>\
+            <div><a href='https://e.com/p/2'><img src='https://e.com/t2.jpg'></a></div>\
+            <div><a href='https://e.com/p/3'><img src='https://e.com/t3.jpg'></a></div>\
+            </div><header><a href='https://e.com/home'><img src='https://e.com/logo.png'></a></header>";
+        cb.exec_js(&format!("document.body.innerHTML = {:?}", html)).await.expect("set html");
+        let cands = cb.extract_candidates().await.expect("extract");
+        assert_eq!(cands.len(), 4, "3 grid thumbs + 1 logo");
+        let example = cands.iter().find(|c| c.href.as_deref() == Some("https://e.com/p/1")).expect("grid example");
+        let (recipe, sibs) = crate::tools::recipe::generalize(example, &cands, 0, "e.com");
+        assert_eq!(sibs.len(), 3, "the 3 gallery items, not the header logo");
+        assert!(recipe.link_selector.is_some(), "grid items are links");
+    }
 }
