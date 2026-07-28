@@ -1,12 +1,13 @@
 # Bow
 
-A local, privacy-respecting AI agent for Windows. Bow runs your own model in
-**LM Studio** and gives it real tools: files, shell, web search, full browser
-control, image scraping + vision, episodic memory, and — via **MCP** — the
-entire Model Context Protocol ecosystem.
+A local, privacy-respecting AI agent for Windows. Bow **runs your own GGUF model
+itself** — it manages a bundled llama.cpp `llama-server` — and gives it real
+tools: files, shell, web search, full browser control, image scraping + vision,
+episodic memory, and — via **MCP** — the entire Model Context Protocol ecosystem.
 
-There are no content restrictions and no cloud model calls: everything runs
-against your local LM Studio server.
+There are no content restrictions and no cloud model calls. There is also no
+external inference app to install or launch: point Bow at a folder of GGUFs,
+pick one in Settings, and it loads the model itself.
 
 ---
 
@@ -25,14 +26,17 @@ agent logic on one local port:
                                              │  bow-desktop (Rust)  │
                                              │  • axum web server   │
                                              │  • agent loop        │
-                                             │  • talks to LM Studio│
+                                             │  • owns the engine   │
                                              │  • runs all tools    │
                                              │  • system tray icon  │
                                              └───────────┬──────────┘
+                                                         │ spawns as a child process
                                                          │ OpenAI-compatible
                                                          ▼ /v1/chat/completions
                                                ┌──────────────────────┐
-                                               │  LM Studio (local)   │
+                                               │  llama-server        │
+                                               │  127.0.0.1:<random>  │
+                                               │  ← your .gguf        │
                                                └──────────────────────┘
 ```
 
@@ -43,11 +47,38 @@ agent logic on one local port:
 - **`desktop/webapp/`** — React/TypeScript chat UI, built to `desktop/webapp/dist`
   and served directly by the backend.
 
+### The inference engine
+
+Bow embeds llama.cpp rather than depending on a separate desktop app:
+
+- **The binary is fetched, not vendored.** `get-llama.ps1` downloads a *pinned*
+  llama.cpp release into `desktop/src-tauri/bin/llama/` — the CUDA 12.4 build if
+  an NVIDIA driver is detected, CPU-only otherwise. It is idempotent and runs as
+  part of `bow.bat`.
+- **Bow owns the process.** `llm_engine.rs` spawns
+  `llama-server -m <model.gguf> [--mmproj <projector>] --port <ephemeral>
+  --host 127.0.0.1 --jinja --n-gpu-layers 999 --ctx-size <BOW_CTX_SIZE>` with no
+  console window, polls `/health` until the model is resident, and kills the
+  child on exit. A crash flips engine status to `Failed` with the reason shown
+  in Settings.
+- **Models come from your folder.** `BOW_MODELS_DIR` (default `C:\AI\models`) is
+  scanned recursively for `*.gguf`. Your selection persists in `engine.json` and
+  auto-loads on the next start.
+- **Quantized only.** The quant tag is read from the filename (`Q4_K_M`,
+  `IQ4_XS`, …); F16/BF16/F32 weights are listed but marked *unquantized — not
+  loadable* and refused, so you can't accidentally try to load a 30 GB f16 file.
+- **Vision is automatic.** A model with a sibling `mmproj-*.gguf` in the same
+  folder is loaded with `--mmproj` and flagged vision-capable; `image_verify`
+  and the scrape **Verify** toggle are gated on that flag.
+
+Engine control lives in the web UI's **Settings** panel, backed by
+`GET /api/engine`, `GET /api/models`, and `POST /api/engine/{load,stop,models-dir}`.
+
 ### The agent loop (high level)
 
 1. User message arrives over the WebSocket.
 2. Bow builds the tool list (native tools **+** any MCP server tools) and streams
-   a completion from LM Studio.
+   a completion from the loaded model.
 3. Tool calls are executed — plan/verify tools run serially; independent tool
    calls run in parallel.
 4. Results feed back in; older tool results get masked to control context growth.
@@ -61,11 +92,17 @@ agent logic on one local port:
 ### Prerequisites
 
 - **Windows 10/11**
-- **[LM Studio](https://lmstudio.ai/)** running a tool-capable model, server
-  started on `http://localhost:1234`. A vision-capable model is needed for
-  `image_verify` screenshots.
+- **At least one quantized GGUF model** in `BOW_MODELS_DIR` (default
+  `C:\AI\models`) — pick something tool-capable. For `image_verify` and scrape
+  verification you also need a vision model with its `mmproj-*.gguf` projector
+  next to it in the same folder.
 - **Rust** (stable) and **Node.js** for building.
+- *(Optional)* An **NVIDIA GPU + driver** — `get-llama.ps1` then fetches the CUDA
+  build instead of the CPU one. Nothing else to configure.
 - *(Optional)* **Node/npx** and/or **uv/uvx** if you want to run MCP servers.
+
+No separate inference app (LM Studio, Ollama, …) is required or used — Bow
+downloads and manages `llama-server` itself.
 
 ### Configure
 
@@ -75,10 +112,8 @@ are actually read:
 | Key | Purpose |
 |---|---|
 | `BOW_SECRET` | Auth token the web UI uses. **Required.** |
-| `LM_STUDIO_URL` | LM Studio server URL (default `http://localhost:1234`). |
-| `LM_STUDIO_MODEL` | Model id as shown in LM Studio. |
-| `LM_STUDIO_REASONING_EFFORT` | `low`/`medium`/`high`, or blank. |
-| `LM_STUDIO_REASONING_TOKENS` | Reasoning token budget, or blank. |
+| `BOW_MODELS_DIR` | Folder scanned recursively for `*.gguf` models (default `C:\AI\models`). Changeable at runtime in Settings. |
+| `BOW_CTX_SIZE` | Context window passed to `llama-server` as `--ctx-size` (default `8192`). |
 | `BOW_WS_PORT` | WebSocket port (default `9357`). |
 | `BOW_WORKSPACE` | Where Bow reads/writes files, stores `memory.db`, finds `mcp.json`. |
 | `TAVILY_API_KEY` | For `web_search` / `web_search_deep`. |
@@ -87,9 +122,12 @@ are actually read:
 
 ## Run
 
-1. Ensure `desktop/.env` is configured (LM Studio URL/model, BOW_SECRET, etc.).
+1. Ensure `desktop/.env` is configured (`BOW_SECRET`, `BOW_MODELS_DIR`, etc.).
 2. Double-click `bow.bat` in the project root.
 3. Your browser opens to `http://127.0.0.1:9357` (Bow Image Studio).
+4. Open **Settings** and pick a model. The first load takes a while (weights are
+   read off disk and pushed to VRAM); the status line goes `Starting → Ready`.
+   Your choice is remembered and auto-loads on the next run.
 
 There is no browser extension — Bow runs as a standalone local web app.
 
@@ -97,13 +135,21 @@ There is no browser extension — Bow runs as a standalone local web app.
 - Builds the web UI (`npm run build` in `desktop/webapp`)
 - Builds the backend (`cargo build` in `desktop/src-tauri`)
 - Copies built web assets next to the exe (`target/debug/web/`)
+- Runs `get-llama.ps1` and copies `llama-server` next to the exe
+  (`target/debug/llama/`) — a no-op once the binary is present
 - Launches `bow-desktop.exe` (tray icon appears)
+
+It also kills any running `bow-desktop.exe` **process tree** and reaps orphaned
+`llama-server.exe` processes first, so a previous run can't hold a lock on the
+binaries it's about to relink.
 
 ### Using the scraper
 
 The Bow Image Studio web UI (at `http://127.0.0.1:9357`) provides a complete
-image-scraping and curation workflow that does **not** require LM Studio — it is
-triggered from the browser UI; the scrape runs in the local backend.
+image-scraping and curation workflow that does **not** require a loaded model —
+it is triggered from the browser UI and the scrape runs in the local backend.
+(The exception is the **Verify** toggle, which needs a vision-capable model
+loaded; it is disabled otherwise.)
 
 #### 1. Configure and start a scrape
 
@@ -237,7 +283,7 @@ thumbnails; delete, dedupe, and open-folder work identically.
 | Images | `image_download` (Bing/DDG/Yandex/Brave/Qwant/SearXNG), `image_verify` (vision; transcodes WebP→PNG), `image_dedupe` (pHash near-dup quarantine), `image_stats` (folder report), `image_resize` (non-destructive resize/convert for training sets), `image_autotag` (writes kohya `.txt` captions via the local vision model) |
 | Browser | `browser_navigate`, `browser_back`, `browser_forward`, `browser_reload`, `browser_click`, `browser_fill`, `browser_read_page`, `browser_screenshot`, `browser_analyze_page`, `browser_scroll`, `browser_get_url`, `browser_get_cookies`, `browser_set_cookie`, `browser_delete_cookies`, `browser_exec_js` — drive the **controlled Chrome** (see "Scrape a page or gallery" above) |
 | Planning | `plan_create`, `plan_step_start/done/fail`, `verify_step`, `task_complete` |
-| Memory | `memory_store`, `memory_retrieve` (SQLite FTS5 + optional embeddings) |
+| Memory | `memory_store`, `memory_retrieve` (SQLite FTS5 full-text search) |
 
 ### Image-training workflow
 
@@ -250,7 +296,7 @@ The image tools chain into a training-set prep pipeline. A typical agent run:
    is deleted).
 4. `image_resize` — write normalized copies (capped longest side, consistent
    format) into a clean output folder, leaving originals untouched.
-5. `image_autotag` — caption each image with the local LM Studio vision model,
+5. `image_autotag` — caption each image with the loaded local vision model,
    writing a `<name>.txt` sidecar (kohya convention). Use `style:"tags"` for
    booru-style tags or `"caption"` for a sentence, and `trigger` to prepend an
    activation word (the character/person's name).
