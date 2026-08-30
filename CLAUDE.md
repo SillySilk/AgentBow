@@ -67,6 +67,20 @@ general AI agent is secondary.
   Idempotent; called by `bow.bat`. The binaries are **not** vendored into git.
 - `bow.bat` / `kill-bow.bat` — launch / stop (kept in repo root by convention).
 
+## Commands
+
+Run from `desktop/` (verified in `desktop/package.json`):
+- `npm run dev` — Vite dev server for the webapp
+- `npm run build` — `tsc && vite build`, compiles + bundles to `desktop/webapp/dist`
+- `npm run preview` — preview the production build
+
+No lint/test script is defined in `package.json`. `package.json` also lists
+`@tauri-apps/api`/`@tauri-apps/cli` as devDependencies and a `"tauri"` script —
+these are vestigial leftovers from before Tauri was removed and are unused; the
+Rust side has no `tauri` crate dependency and no `tauri::` calls (verified in
+`desktop/src-tauri/Cargo.toml` and `src/`). Don't mistake their presence for
+Tauri still being active.
+
 ## Working agreements
 
 - Local LLM only — never reintroduce Anthropic/cloud model calls, and never
