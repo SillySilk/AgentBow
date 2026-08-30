@@ -433,6 +433,11 @@ fn source_enabled(sources: &Option<Vec<String>>, key: &str) -> bool {
 
 // ── Pacing + vision-QA ──────────────────────────────────────────────────────────
 
+/// Default minimum shorter side, in pixels, for a saved image. Search engines mix
+/// full-size originals with thumbnails and sprite-sized icons; 512 keeps anything
+/// worth curating and drops the rest.
+pub const DEFAULT_MIN_SIDE: u32 = 512;
+
 /// Per-run knobs threaded from the WS request: download pacing + the vision gate.
 #[derive(Clone, Default)]
 pub struct ScrapeTuning {
@@ -458,6 +463,10 @@ pub struct ScrapeTuning {
     /// Animus Sorter category (`Character`/`Object`/`Style`). `Some` ⇒ files are named
     /// `<NAME>_NNN_<Category>.ext`; `None` ⇒ legacy `<name>_NNN.ext`.
     pub category: Option<String>,
+    /// Reject any image whose *shorter* side is below this many pixels. `0` ⇒ off.
+    /// Measured from the downloaded bytes, so thumbnails an engine advertised as
+    /// full-size are caught too.
+    pub min_side: u32,
 }
 
 /// Resolved vision-gate settings (prompt already query-interpolated).
@@ -541,6 +550,7 @@ async fn vision_judge(bytes: &[u8], ext: &str, cfg: &VerifyConfig) -> (bool, Str
 /// Download images matching `query` into `dest_dir`, up to `count` files.
 /// Writes a session log to `{log_dir}\\bow_downloads.log`.
 /// Source selection lives in `tuning.sources` (`None`/empty → run all scrapers).
+#[allow(clippy::too_many_arguments)]
 pub async fn image_download(
     query: &str,
     count: usize,
@@ -706,7 +716,7 @@ pub async fn image_download(
 
         download_batch(
             &dl_client, new_candidates, count, &dest_base, &naming,
-            tuning.delay_ms, &verify_cfg, tuning.dedupe, &mut seen_hashes,
+            tuning.delay_ms, &verify_cfg, tuning.dedupe, tuning.min_side, &mut seen_hashes,
             &mut downloaded, &mut failures, &mut seq, &progress, &cancel,
             &url_sources, "web",
         ).await;
@@ -875,19 +885,53 @@ fn brave_page_url(encoded_query: &str, page: usize) -> String {
 }
 
 /// Parse original image URLs from a Bing images results page.
+///
+/// Bing carries each tile's original URL twice: in the tile's `m="{…}"` JSON blob
+/// (`murl`) and in the detail-page link's `mediaurl=` query param. Which of the two
+/// survives depends on the layout Bing happens to serve, and the JSON blob may or may
+/// not be HTML-entity encoded depending on whether the HTML came off the wire or out
+/// of the rendered DOM. So every pattern runs and the union is deduped — the old
+/// fallback chain stopped at the first pattern that matched *anything*, which returned
+/// a single stray URL once Bing's layout shifted.
 fn parse_bing(html: &str, max: usize) -> Vec<String> {
     let mut urls = Vec::new();
-    // Primary: HTML-entity encoded data-m attributes
+    // Entity-encoded tile JSON (server-rendered HTML, and re-serialized DOM).
     extract_between(html, "&quot;murl&quot;:&quot;", "&quot;", max, &mut urls);
-    // Fallback 1: plain JSON in script blocks / decoded DOM attributes
-    if urls.is_empty() {
-        extract_between(html, "\"murl\":\"", "\"", max, &mut urls);
+    // Plain tile JSON (script blocks / already-decoded attributes).
+    extract_between(html, "\"murl\":\"", "\"", max, &mut urls);
+    // Older layout.
+    extract_between(html, "data-imgurl=\"", "\"", max, &mut urls);
+    // Detail-page links. Several links per tile point at the same image, so pull
+    // generously and let the dedup below trim it back.
+    urls.extend(parse_bing_mediaurls(html, max * 4));
+
+    let mut seen = std::collections::HashSet::new();
+    urls.into_iter()
+        .filter(|u| u.starts_with("http"))
+        .filter(|u| seen.insert(u.clone()))
+        .take(max)
+        .collect()
+}
+
+/// Pull percent-encoded originals out of Bing's `…&mediaurl=<url>&…` detail links.
+/// Decoded here because `filter_candidates` only undoes HTML entities.
+fn parse_bing_mediaurls(html: &str, max: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while out.len() < max {
+        let Some(rel) = html[pos..].find("mediaurl=") else { break };
+        let start = pos + rel + "mediaurl=".len();
+        // The value is percent-encoded, so the first `&`, quote or `<` ends it.
+        let end = html[start..]
+            .find(['&', '"', '\'', '<', ' '])
+            .map(|e| start + e)
+            .unwrap_or(html.len());
+        if let Ok(decoded) = urlencoding::decode(&html[start..end]) {
+            out.push(decoded.into_owned());
+        }
+        pos = end.max(start + 1);
     }
-    // Fallback 2: data-imgurl attributes (older Bing layout)
-    if urls.is_empty() {
-        extract_between(html, "data-imgurl=\"", "\"", max, &mut urls);
-    }
-    urls
+    out
 }
 
 async fn scrape_duckduckgo_images(client: &reqwest::Client, query: &str, max: usize, page: usize) -> ScrapeResult {
@@ -1059,6 +1103,23 @@ type Phash = image_hasher::ImageHash<Box<[u8]>>;
 
 /// Perceptual-hash encoded image bytes off the async runtime (decode is CPU-heavy).
 /// Returns `None` on decode failure.
+/// Reject an image whose shorter side is under `min_side` px, returning the skip
+/// reason. `0` disables the check. Reads the header only — no full decode. An image
+/// whose dimensions can't be read is kept: `validate_image_bytes` already vouched for
+/// its magic bytes, so a format this build can't measure should never be dropped
+/// silently.
+fn small_image_skip(min_side: u32, bytes: &[u8]) -> Option<String> {
+    if min_side == 0 {
+        return None;
+    }
+    let (w, h) = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()?;
+    (w.min(h) < min_side).then(|| format!("too small ({}x{}, min {}px)", w, h, min_side))
+}
+
 async fn phash_async(bytes: &[u8]) -> Option<Phash> {
     let bytes = bytes.to_vec();
     tokio::task::spawn_blocking(move || crate::tools::image_curate::phash_bytes(&bytes))
@@ -1325,12 +1386,15 @@ pub struct DownloadOpts {
     pub delay_ms: u64,
     /// Vision-QA keep/discard gate; `None` ⇒ keep everything.
     pub verify: Option<VerifyConfig>,
+    /// Reject any image whose shorter side is below this many pixels. `0` ⇒ off.
+    pub min_side: u32,
 }
 
 /// Download a list of URLs into `dest_dir`, stopping once `count` succeed.
 /// Files are named `<name_hint>_NNN.ext` (name_hint is sanitized).
 /// Emits `Downloaded`/`Failed` events; logs results into `log`.
 /// Returns the sorted list of successfully downloaded file paths.
+#[allow(clippy::too_many_arguments)]
 pub async fn download_urls_to_dir(
     urls: Vec<String>,
     count: usize,
@@ -1341,7 +1405,7 @@ pub async fn download_urls_to_dir(
     progress: &Option<UnboundedSender<ScrapeEvent>>,
     cancel: CancelFlag,
 ) -> Result<Vec<String>> {
-    let DownloadOpts { delay_ms, verify } = opts;
+    let DownloadOpts { delay_ms, verify, min_side } = opts;
     let emit = |e: ScrapeEvent| { if let Some(tx) = progress { let _ = tx.send(e); } };
 
     emit(ScrapeEvent::Phase { label: "Downloading".into() });
@@ -1370,7 +1434,7 @@ pub async fn download_urls_to_dir(
 
     download_batch(
         &client, candidates, count, &dest_base, &naming,
-        delay_ms, &verify, false, &mut Vec::new(),
+        delay_ms, &verify, false, min_side, &mut Vec::new(),
         &mut downloaded, &mut failures, &mut seq, progress, &cancel,
         &std::collections::HashMap::new(), "page",
     ).await;
@@ -1396,6 +1460,7 @@ async fn download_batch(
     delay_ms: u64,
     verify: &Option<VerifyConfig>,
     dedupe: bool,
+    min_side: u32,
     seen_hashes: &mut Vec<Phash>,
     downloaded: &mut Vec<String>,
     failures: &mut Vec<(String, String)>,
@@ -1419,6 +1484,16 @@ async fn download_batch(
             if is_cancelled(cancel) { break; }
             match download_image_bytes(client, url).await {
                 Ok((bytes, ext)) => {
+                    // Size gate first: rejecting here saves a vision-model round trip.
+                    if let Some(small) = small_image_skip(min_side, &bytes) {
+                        debug!("SMALL {} — {}", url, small);
+                        failures.push((url.clone(), small.clone()));
+                        emit(ScrapeEvent::Failed { url: url.clone(), reason: small });
+                        if delay_ms > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        }
+                        continue;
+                    }
                     let (keep, reason) = match verify {
                         Some(cfg) => {
                             emit(ScrapeEvent::Verifying { url: url.clone(), done: downloaded.len(), target: target_total });
@@ -1487,13 +1562,16 @@ async fn download_batch(
             if is_cancelled(&cancel) { return None; }
             match download_image_bytes(&client, &url).await {
                 Ok((bytes, ext)) => {
+                    if let Some(small) = small_image_skip(min_side, &bytes) {
+                        return Some((false, url, String::new(), small));
+                    }
                     // Unique number per success; skip any number whose file already
                     // exists (resume into a non-empty bin never overwrites).
                     let mut n = seq_atomic.fetch_add(1, Ordering::SeqCst) + 1;
-                    let mut path = format!("{}\\{}", dest_base, naming.file_name(n, &ext));
+                    let mut path = format!("{}\\{}", dest_base, naming.file_name(n, ext));
                     while Path::new(&path).exists() {
                         n = seq_atomic.fetch_add(1, Ordering::SeqCst) + 1;
-                        path = format!("{}\\{}", dest_base, naming.file_name(n, &ext));
+                        path = format!("{}\\{}", dest_base, naming.file_name(n, ext));
                     }
                     match std::fs::write(&path, &bytes) {
                         Ok(_) => Some((true, url, path, String::new())),
@@ -1984,6 +2062,46 @@ mod tests {
                     &quot;murl&quot;:&quot;https://b.com/2.png&quot; z";
         let urls = parse_bing(html, 10);
         assert_eq!(urls, vec!["https://a.com/1.jpg", "https://b.com/2.png"]);
+    }
+
+    /// A layout where the tile JSON yields one stray hit and the real originals live
+    /// only in `mediaurl=` links — the case the old fallback chain returned 1 URL for.
+    #[test]
+    fn parse_bing_unions_murl_and_mediaurl() {
+        let html = "&quot;murl&quot;:&quot;https://a.com/1.jpg&quot;                     <a href=\"/images/search?view=detailV2&amp;mediaurl=https%3a%2f%2fb.com%2f2.png%3fv%3d9&amp;exph=800\">x</a>                    <a href=\"/images/search?mediaurl=https%3a%2f%2fc.com%2f3.jpg&amp;w=1\">y</a>";
+        let urls = parse_bing(html, 10);
+        assert_eq!(urls, vec![
+            "https://a.com/1.jpg",
+            "https://b.com/2.png?v=9",
+            "https://c.com/3.jpg",
+        ]);
+    }
+
+    /// The same original appears in several links per tile; the union must dedup.
+    #[test]
+    fn parse_bing_dedups_repeated_mediaurls() {
+        let link = "mediaurl=https%3a%2f%2fa.com%2f1.jpg&amp;";
+        let html = format!("{}{}{}", link, link, link);
+        assert_eq!(parse_bing(&html, 10), vec!["https://a.com/1.jpg"]);
+    }
+
+    #[test]
+    fn small_image_skip_gates_on_shorter_side() {
+        let png = |w, h| {
+            let mut buf = Vec::new();
+            image::RgbImage::new(w, h)
+                .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+                .unwrap();
+            buf
+        };
+        // Wide but short: the 200px side decides.
+        assert!(small_image_skip(512, &png(1200, 200)).is_some());
+        assert!(small_image_skip(512, &png(400, 400)).is_some());
+        assert!(small_image_skip(512, &png(1024, 768)).is_none());
+        assert!(small_image_skip(512, &png(512, 512)).is_none(), "the floor itself passes");
+        // 0 disables, and unreadable bytes are kept rather than silently dropped.
+        assert!(small_image_skip(0, &png(8, 8)).is_none());
+        assert!(small_image_skip(512, b"not an image").is_none());
     }
 
     #[test]

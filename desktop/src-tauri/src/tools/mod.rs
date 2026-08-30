@@ -330,7 +330,8 @@ pub fn tool_schemas() -> Vec<Value> {
                 "properties": {
                     "query": { "type": "string" },
                     "count": { "type": "integer" },
-                    "dest_dir": { "type": "string" }
+                    "dest_dir": { "type": "string" },
+                    "min_side": { "type": "integer", "description": "Skip images whose shorter side is under this many pixels. Default 512; 0 disables the check." }
                 },
                 "required": ["query", "dest_dir"]
             }
@@ -695,7 +696,13 @@ pub async fn dispatch(tool_name: &str, input: &Value, ctx: &ToolCtx<'_>) -> Resu
             let log_dir = format!("{}\\logs", workspace_root.trim_end_matches(['\\', '/']));
             let s = crate::tools::image_search::image_download(
                 query, count, dest_dir, &log_dir,
-                crate::tools::image_search::ScrapeTuning::default(), browser, None, None,
+                crate::tools::image_search::ScrapeTuning {
+                    min_side: input["min_side"].as_u64()
+                        .map(|v| (v as u32).min(8192))
+                        .unwrap_or(crate::tools::image_search::DEFAULT_MIN_SIDE),
+                    ..Default::default()
+                },
+                browser, None, None,
             ).await?;
             Ok(json!(s))
         }

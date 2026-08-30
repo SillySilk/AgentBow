@@ -102,7 +102,7 @@ interface Store {
    * (e.g. to grey out the Verify toggle when the loaded model has no vision). */
   engine: EngineStatus | null;
   connect: () => void;
-  startScrape: (a: { query: string; count: number; destDir: string; sources: string[]; delayMs: number; verify: boolean; visionPrompt: string; bin: number | null; dedupe: boolean; category: string | null }) => void;
+  startScrape: (a: { query: string; count: number; destDir: string; sources: string[]; delayMs: number; verify: boolean; visionPrompt: string; bin: number | null; dedupe: boolean; category: string | null; minSide: number }) => void;
   /** Cooperatively stop the in-flight scrape; already-downloaded images are kept. */
   stopScrape: () => void;
   setWorkingSlot: (dir: string) => void;
@@ -153,14 +153,14 @@ export const useStore = create<Store>((set, get) => ({
       set({ _ws: ws });
     }).catch(() => set({ status: "config unavailable" }));
   },
-  startScrape: (a: { query: string; count: number; destDir: string; sources: string[]; delayMs: number; verify: boolean; visionPrompt: string; bin: number | null; dedupe: boolean; category: string | null }) => {
+  startScrape: (a: { query: string; count: number; destDir: string; sources: string[]; delayMs: number; verify: boolean; visionPrompt: string; bin: number | null; dedupe: boolean; category: string | null; minSide: number }) => {
     const ws = get()._ws;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     set({ scrape: { ...initialScrapeState(), running: true, target: a.count }, lastDestDir: a.destDir });
     ws.send(JSON.stringify({
       type: "scrape_request", query: a.query, count: a.count, dest_dir: a.destDir, sources: a.sources,
       delay_ms: a.delayMs, verify: a.verify, vision_prompt: a.visionPrompt.trim() || null,
-      bin: a.bin, dedupe: a.dedupe, category: a.category,
+      bin: a.bin, dedupe: a.dedupe, category: a.category, min_side: a.minSide,
     }));
   },
   stopScrape: () => {

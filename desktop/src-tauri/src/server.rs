@@ -41,6 +41,8 @@ enum InboundMsg {
         #[serde(default = "default_true")] dedupe: bool,
         /// Animus Sorter category (`Character`/`Object`/`Style`). `None` ⇒ legacy naming.
         #[serde(default)] category: Option<String>,
+        /// Reject images whose shorter side is under this many pixels. 0 ⇒ off.
+        #[serde(default = "default_min_side")] min_side: u32,
     },
     BrowserOpen { url: String },
     PageScrapeRequest { count: u32, dest_dir: String, #[serde(default)] scrolls: u32 },
@@ -73,6 +75,10 @@ enum InboundMsg {
 
 /// serde default for the dedup flag (on unless the client explicitly disables it).
 fn default_true() -> bool { true }
+
+/// serde default for the minimum-shorter-side gate. Matches the UI default so an
+/// older client that omits the field still gets thumbnails filtered out.
+fn default_min_side() -> u32 { crate::tools::image_search::DEFAULT_MIN_SIDE }
 
 /// Classify a raw inbound WS text frame before full deserialization.
 /// Returns None for control frames the loop should skip (e.g. ping).
@@ -245,7 +251,7 @@ pub async fn run_ws(
                         scrape_cancel.store(true, Ordering::Relaxed);
                     }
 
-                    InboundMsg::ScrapeRequest { query, count, dest_dir, sources, delay_ms, verify, vision_prompt, bin, dedupe, category } => {
+                    InboundMsg::ScrapeRequest { query, count, dest_dir, sources, delay_ms, verify, vision_prompt, bin, dedupe, category, min_side } => {
                         if !authenticated {
                             send_json(&out_tx, json!({"type":"error","code":"unauthenticated","message":"Must authenticate first"})).await;
                             continue;
@@ -302,6 +308,9 @@ pub async fn run_ws(
                             dedupe,
                             sources,
                             category,
+                            // Guard against a client asking for something no image
+                            // can satisfy; 0 stays "off".
+                            min_side: min_side.min(8192),
                         };
                         let out_tx = out_tx.clone();
                         let cb = controlled_browser.clone();
@@ -399,7 +408,7 @@ pub async fn run_ws(
                             let mut log = crate::tools::image_search::SessionLog::new(&log_dir, "page_scrape");
                             let result = crate::tools::image_search::download_urls_to_dir(
                                 urls, count, &dest, "page",
-                                crate::tools::image_search::DownloadOpts::default(),
+                                crate::tools::image_search::DownloadOpts { min_side: default_min_side(), ..Default::default() },
                                 &mut log, &Some(tx.clone()), Some(cancel),
                             ).await;
                             let log_note = log.flush();
@@ -524,7 +533,8 @@ pub async fn run_ws(
 
                             let mut log = crate::tools::image_search::SessionLog::new(&log_dir, "case_run");
                             let result = crate::tools::image_search::download_urls_to_dir(
-                                urls, count, &dest, "case", crate::tools::image_search::DownloadOpts::default(),
+                                urls, count, &dest, "case",
+                                crate::tools::image_search::DownloadOpts { min_side: default_min_side(), ..Default::default() },
                                 &mut log, &Some(tx.clone()), Some(cancel),
                             ).await;
                             let log_note = log.flush();

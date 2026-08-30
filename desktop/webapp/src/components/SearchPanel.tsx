@@ -10,10 +10,14 @@ const ALL_SOURCES = [
   { key: "ddg", label: "DuckDuckGo" },
   { key: "bing", label: "Bing" },
 ];
-// Default to Yandex only: its safe-search-off cookie is confirmed working (uncensored
-// results), and since downloads fill from the first engine's candidates, a single
-// uncensored source guarantees uncensored downloads. Toggle the others on as needed.
-const DEFAULT_ENABLED = ["yandex"];
+// All four informants on by default. Yandex still leads the queue (its safe-search-off
+// cookie is confirmed working, so the first candidates through are uncensored) and the
+// rest widen the pool behind it. Toggle any off as needed.
+const DEFAULT_ENABLED = ALL_SOURCES.map((s) => s.key);
+
+// Minimum shorter side, in px, for a downloaded image — keeps thumbnails and icons out
+// of the vault. Mirrors the backend default; 0 turns the check off.
+const DEFAULT_MIN_SIDE = 512;
 
 const DEFAULT_PROMPT_HINT =
   "Leave blank to use the default: judges relevance to the subject, technical quality, and rejects watermarks/collages/text overlays.";
@@ -36,6 +40,7 @@ export default function SearchPanel() {
   const [useBin, setUseBin] = useState(false);
   const [bin, setBin] = useState(1);
   const [dedupe, setDedupe] = useState(true);
+  const [minSide, setMinSide] = useState(DEFAULT_MIN_SIDE);
   const [category, setCategory] = useState("");   // "" = Off (legacy naming)
 
   const disabled = running || status !== "connected" || !query.trim() || !destDir.trim() || enabled.size === 0;
@@ -73,11 +78,16 @@ export default function SearchPanel() {
         style={{ width: "100%", margin: "5px 0 14px" }}
       />
 
-      <div style={{ display: "grid", gridTemplateColumns: "96px 1fr", gap: 12, marginBottom: 14 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "96px 104px 1fr", gap: 12, marginBottom: 14 }}>
         <div>
           <label className="forge-label">Haul size</label>
           <input type="number" min={1} max={200} className="forge-input" style={{ width: "100%", marginTop: 5 }}
             value={count} onChange={(e) => setCount(Math.max(1, Math.min(200, Number(e.target.value) || 1)))} />
+        </div>
+        <div title="Skip any image whose shorter side is under this. 0 = keep everything.">
+          <label className="forge-label">Min size (px)</label>
+          <input type="number" min={0} max={4096} step={64} className="forge-input" style={{ width: "100%", marginTop: 5 }}
+            value={minSide} onChange={(e) => setMinSide(Math.max(0, Math.min(4096, Number(e.target.value) || 0)))} />
         </div>
         <div>
           <label className="forge-label">The vault (drop point)</label>
@@ -150,7 +160,7 @@ export default function SearchPanel() {
           <Button
             variant="forge" size="lg" block
             disabled={disabled}
-            onClick={() => startScrape({ query, count, destDir, sources: [...enabled], delayMs, verify, visionPrompt, bin: useBin ? bin : null, dedupe, category: category || null })}
+            onClick={() => startScrape({ query, count, destDir, sources: [...enabled], delayMs, verify, visionPrompt, bin: useBin ? bin : null, dedupe, category: category || null, minSide })}
           >
             ▾ STOKE THE FORGE — RUN THE HAUL
           </Button>
