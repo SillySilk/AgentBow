@@ -431,6 +431,24 @@ fn source_enabled(sources: &Option<Vec<String>>, key: &str) -> bool {
     }
 }
 
+/// Round-robin several per-source candidate lists into one queue: first candidate from
+/// every source, then the second from every source, and so on. Downloading stops as
+/// soon as the target count is met, so this is what keeps every engine represented in
+/// the saved set instead of only whichever one happened to be listed first.
+/// Length is preserved; short lists simply drop out of later rounds.
+fn interleave(lists: Vec<Vec<String>>) -> Vec<String> {
+    let longest = lists.iter().map(Vec::len).max().unwrap_or(0);
+    let mut out = Vec::with_capacity(lists.iter().map(Vec::len).sum());
+    for i in 0..longest {
+        for list in &lists {
+            if let Some(u) = list.get(i) {
+                out.push(u.clone());
+            }
+        }
+    }
+    out
+}
+
 // ── Pacing + vision-QA ──────────────────────────────────────────────────────────
 
 /// Default minimum shorter side, in pixels, for a saved image. Search engines mix
@@ -585,24 +603,38 @@ pub async fn image_download(
     let per_page_max = (count * 4).max(50);
     let encoded = urlencoding::encode(query);
 
-    // (key, display, page-url builder, parser, pre-nav cookies). Yandex first: its
-    // safe-search-off is confirmed working, so leading with it puts uncensored
-    // candidates at the front of the download queue. DDG (HTTP) runs last.
+    // (key, display, page-url builder, parser, pre-nav cookies). `key` also names the
+    // browser tab the engine drives, so the three browser engines scrape concurrently
+    // in their own tabs. DDG needs no browser (plain HTTP) and runs alongside them.
     type EngineRow = (
         &'static str,
         &'static str,
-        fn(&str, usize) -> String,
+        fn(&str, usize, bool) -> String,
         fn(&str, usize) -> Vec<String>,
         &'static [(&'static str, &'static str, &'static str)],
     );
     let browser_engines: &[EngineRow] = &[
         ("yandex", "Yandex", yandex_page_url, parse_yandex,
          &[("safesearch", "0", ".yandex.com"), ("yp", "1999999999.sp.ssp%3D0", ".yandex.com")]),
+        // `BCP=AD=0&AL=0&SM=0` is the second half of Bing's adult-filter state; the
+        // ADLT flag in SRCHHPGUSR alone is honoured inconsistently without it.
         ("bing", "Bing", bing_page_url, parse_bing,
-         &[("SRCHHPGUSR", "SRCHLANG=en&ADLT=OFF&NNT=10&NRSLT=50", ".bing.com"), ("adlt", "off", ".bing.com")]),
+         &[("SRCHHPGUSR", "SRCHLANG=en&ADLT=OFF&NNT=10&NRSLT=50", ".bing.com"),
+           ("BCP", "AD=0&AL=0&SM=0", ".bing.com"),
+           ("adlt", "off", ".bing.com")]),
         ("brave", "Brave", brave_page_url, parse_brave,
          &[("safesearch", "off", ".search.brave.com")]),
     ];
+
+    // Ask the engines themselves for large images only whenever the run has a
+    // minimum-size gate, so small results never even enter the candidate pool.
+    let large_only = tuning.min_side > 0;
+    if large_only {
+        log.push(format!(
+            "Large-images-only requested from Yandex/Bing/DDG (min side {}px)",
+            tuning.min_side
+        ));
+    }
 
     // Resolve the vision gate once (independent of paging). The gate only runs
     // when the loaded model actually has vision — no auto-detect, no fallback.
@@ -670,35 +702,47 @@ pub async fn image_download(
             break;
         }
 
-        // Scrape this page from every enabled source.
-        let mut results: Vec<ScrapeResult> = Vec::new();
+        // Scrape this page from every enabled source, all at once: each browser engine
+        // in its own tab, DDG over plain HTTP. `join_all` preserves the table order in
+        // the results, so logging stays deterministic.
         let fetch = BrowserFetch { browser, log_dir, progress: &progress };
+        type ScrapeJob<'a> =
+            std::pin::Pin<Box<dyn std::future::Future<Output = ScrapeResult> + Send + 'a>>;
+        let mut jobs: Vec<ScrapeJob<'_>> = Vec::new();
         for (key, name, page_url, parse, cookies) in browser_engines {
             if source_enabled(&sources, key) {
-                let url = page_url(&encoded, page);
-                results.push(
-                    scrape_via_browser(&fetch, name, &url, per_page_max, *parse, cookies).await,
-                );
+                let url = page_url(&encoded, page, large_only);
+                jobs.push(Box::pin(scrape_via_browser(
+                    &fetch, key, name, url, per_page_max, *parse, cookies,
+                )));
             }
         }
         if source_enabled(&sources, "ddg") {
-            results.push(scrape_duckduckgo_images(&client, query, per_page_max, page).await);
+            jobs.push(Box::pin(scrape_duckduckgo_images(
+                &client, query, per_page_max, page, large_only,
+            )));
         }
+        let results: Vec<ScrapeResult> = futures_util::future::join_all(jobs).await;
 
         // Decode/paywall-filter each source's URLs *per source* so every candidate keeps
         // an attribution to the scraper it came from (for the per-source download tally),
-        // then keep only candidates not already seen on an earlier page.
+        // then interleave the per-source lists. Concatenating them (the old behaviour)
+        // meant the first engine's results filled the whole target count and the later
+        // engines' candidates were collected but never downloaded.
         let mut raw_n = 0usize;
-        let mut decoded_all: Vec<String> = Vec::new();
+        let mut per_source: Vec<Vec<String>> = Vec::new();
         for r in &results {
             log.push(format!("p{} {}", page, r.log_line()));
             emit(ScrapeEvent::Source { source: r.source.to_string(), count: r.urls.len(), error: r.error.clone() });
             raw_n += r.urls.len();
+            let mut mine = Vec::new();
             for u in filter_candidates(r.urls.clone()) {
                 url_sources.entry(u.clone()).or_insert_with(|| r.source.to_string());
-                decoded_all.push(u);
+                mine.push(u);
             }
+            per_source.push(mine);
         }
+        let decoded_all = interleave(per_source);
         let filtered = raw_n.saturating_sub(decoded_all.len());
         let new_candidates: Vec<String> =
             decoded_all.into_iter().filter(|u| seen.insert(u.clone())).collect();
@@ -786,16 +830,17 @@ struct BrowserFetch<'a> {
 /// and wait for them to solve it before extracting.
 async fn scrape_via_browser(
     fetch: &BrowserFetch<'_>,
+    tab: &'static str,
     source: &'static str,
-    url: &str,
+    url: String,
     max: usize,
     parse: fn(&str, usize) -> Vec<String>,
-    cookies: &[(&str, &str, &str)],
+    cookies: &'static [(&'static str, &'static str, &'static str)],
 ) -> ScrapeResult {
     let BrowserFetch { browser, log_dir, progress } = *fetch;
     let emit = |e: ScrapeEvent| { if let Some(tx) = progress { let _ = tx.send(e); } };
 
-    let html = match browser.scrape_search_page(url, 3, cookies).await {
+    let html = match browser.scrape_search_page_in(tab, &url, 3, cookies).await {
         Ok(h) => h,
         Err(e) => return ScrapeResult::err(source, format!("browser: {}", e)),
     };
@@ -816,7 +861,7 @@ async fn scrape_via_browser(
         emit(ScrapeEvent::Phase {
             label: format!("Solve the captcha for {} in the browser window — then it continues…", source),
         });
-        match wait_for_captcha_clear(browser, std::time::Duration::from_secs(120)).await {
+        match wait_for_captcha_clear(browser, tab, std::time::Duration::from_secs(120)).await {
             Some(h) => {
                 let urls = parse(&h, max);
                 if urls.is_empty() { dump_debug_html(log_dir, source, &h); }
@@ -839,16 +884,18 @@ fn dump_debug_html(log_dir: &str, source: &str, html: &str) {
     let _ = std::fs::write(&path, html);
 }
 
-/// Poll the current page until it's no longer a captcha challenge, or `timeout`
-/// elapses. Returns the cleared HTML on success.
+/// Poll tab `tab` until it's no longer a captcha challenge, or `timeout` elapses.
+/// Returns the cleared HTML on success. Scoped to the engine's own tab so one
+/// engine's challenge doesn't read another engine's page.
 async fn wait_for_captcha_clear(
     browser: &crate::tools::controlled_browser::ControlledBrowser,
+    tab: &str,
     timeout: std::time::Duration,
 ) -> Option<String> {
     let start = std::time::Instant::now();
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        let html = browser.raw_html().await.ok()?;
+        let html = browser.raw_html_in(tab).await.ok()?;
         if !is_captcha_page(&html) {
             return Some(html);
         }
@@ -862,22 +909,33 @@ async fn wait_for_captcha_clear(
 // `page` is 0-indexed. Each builder maps it to that engine's pagination param so the
 // scraper can keep pulling fresh results until the success target is met.
 
-fn yandex_page_url(encoded_query: &str, page: usize) -> String {
+// `large_only` asks the engine itself to return only large images. It's driven by the
+// run's `min_side` gate: filtering server-side means the small results never enter the
+// candidate pool at all, instead of being downloaded and then thrown away. Brave's web
+// UI exposes no size parameter, so there it stays a download-time gate only.
+
+fn yandex_page_url(encoded_query: &str, page: usize, large_only: bool) -> String {
     format!(
-        "https://yandex.com/images/search?text={}&nomisspell=1&numdoc=50&filter=0&itype=photo&p={}",
-        encoded_query, page
+        "https://yandex.com/images/search?text={}&nomisspell=1&numdoc=50&filter=0&itype=photo{}&p={}",
+        encoded_query,
+        if large_only { "&isize=large" } else { "" },
+        page
     )
 }
 
-fn bing_page_url(encoded_query: &str, page: usize) -> String {
+fn bing_page_url(encoded_query: &str, page: usize, large_only: bool) -> String {
     // Bing's `first` is a 1-indexed result offset; 50 results per page.
+    // `qft=+filterui:imagesize-large` is the results-page size filter (the `+` must
+    // stay percent-encoded); `FORM=IRFLTR` marks the request as a filter refinement.
     format!(
-        "https://www.bing.com/images/search?q={}&count=50&first={}&safeSearch=Off&adlt=off&mkt=en-US",
-        encoded_query, page * 50 + 1
+        "https://www.bing.com/images/search?q={}&count=50&first={}&safeSearch=Off&adlt=off&mkt=en-US{}",
+        encoded_query,
+        page * 50 + 1,
+        if large_only { "&qft=%2Bfilterui%3Aimagesize-large&FORM=IRFLTR" } else { "" }
     )
 }
 
-fn brave_page_url(encoded_query: &str, page: usize) -> String {
+fn brave_page_url(encoded_query: &str, page: usize, _large_only: bool) -> String {
     format!(
         "https://search.brave.com/images?q={}&safesearch=off&source=web&offset={}",
         encoded_query, page
@@ -934,7 +992,20 @@ fn parse_bing_mediaurls(html: &str, max: usize) -> Vec<String> {
     out
 }
 
-async fn scrape_duckduckgo_images(client: &reqwest::Client, query: &str, max: usize, page: usize) -> ScrapeResult {
+/// DuckDuckGo's `i.js` filter string: six comma-separated slots, in order
+/// `time,size,color,type,layout,license`. Empty means "no filter" for that slot, so
+/// large-only is `,size:Large,,,,`.
+fn ddg_filter_string(large_only: bool) -> &'static str {
+    if large_only { ",size:Large,,,," } else { ",,,,," }
+}
+
+async fn scrape_duckduckgo_images(
+    client: &reqwest::Client,
+    query: &str,
+    max: usize,
+    page: usize,
+    large_only: bool,
+) -> ScrapeResult {
     let encoded = urlencoding::encode(query);
     let offset = page * 100; // DDG's i.js `s` param pages ~100 results at a time
 
@@ -975,8 +1046,8 @@ async fn scrape_duckduckgo_images(client: &reqwest::Client, query: &str, max: us
     };
 
     let api_url = format!(
-        "https://duckduckgo.com/i.js?q={}&vqd={}&o=json&l=us-en&s={}&f=,,,,,&p=-2",
-        encoded, vqd, offset
+        "https://duckduckgo.com/i.js?q={}&vqd={}&o=json&l=us-en&s={}&f={}&p=-2",
+        encoded, vqd, offset, ddg_filter_string(large_only)
     );
     info!("DDG vqd={}", vqd);
     let resp = match client.get(&api_url)
@@ -2045,15 +2116,41 @@ mod tests {
     #[test]
     fn page_urls_advance_per_engine_offsets() {
         // Yandex: 0-indexed page param.
-        assert!(yandex_page_url("cats", 0).contains("&p=0"));
-        assert!(yandex_page_url("cats", 3).contains("&p=3"));
+        assert!(yandex_page_url("cats", 0, false).contains("&p=0"));
+        assert!(yandex_page_url("cats", 3, false).contains("&p=3"));
         // Bing: 1-indexed result offset, 50 per page.
-        assert!(bing_page_url("cats", 0).contains("first=1"));
-        assert!(bing_page_url("cats", 1).contains("first=51"));
-        assert!(bing_page_url("cats", 2).contains("first=101"));
+        assert!(bing_page_url("cats", 0, false).contains("first=1"));
+        assert!(bing_page_url("cats", 1, false).contains("first=51"));
+        assert!(bing_page_url("cats", 2, false).contains("first=101"));
         // Brave: offset param echoes the page index.
-        assert!(brave_page_url("cats", 0).contains("offset=0"));
-        assert!(brave_page_url("cats", 4).contains("offset=4"));
+        assert!(brave_page_url("cats", 0, false).contains("offset=0"));
+        assert!(brave_page_url("cats", 4, false).contains("offset=4"));
+    }
+
+    #[test]
+    fn large_only_adds_each_engines_size_filter() {
+        assert!(yandex_page_url("cats", 0, true).contains("&isize=large"));
+        assert!(!yandex_page_url("cats", 0, false).contains("isize"));
+        // The `+` in `+filterui:...` must reach Bing percent-encoded, not as a space.
+        assert!(bing_page_url("cats", 0, true).contains("qft=%2Bfilterui%3Aimagesize-large"));
+        assert!(!bing_page_url("cats", 0, false).contains("qft"));
+        // Brave's web UI has no size parameter — the URL is unchanged either way.
+        assert_eq!(brave_page_url("cats", 0, true), brave_page_url("cats", 0, false));
+        // DDG's i.js filter slots are time,size,color,type,layout,license.
+        assert_eq!(ddg_filter_string(true), ",size:Large,,,,");
+        assert_eq!(ddg_filter_string(false), ",,,,,");
+    }
+
+    #[test]
+    fn interleave_round_robins_and_keeps_everything() {
+        let out = interleave(vec![
+            vec!["y1".into(), "y2".into(), "y3".into()],
+            vec!["b1".into()],
+            vec!["r1".into(), "r2".into()],
+        ]);
+        assert_eq!(out, vec!["y1", "b1", "r1", "y2", "r2", "y3"]);
+        assert!(interleave(vec![]).is_empty());
+        assert!(interleave(vec![vec![], vec![]]).is_empty());
     }
 
     #[test]

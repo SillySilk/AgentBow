@@ -119,11 +119,14 @@ pub fn resolve_candidate_urls(raw: Vec<RawCandidate>, base: &str) -> Vec<Candida
 }
 
 struct BrowserState {
-    // Held alive to keep the browser process running; methods are only needed
-    // during launch (ensure_launched) where it is used directly before storage.
-    #[allow(dead_code)]
+    // Held alive to keep the browser process running, and used by `named_page` to
+    // open additional tabs after launch.
     browser: Browser,
     page: Page,
+    /// Extra tabs keyed by caller-chosen name (one per scraper engine), so several
+    /// scrapers can drive their own page at the same time instead of queueing on
+    /// the single primary tab.
+    tabs: std::collections::HashMap<String, Page>,
     _handler: tokio::task::JoinHandle<()>,
 }
 
@@ -160,7 +163,14 @@ impl ControlledBrowser {
 
         let mut builder = BrowserConfig::builder()
             .chrome_executable(exe)
-            .user_data_dir(self.profile_dir.clone());
+            .user_data_dir(self.profile_dir.clone())
+            // Scraper tabs run in the background while only one is foregrounded.
+            // Without these, Chrome throttles background renderers and timers, so
+            // lazy-loaded result tiles never render and a parallel scrape returns
+            // far fewer URLs from every tab but the visible one.
+            .arg("--disable-background-timer-throttling")
+            .arg("--disable-backgrounding-occluded-windows")
+            .arg("--disable-renderer-backgrounding");
         if !headless {
             builder = builder.with_head();
         }
@@ -179,9 +189,38 @@ impl ControlledBrowser {
         *guard = Some(BrowserState {
             browser,
             page,
+            tabs: std::collections::HashMap::new(),
             _handler: handler_task,
         });
         Ok(())
+    }
+
+    /// Get-or-create the tab named `key`. Each name owns its own Chrome tab, so two
+    /// callers with different names can navigate and scrape concurrently — the lock
+    /// is only held long enough to look the tab up (or open it the first time).
+    ///
+    /// A tab the user closed manually is detected here and reopened, so a stray
+    /// close can't wedge that engine for the rest of the session.
+    async fn named_page(&self, key: &str) -> Result<Page> {
+        self.ensure_launched(false).await?;
+        let mut guard = self.inner.lock().await;
+        let st = guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("Browser not launched — call browser_open first"))?;
+        if let Some(existing) = st.tabs.get(key) {
+            // Cheap liveness probe: a closed tab's target is gone and this errors.
+            if existing.url().await.is_ok() {
+                return Ok(existing.clone());
+            }
+            st.tabs.remove(key);
+        }
+        let page = st
+            .browser
+            .new_page("about:blank")
+            .await
+            .map_err(|e| anyhow!("new_page({}): {}", key, e))?;
+        st.tabs.insert(key.to_string(), page.clone());
+        Ok(page)
     }
 
     /// Internal: run a closure with the current page, erroring if not launched.
@@ -223,56 +262,50 @@ impl ControlledBrowser {
     /// already holds a cookie with that name (e.g. Bing rewrote `SRCHHPGUSR` after the
     /// user signed in and set their own preferences), the existing cookie wins —
     /// clobbering it would silently undo a logged-in account's SafeSearch setting.
-    pub async fn scrape_search_page(
+    /// `tab` names the tab to drive; each engine passes its own name so the scrapes
+    /// run side by side rather than queueing on one page.
+    pub async fn scrape_search_page_in(
         &self,
+        tab: &str,
         url: &str,
         scrolls: u32,
         cookies: &[(&str, &str, &str)],
     ) -> Result<String> {
-        self.ensure_launched(false).await?;
+        let page = self.named_page(tab).await?;
         let u = url.to_string();
-        let owned_cookies: Vec<(String, String, String)> = cookies
-            .iter()
-            .map(|(n, v, d)| (n.to_string(), v.to_string(), d.to_string()))
-            .collect();
-        self.with_page(|page| async move {
-            // Seed safe-search-off cookies before the page loads, skipping any the
-            // profile already has (a logged-in session's own prefs take precedence).
-            let existing: std::collections::HashSet<String> = page
-                .execute(GetCookiesParams { urls: Some(vec![u.clone()]) })
-                .await
-                .map(|r| r.result.cookies.iter().map(|c| c.name.clone()).collect())
-                .unwrap_or_default();
-            for (n, v, d) in &owned_cookies {
-                if existing.contains(n) {
-                    continue;
-                }
-                if let Ok(cp) = serde_json::from_value::<CookieParam>(
-                    json!({ "name": n, "value": v, "domain": d, "path": "/" }),
-                ) {
-                    let _ = page.set_cookie(cp).await;
-                }
+        // Seed safe-search-off cookies before the page loads, skipping any the
+        // profile already has (a logged-in session's own prefs take precedence).
+        let existing: std::collections::HashSet<String> = page
+            .execute(GetCookiesParams { urls: Some(vec![u.clone()]) })
+            .await
+            .map(|r| r.result.cookies.iter().map(|c| c.name.clone()).collect())
+            .unwrap_or_default();
+        for (n, v, d) in cookies {
+            if existing.contains(*n) {
+                continue;
             }
-            page.goto(&u).await.map_err(|e| anyhow!("goto: {}", e))?;
-            page.wait_for_navigation().await.ok();
-            // Let the initial result tiles render.
-            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-            for _ in 0..scrolls {
-                let _ = page.evaluate("window.scrollTo(0,document.body.scrollHeight)").await;
-                tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+            if let Ok(cp) = serde_json::from_value::<CookieParam>(
+                json!({ "name": n, "value": v, "domain": d, "path": "/" }),
+            ) {
+                let _ = page.set_cookie(cp).await;
             }
-            page.content().await.map_err(|e| anyhow!("content: {}", e))
-        })
-        .await
+        }
+        page.goto(&u).await.map_err(|e| anyhow!("goto: {}", e))?;
+        page.wait_for_navigation().await.ok();
+        // Let the initial result tiles render.
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        for _ in 0..scrolls {
+            let _ = page.evaluate("window.scrollTo(0,document.body.scrollHeight)").await;
+            tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+        }
+        page.content().await.map_err(|e| anyhow!("content: {}", e))
     }
 
-    /// Return the current page's raw HTML without navigating (used to poll while the
-    /// user solves a captcha).
-    pub async fn raw_html(&self) -> Result<String> {
-        self.with_page(|page| async move {
-            page.content().await.map_err(|e| anyhow!("content: {}", e))
-        })
-        .await
+    /// Return tab `tab`'s raw HTML without navigating (used to poll while the user
+    /// solves a captcha in that engine's tab).
+    pub async fn raw_html_in(&self, tab: &str) -> Result<String> {
+        let page = self.named_page(tab).await?;
+        page.content().await.map_err(|e| anyhow!("content: {}", e))
     }
 
     /// Return the current page's `{ url, title }`.
