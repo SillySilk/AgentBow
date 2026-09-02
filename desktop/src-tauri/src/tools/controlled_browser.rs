@@ -76,6 +76,45 @@ use url::Url;
 
 use crate::tools::recipe::Candidate;
 
+/// Run one browser step with a hard deadline, naming the step in the error.
+///
+/// chromiumoxide's `wait_for_navigation` has no timeout of its own: it resolves only
+/// when the main frame reports a `load` lifecycle event, and when that event is missed
+/// (upstream issue #52) it never resolves. Three scrapes in a row froze this way with
+/// the pages fully loaded in Edge. Every wait the scraper depends on goes through here
+/// so a silent hang becomes an error the caller can log and move past.
+/// Longest we wait for a navigated page to report `load`. Real pages finish in
+/// 1-2 s; the hung scrapes all had `document.readyState == "complete"` while the
+/// library still waited, so past this point the page is read as-is.
+const NAV_LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Wait for `page` to finish loading, never longer than `NAV_LOAD_TIMEOUT`. A missed
+/// load event is not fatal: the caller reads whatever the page holds, exactly as it
+/// did before, minus the possibility of waiting forever.
+async fn await_load(page: &Page) {
+    let waited = with_deadline("page load", NAV_LOAD_TIMEOUT, async {
+        page.wait_for_navigation()
+            .await
+            .map(|_| ())
+            .map_err(|e| anyhow!("wait_for_navigation: {}", e))
+    })
+    .await;
+    if let Err(e) = waited {
+        tracing::warn!("{} — reading the page as-is", e);
+    }
+}
+
+pub(crate) async fn with_deadline<T>(
+    step: &str,
+    limit: std::time::Duration,
+    fut: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout(limit, fut).await {
+        Ok(r) => r,
+        Err(_) => Err(anyhow!("{} timed out after {:.0?}", step, limit)),
+    }
+}
+
 /// Raw shape the page-extraction JS returns (URLs not yet absolutized).
 #[derive(serde::Deserialize)]
 pub struct RawCandidate {
@@ -244,7 +283,7 @@ impl ControlledBrowser {
         let u = url.to_string();
         self.with_page(|page| async move {
             page.goto(&u).await.map_err(|e| anyhow!("goto: {}", e))?;
-            page.wait_for_navigation().await.ok();
+            await_load(&page).await;
             let final_url = page.url().await.ok().flatten().unwrap_or(u);
             Ok(json!(format!("Navigated to {}", final_url)))
         })
@@ -291,7 +330,7 @@ impl ControlledBrowser {
             }
         }
         page.goto(&u).await.map_err(|e| anyhow!("goto: {}", e))?;
-        page.wait_for_navigation().await.ok();
+        await_load(&page).await;
         // Let the initial result tiles render.
         tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
         for _ in 0..scrolls {
@@ -539,7 +578,7 @@ impl ControlledBrowser {
             page.evaluate("history.back()")
                 .await
                 .map_err(|e| anyhow!("back: {}", e))?;
-            page.wait_for_navigation().await.ok();
+            await_load(&page).await;
             let url = page.url().await.ok().flatten().unwrap_or_default();
             let title = page.get_title().await.ok().flatten().unwrap_or_default();
             Ok(json!({ "url": url, "title": title }))
@@ -553,7 +592,7 @@ impl ControlledBrowser {
             page.evaluate("history.forward()")
                 .await
                 .map_err(|e| anyhow!("forward: {}", e))?;
-            page.wait_for_navigation().await.ok();
+            await_load(&page).await;
             let url = page.url().await.ok().flatten().unwrap_or_default();
             let title = page.get_title().await.ok().flatten().unwrap_or_default();
             Ok(json!({ "url": url, "title": title }))
@@ -716,6 +755,27 @@ pub fn normalize_image_urls(raw: Vec<String>, base: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn with_deadline_passes_through_a_result_that_arrives_in_time() {
+        let v = with_deadline("quick step", std::time::Duration::from_secs(5), async { Ok(7) })
+            .await
+            .expect("finished well inside the deadline");
+        assert_eq!(v, 7);
+    }
+
+    #[tokio::test]
+    async fn with_deadline_errors_instead_of_hanging_on_a_stuck_future() {
+        // chromiumoxide's wait_for_navigation can never resolve (upstream #52); the
+        // scraper must get an error back, not block forever.
+        let stuck = std::future::pending::<Result<()>>();
+        let err = with_deadline("page load", std::time::Duration::from_millis(30), stuck)
+            .await
+            .expect_err("a future that never resolves must time out");
+        let msg = err.to_string();
+        assert!(msg.contains("page load"), "names the step: {msg}");
+        assert!(msg.contains("timed out"), "says it timed out: {msg}");
+    }
     #[test]
     fn chrome_executable_honors_env_override() {
         // Point CHROME_PATH at a file we know exists (this test binary itself).
@@ -791,6 +851,75 @@ mod tests {
         assert!(out.contains(&"https://cdn.e.com/image/12345".to_string()));
         assert!(out.contains(&"https://e.com/a.jpg".to_string()));
         assert!(!out.iter().any(|u| u.ends_with("page.html")));
+    }
+
+    /// Plain CDP `Runtime.evaluate`, bypassing chromiumoxide's `evaluate` wrapper — that
+    /// wrapper waits on the same navigation bookkeeping this test deliberately wedges.
+    async fn raw_eval(page: &Page, js: &str) -> Option<serde_json::Value> {
+        let params = chromiumoxide::cdp::js_protocol::runtime::EvaluateParams::builder()
+            .expression(js)
+            .return_by_value(true)
+            .build()
+            .ok()?;
+        page.execute(params).await.ok()?.result.result.value.clone()
+    }
+
+    /// The freeze that ended three scrapes at 37/100, 73/100 and 0/100: Edge showed the
+    /// results page fully loaded, yet chromiumoxide's load wait never returned. Recreate
+    /// that state: load a page completely, then start a navigation that never commits
+    /// (`/slow` is held open by the server and never answered). Chrome reports
+    /// `frameStartedLoading`, the library clears its "loaded" flag, and no new document
+    /// ever arrives to set it again — while the loaded page stays on screen. Once wedged
+    /// the library stalls every CDP command too, so the pending navigation is confirmed
+    /// from the server's side. `await_load` must come back anyway.
+    #[tokio::test]
+    #[ignore = "requires a real Chrome install; run manually with --ignored"]
+    async fn await_load_returns_when_chromiumoxide_never_sees_load() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let slow_hits = Arc::new(AtomicUsize::new(0));
+        let hits = slow_hits.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                if req.starts_with("GET /page") {
+                    let body = "<p>loaded</p>";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(), body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                } else if req.starts_with("GET /slow") {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    held.push(sock); // hold the request open, never reply
+                }
+            }
+        });
+        let dir = std::env::temp_dir().join("bow_cb_stuck_load");
+        let cb = ControlledBrowser::new(dir);
+        cb.ensure_launched(true).await.expect("launch");
+        cb.navigate(&format!("http://127.0.0.1:{port}/page")).await.expect("a page that loads");
+        let page = cb.inner.lock().await.as_ref().expect("launched").page.clone();
+        assert_eq!(raw_eval(&page, "document.readyState").await, Some("complete".into()));
+
+        raw_eval(&page, "setTimeout(() => location.assign('/slow'), 0); 'started'").await;
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert_eq!(slow_hits.load(Ordering::SeqCst), 1, "Chrome must have started, and be stuck in, the /slow navigation");
+
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(60), await_load(&page)).await;
+        eprintln!("await_load took {:?}", started.elapsed());
+        assert!(outcome.is_ok(), "await_load hung past 60s while the loaded page sat on screen");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_secs(10),
+            "returned in {:?} — the library still saw the page as loaded, so the deadline path was never exercised",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]

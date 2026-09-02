@@ -1,5 +1,6 @@
 use anyhow::Result;
 use base64::Engine as _;
+use crate::tools::controlled_browser::with_deadline;
 use serde::Deserialize;
 use serde_json::json;
 use std::io::Write as IoWrite;
@@ -828,6 +829,11 @@ struct BrowserFetch<'a> {
 /// Fetch an engine's results page through the real headed browser and parse it with
 /// `parse`. If the page is a captcha challenge, prompt the user (via a Phase event)
 /// and wait for them to solve it before extracting.
+/// Ceiling for one engine's results-page fetch: cookie seeding, navigation, the
+/// bounded load wait, three scroll passes and the HTML read. Legitimate fetches
+/// finish in well under a minute; only a hang gets here.
+const ENGINE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
 async fn scrape_via_browser(
     fetch: &BrowserFetch<'_>,
     tab: &'static str,
@@ -840,7 +846,10 @@ async fn scrape_via_browser(
     let BrowserFetch { browser, log_dir, progress } = *fetch;
     let emit = |e: ScrapeEvent| { if let Some(tx) = progress { let _ = tx.send(e); } };
 
-    let html = match browser.scrape_search_page_in(tab, &url, 3, cookies).await {
+    // Bounded so one wedged tab can only cost this engine its page, never stall the
+    // `join_all` that the other engines (and the whole run) are waiting behind.
+    let fetch_page = browser.scrape_search_page_in(tab, &url, 3, cookies);
+    let html = match with_deadline(&format!("{} results page", source), ENGINE_FETCH_TIMEOUT, fetch_page).await {
         Ok(h) => h,
         Err(e) => return ScrapeResult::err(source, format!("browser: {}", e)),
     };
