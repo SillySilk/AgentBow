@@ -223,6 +223,73 @@ use tokio::sync::Mutex;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+/// Windows job object that kills whatever is still inside it when the last handle
+/// closes — i.e. when *this* process dies, however it dies.
+///
+/// `kill_on_drop(true)` and the tray's `stop()` only cover the exits that run Rust
+/// code. They do not cover `std::process::exit` (which skips destructors), a panic
+/// that aborts, `taskkill /F` on bow-desktop alone, a closed console window
+/// (CTRL_CLOSE_EVENT terminates us), or logoff/shutdown. Every one of those left
+/// llama-server alive holding the whole model in VRAM — an orphan with a dead
+/// parent, recoverable only by `kill-bow.bat` or a reboot. A job object is the one
+/// mechanism the OS itself enforces, so the guarantee no longer depends on Bow
+/// getting a chance to clean up.
+#[cfg(windows)]
+mod winjob {
+    use std::os::windows::io::RawHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    pub struct KillOnCloseJob(HANDLE);
+
+    // The handle is only ever handed to thread-safe Win32 calls and closed once, on
+    // drop. Raw HANDLE is a bare pointer, so the auto-traits have to be asserted.
+    unsafe impl Send for KillOnCloseJob {}
+    unsafe impl Sync for KillOnCloseJob {}
+
+    impl KillOnCloseJob {
+        pub fn new() -> Option<Self> {
+            unsafe {
+                let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                if job.is_null() {
+                    return None;
+                }
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                let ok = SetInformationJobObject(
+                    job,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const core::ffi::c_void,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                );
+                if ok == 0 {
+                    CloseHandle(job);
+                    return None;
+                }
+                Some(Self(job))
+            }
+        }
+
+        /// Put an already-spawned process under this job. Nested jobs are fine on
+        /// Windows 8+, so this works even when Bow itself was launched inside one.
+        pub fn assign(&self, child: RawHandle) -> bool {
+            unsafe { AssignProcessToJobObject(self.0, child as HANDLE) != 0 }
+        }
+    }
+
+    impl Drop for KillOnCloseJob {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+}
+
 struct EngineInner {
     child: Option<tokio::process::Child>,
     state: String,
@@ -259,16 +326,34 @@ impl EngineStatus {
 pub struct LlmEngine {
     inner: Arc<Mutex<EngineInner>>,
     bin_dir: PathBuf,
+    /// Shared across clones: one job for the whole process, held until exit.
+    #[cfg(windows)]
+    job: Option<Arc<winjob::KillOnCloseJob>>,
 }
 
 impl LlmEngine {
     pub fn new(bin_dir: PathBuf) -> Self {
+        #[cfg(windows)]
+        let job = match winjob::KillOnCloseJob::new() {
+            Some(j) => Some(Arc::new(j)),
+            None => {
+                // Not fatal: the engine still runs, it just loses the guarantee that
+                // llama-server dies with Bow. Say so, because the symptom (VRAM held
+                // by an orphan after Bow is gone) is otherwise baffling.
+                tracing::warn!(
+                    "could not create job object — llama-server may outlive Bow if it exits abnormally"
+                );
+                None
+            }
+        };
         LlmEngine {
             inner: Arc::new(Mutex::new(EngineInner {
                 child: None, state: "stopped".into(), error: None, model: None, port: None,
                 generation: 0,
             })),
             bin_dir,
+            #[cfg(windows)]
+            job,
         }
     }
 
@@ -360,6 +445,21 @@ impl LlmEngine {
                 return Err(anyhow!(msg));
             }
         };
+        // Adopt the child into the kill-on-close job before anything else can go
+        // wrong, so even a crash one line from here cannot strand it.
+        #[cfg(windows)]
+        {
+            match (self.job.as_ref(), child.raw_handle()) {
+                (Some(job), Some(h)) => {
+                    if !job.assign(h) {
+                        tracing::warn!(
+                            "AssignProcessToJobObject failed — llama-server may outlive Bow"
+                        );
+                    }
+                }
+                _ => tracing::warn!("no job object — llama-server may outlive Bow"),
+            }
+        }
         {
             let mut g = self.inner.lock().await;
             if g.generation != my_gen {

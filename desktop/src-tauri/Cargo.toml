@@ -38,3 +38,8 @@ tao = "0.30"
 chromiumoxide = "0.9.1"
 url = "2"
 winreg = "0.56.0"
+
+# Job objects: the OS-enforced guarantee that llama-server dies with Bow, covering
+# the exits that skip Rust cleanup (process::exit, abort, taskkill, console close).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security"] }
