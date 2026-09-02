@@ -75,7 +75,7 @@ impl Config {
     }
 }
 
-fn env_candidates() -> Vec<PathBuf> {
+pub(crate) fn env_candidates() -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = Vec::new();
 
     // 1. Next to the running executable

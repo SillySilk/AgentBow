@@ -125,13 +125,51 @@ fn fatal_config_box(msg: &str) {
         .spawn();
 }
 
+/// Directory for Bow's own log, resolved the same way `Config::from_env` resolves
+/// the workspace. Loading .env here is safe and deliberate: dotenvy never overrides
+/// a variable that is already set, so the later `Config::from_env()` sees exactly
+/// the same values.
+fn log_dir() -> PathBuf {
+    for path in crate::state::env_candidates() {
+        if path.exists() {
+            let _ = dotenvy::from_path(&path);
+        }
+    }
+    dotenvy::dotenv().ok();
+    let ws = std::env::var("BOW_WORKSPACE").unwrap_or_else(|_| r"C:\AI\workspace".to_string());
+    PathBuf::from(ws).join("logs")
+}
+
 pub fn run() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("bow_desktop_lib=debug".parse().unwrap()),
-        )
-        .init();
+    // Bow's own log. Until now tracing went only to stdout, and in a debug build
+    // launched by bow.bat that stdout is a console window that disappears with the
+    // process -- so when Bow died mid-scrape there was nothing left to say why.
+    // The scrape's own bow_downloads.log recorded the truncation but not the cause.
+    // One previous run is kept beside the current one.
+    let dir = log_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let log_path = dir.join("bow.log");
+    let _ = std::fs::rename(&log_path, dir.join("bow.log.prev"));
+    let log_file = std::fs::OpenOptions::new()
+        .create(true).write(true).truncate(true).open(&log_path).ok();
+
+    let filter = tracing_subscriber::EnvFilter::from_default_env()
+        .add_directive("bow_desktop_lib=debug".parse().unwrap());
+    match log_file {
+        Some(f) => {
+            use tracing_subscriber::fmt::writer::MakeWriterExt;
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_ansi(false)
+                .with_writer(std::io::stdout.and(f))
+                .init();
+            info!("logging to {}", log_path.display());
+        }
+        None => {
+            tracing_subscriber::fmt().with_env_filter(filter).init();
+            tracing::warn!("could not open {} — logging to stdout only", log_path.display());
+        }
+    }
 
     let config = match Config::from_env() {
         Ok(c) => c,
