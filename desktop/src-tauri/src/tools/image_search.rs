@@ -848,10 +848,22 @@ async fn scrape_via_browser(
 
     // Bounded so one wedged tab can only cost this engine its page, never stall the
     // `join_all` that the other engines (and the whole run) are waiting behind.
-    let fetch_page = browser.scrape_search_page_in(tab, &url, 3, cookies);
-    let html = match with_deadline(&format!("{} results page", source), ENGINE_FETCH_TIMEOUT, fetch_page).await {
-        Ok(h) => h,
-        Err(e) => return ScrapeResult::err(source, format!("browser: {}", e)),
+    // A tab that fails is thrown away and the page fetched once more in a fresh
+    // one: a tab that has stopped answering never comes back on its own, and until
+    // now every later pass paid the full timeout for it (2026-09-05 run: Yandex and
+    // Bing dead from pass 2 to the end, "sources exhausted" at 66/200).
+    let mut fresh_tab = false;
+    let html = loop {
+        let fetch_page = browser.scrape_search_page_in(tab, &url, 3, cookies);
+        match with_deadline(&format!("{} results page", source), ENGINE_FETCH_TIMEOUT, fetch_page).await {
+            Ok(h) => break h,
+            Err(e) if !fresh_tab => {
+                tracing::warn!("{}: {} — retrying in a fresh tab", source, e);
+                browser.discard_tab(tab).await;
+                fresh_tab = true;
+            }
+            Err(e) => return ScrapeResult::err(source, format!("browser: {}", e)),
+        }
     };
 
     // Parse FIRST. If results are present, any captcha marker is a false positive
@@ -2289,6 +2301,59 @@ mod tests {
         // Both proxy copies decode to the same source, so it comes out once; the
         // favicon copy is dropped; non-Brave URLs never come from this parser.
         assert_eq!(parse_brave(&html, 10), vec![src]);
+    }
+
+    /// Live repro for engine tabs that stop answering after a pass (the
+    /// "Yandex results page timed out after 90s" / "goto: Request timed out"
+    /// failures). Scrapes page 0 in parallel tabs exactly like a run, idles for
+    /// `BOW_IDLE_SECS` (default 60) the way a download batch would, then scrapes
+    /// page 1 and prints per-engine outcomes with the per-step timings from
+    /// `scrape_search_page_in`:
+    /// `BOW_IDLE_SECS=600 cargo test --lib idle_tabs_repro_live -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires a real Chrome/Edge install and network; run manually with --ignored --nocapture"]
+    async fn idle_tabs_repro_live() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("bow_desktop_lib=debug")
+            .with_test_writer()
+            .try_init();
+        let idle: u64 = std::env::var("BOW_IDLE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(60);
+        let profile = std::env::temp_dir().join("bow_idle_tabs_repro");
+        let browser = crate::tools::controlled_browser::ControlledBrowser::new(profile);
+        let log_dir = std::env::temp_dir().join("bow_idle_tabs_repro_logs").to_string_lossy().to_string();
+        let fetch = BrowserFetch { browser: &browser, log_dir: &log_dir, progress: &None };
+        let encoded = urlencoding::encode("Francine Smith American dad").to_string();
+        type Row = (
+            &'static str,
+            &'static str,
+            fn(&str, usize, bool) -> String,
+            fn(&str, usize) -> Vec<String>,
+            &'static [(&'static str, &'static str, &'static str)],
+        );
+        let engines: [Row; 3] = [
+            ("yandex", "Yandex", yandex_page_url, parse_yandex,
+             &[("safesearch", "0", ".yandex.com"), ("yp", "1999999999.sp.ssp%3D0", ".yandex.com")]),
+            ("bing", "Bing", bing_page_url, parse_bing,
+             &[("SRCHHPGUSR", "SRCHLANG=en&ADLT=OFF&NNT=10&NRSLT=50", ".bing.com"),
+               ("BCP", "AD=0&AL=0&SM=0", ".bing.com"),
+               ("adlt", "off", ".bing.com")]),
+            ("brave", "Brave", brave_page_url, parse_brave,
+             &[("safesearch", "off", ".search.brave.com")]),
+        ];
+        for page in 0..2 {
+            let t0 = std::time::Instant::now();
+            let jobs = engines.iter().map(|(key, name, page_url, parse, cookies)| {
+                scrape_via_browser(&fetch, key, name, page_url(&encoded, page, true), 200, *parse, cookies)
+            });
+            let results = futures_util::future::join_all(jobs).await;
+            for r in &results {
+                eprintln!("p{} {}   [{:.1?}]", page, r.log_line(), t0.elapsed());
+            }
+            if page == 0 {
+                eprintln!("-- idling {}s --", idle);
+                tokio::time::sleep(std::time::Duration::from_secs(idle)).await;
+            }
+        }
     }
 
     #[test]

@@ -88,6 +88,13 @@ use crate::tools::recipe::Candidate;
 /// library still waited, so past this point the page is read as-is.
 const NAV_LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// Ceiling for any single CDP step the scraper takes (a cookie read, a script
+/// evaluation, an HTML read). chromiumoxide's own per-command timeout is 30 s;
+/// healthy tabs answer these in milliseconds, so a step that runs past this is a
+/// tab that has stopped answering, and the scraper should give up on the tab
+/// rather than pay 30 s for every step that follows.
+const STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Wait for `page` to finish loading, never longer than `NAV_LOAD_TIMEOUT`. A missed
 /// load event is not fatal: the caller reads whatever the page holds, exactly as it
 /// did before, minus the possibility of waiting forever.
@@ -102,6 +109,33 @@ async fn await_load(page: &Page) {
     if let Err(e) = waited {
         tracing::warn!("{} — reading the page as-is", e);
     }
+}
+
+/// Wait for the navigation `scrape_search_page_in` issued to produce a fully
+/// loaded document, never longer than `limit` (then the page is read as-is, exactly
+/// as `await_load` does). The `__bow_nav` marker set on the old document just
+/// before `location.assign` dies with that document, so its absence together with
+/// `readyState === "complete"` means the new one is in place.
+async fn wait_for_document(page: &Page, limit: std::time::Duration) {
+    const READY: &str =
+        "typeof window.__bow_nav === 'undefined' && document.readyState === 'complete'";
+    let start = std::time::Instant::now();
+    while start.elapsed() < limit {
+        // An evaluation can fail mid-transition (the execution context is torn down
+        // while the new document commits); that just means "not yet".
+        let ready = with_deadline("readiness poll", STEP_TIMEOUT, async {
+            page.evaluate(READY).await.map_err(|e| anyhow!("{}", e))
+        })
+        .await
+        .ok()
+        .and_then(|r| r.value().and_then(|v| v.as_bool()))
+        .unwrap_or(false);
+        if ready {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    tracing::warn!("page load timed out after {:.0?} — reading the page as-is", limit);
 }
 
 pub(crate) async fn with_deadline<T>(
@@ -195,29 +229,39 @@ impl ControlledBrowser {
             return Ok(());
         }
 
-        let exe = chrome_executable().ok_or_else(|| {
-            anyhow!("No Chrome/Edge found. Set CHROME_PATH in .env to the chrome.exe path.")
-        })?;
-        std::fs::create_dir_all(&self.profile_dir).ok();
+        // A previous Bow may have left its browser running: `taskkill` on Bow does
+        // not reach the Edge child, which then holds the profile lock, and a fresh
+        // launch dies with "Input/Output error while resolving websocket URL" — every
+        // engine dead for the whole run (the 2026-09-04 "Krusty" run). That instance
+        // advertises its DevTools endpoint in the profile, so attach to it instead.
+        let (browser, mut handler) = match self.connect_existing().await {
+            Some(pair) => pair,
+            None => {
+                let exe = chrome_executable().ok_or_else(|| {
+                    anyhow!("No Chrome/Edge found. Set CHROME_PATH in .env to the chrome.exe path.")
+                })?;
+                std::fs::create_dir_all(&self.profile_dir).ok();
 
-        let mut builder = BrowserConfig::builder()
-            .chrome_executable(exe)
-            .user_data_dir(self.profile_dir.clone())
-            // Scraper tabs run in the background while only one is foregrounded.
-            // Without these, Chrome throttles background renderers and timers, so
-            // lazy-loaded result tiles never render and a parallel scrape returns
-            // far fewer URLs from every tab but the visible one.
-            .arg("--disable-background-timer-throttling")
-            .arg("--disable-backgrounding-occluded-windows")
-            .arg("--disable-renderer-backgrounding");
-        if !headless {
-            builder = builder.with_head();
-        }
-        let cfg = builder.build().map_err(|e| anyhow!("BrowserConfig: {}", e))?;
+                let mut builder = BrowserConfig::builder()
+                    .chrome_executable(exe)
+                    .user_data_dir(self.profile_dir.clone())
+                    // Scraper tabs run in the background while only one is foregrounded.
+                    // Without these, Chrome throttles background renderers and timers, so
+                    // lazy-loaded result tiles never render and a parallel scrape returns
+                    // far fewer URLs from every tab but the visible one.
+                    .arg("--disable-background-timer-throttling")
+                    .arg("--disable-backgrounding-occluded-windows")
+                    .arg("--disable-renderer-backgrounding");
+                if !headless {
+                    builder = builder.with_head();
+                }
+                let cfg = builder.build().map_err(|e| anyhow!("BrowserConfig: {}", e))?;
 
-        let (browser, mut handler) = Browser::launch(cfg)
-            .await
-            .map_err(|e| anyhow!("Chrome launch failed: {}", e))?;
+                Browser::launch(cfg)
+                    .await
+                    .map_err(|e| anyhow!("Chrome launch failed: {}", e))?
+            }
+        };
         // The handler stream MUST be polled for the browser to function.
         let handler_task = tokio::spawn(async move { while (handler.next().await).is_some() {} });
         let page = browser
@@ -234,6 +278,32 @@ impl ControlledBrowser {
         Ok(())
     }
 
+    /// Attach to a browser already running on this profile, if its DevTools endpoint
+    /// answers. Chrome writes `DevToolsActivePort` (port, then the ws path) into the
+    /// profile at startup and removes it on a clean exit; a stale file just fails the
+    /// connect and falls through to a normal launch.
+    async fn connect_existing(&self) -> Option<(Browser, chromiumoxide::handler::Handler)> {
+        let text = std::fs::read_to_string(self.profile_dir.join("DevToolsActivePort")).ok()?;
+        let mut lines = text.lines();
+        let port: u16 = lines.next()?.trim().parse().ok()?;
+        let path = lines.next()?.trim().to_string();
+        let ws = format!("ws://127.0.0.1:{}{}", port, path);
+        let attached = with_deadline("attach to running browser", std::time::Duration::from_secs(5), async {
+            Browser::connect(ws.clone()).await.map_err(|e| anyhow!("{}", e))
+        })
+        .await;
+        match attached {
+            Ok(pair) => {
+                tracing::info!("attached to the browser already running on {}", ws);
+                Some(pair)
+            }
+            Err(e) => {
+                tracing::debug!("no reusable browser on this profile ({}) — launching one", e);
+                None
+            }
+        }
+    }
+
     /// Get-or-create the tab named `key`. Each name owns its own Chrome tab, so two
     /// callers with different names can navigate and scrape concurrently — the lock
     /// is only held long enough to look the tab up (or open it the first time).
@@ -242,17 +312,31 @@ impl ControlledBrowser {
     /// close can't wedge that engine for the rest of the session.
     async fn named_page(&self, key: &str) -> Result<Page> {
         self.ensure_launched(false).await?;
+        let existing = {
+            let guard = self.inner.lock().await;
+            guard.as_ref().and_then(|st| st.tabs.get(key).cloned())
+        };
+        if let Some(page) = existing {
+            // Liveness probe, run outside the lock so one engine's stalled tab can't
+            // hold up the other engines' lookups. `url()` is answered by the driver
+            // itself: a closed tab (its target gone) errors, anything else answers
+            // at once — so the deadline only ever trips on a dead driver.
+            let t0 = std::time::Instant::now();
+            let probe = with_deadline("tab probe", STEP_TIMEOUT, async {
+                page.url().await.map_err(|e| anyhow!("{}", e))
+            })
+            .await;
+            tracing::debug!(tab = key, "named_page: probe {} in {:.1?}",
+                if probe.is_ok() { "ok" } else { "failed" }, t0.elapsed());
+            if probe.is_ok() {
+                return Ok(page);
+            }
+        }
         let mut guard = self.inner.lock().await;
         let st = guard
             .as_mut()
             .ok_or_else(|| anyhow!("Browser not launched — call browser_open first"))?;
-        if let Some(existing) = st.tabs.get(key) {
-            // Cheap liveness probe: a closed tab's target is gone and this errors.
-            if existing.url().await.is_ok() {
-                return Ok(existing.clone());
-            }
-            st.tabs.remove(key);
-        }
+        st.tabs.remove(key);
         let page = st
             .browser
             .new_page("about:blank")
@@ -310,34 +394,104 @@ impl ControlledBrowser {
         scrolls: u32,
         cookies: &[(&str, &str, &str)],
     ) -> Result<String> {
+        // Every step is timed and bounded by `STEP_TIMEOUT`. A wedged tab and a slow
+        // page look identical from the outside, so the log says *which* step stopped
+        // answering, and a step that does stop answering fails fast so the caller
+        // can recycle the tab instead of paying chromiumoxide's 30 s per command.
+        let t0 = std::time::Instant::now();
         let page = self.named_page(tab).await?;
+        tracing::debug!(tab, "scrape: tab ready at {:.1?}", t0.elapsed());
         let u = url.to_string();
+
         // Seed safe-search-off cookies before the page loads, skipping any the
         // profile already has (a logged-in session's own prefs take precedence).
-        let existing: std::collections::HashSet<String> = page
-            .execute(GetCookiesParams { urls: Some(vec![u.clone()]) })
-            .await
-            .map(|r| r.result.cookies.iter().map(|c| c.name.clone()).collect())
-            .unwrap_or_default();
-        for (n, v, d) in cookies {
-            if existing.contains(*n) {
-                continue;
+        with_deadline("cookie seeding", STEP_TIMEOUT, async {
+            let existing: std::collections::HashSet<String> = page
+                .execute(GetCookiesParams { urls: Some(vec![u.clone()]) })
+                .await
+                .map_err(|e| anyhow!("getCookies: {}", e))?
+                .result
+                .cookies
+                .iter()
+                .map(|c| c.name.clone())
+                .collect();
+            for (n, v, d) in cookies {
+                if existing.contains(*n) {
+                    continue;
+                }
+                // `url` is required alongside `domain`: without it chromiumoxide falls
+                // back to the tab's current URL, and on a freshly opened tab that is
+                // about:blank, which it refuses ("Blank page can not have cookie") —
+                // so the very first pass in every fresh tab used to seed nothing.
+                let url = format!("https://{}/", d.trim_start_matches('.'));
+                if let Ok(cp) = serde_json::from_value::<CookieParam>(
+                    json!({ "name": n, "value": v, "domain": d, "path": "/", "url": url }),
+                ) {
+                    if let Err(e) = page.set_cookie(cp).await {
+                        tracing::warn!(tab, "scrape: setCookie {} failed: {}", n, e);
+                    }
+                }
             }
-            if let Ok(cp) = serde_json::from_value::<CookieParam>(
-                json!({ "name": n, "value": v, "domain": d, "path": "/" }),
-            ) {
-                let _ = page.set_cookie(cp).await;
-            }
-        }
-        page.goto(&u).await.map_err(|e| anyhow!("goto: {}", e))?;
-        await_load(&page).await;
+            Ok(())
+        })
+        .await?;
+        tracing::debug!(tab, "scrape: cookies seeded at {:.1?}", t0.elapsed());
+
+        // Navigate from inside the page rather than with `Page.navigate`.
+        // chromiumoxide routes `Page.navigate` through its own navigation watcher,
+        // which resolves only when it sees the frame's `load` lifecycle event — and
+        // on later navigations of a long-lived tab it misses that event (upstream
+        // issue #52), so `goto` sat for 30 s and reported "Request timed out" while
+        // Edge had already loaded the page: the tab that survived the 2026-09-05 run
+        // had every "timed out" pass in its navigation history. A script-driven
+        // navigation never touches the watcher; readiness is polled from the page.
+        let nav = format!("window.__bow_nav = 1; location.assign({});", serde_json::to_string(&u)?);
+        with_deadline("navigate", STEP_TIMEOUT, async {
+            page.evaluate(nav).await.map(|_| ()).map_err(|e| anyhow!("navigate: {}", e))
+        })
+        .await?;
+        tracing::debug!(tab, "scrape: navigation issued at {:.1?}", t0.elapsed());
+        wait_for_document(&page, NAV_LOAD_TIMEOUT).await;
+        tracing::debug!(tab, "scrape: document ready at {:.1?}", t0.elapsed());
+
         // Let the initial result tiles render.
         tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
         for _ in 0..scrolls {
-            let _ = page.evaluate("window.scrollTo(0,document.body.scrollHeight)").await;
+            with_deadline("scroll", STEP_TIMEOUT, async {
+                page.evaluate("window.scrollTo(0,document.body.scrollHeight)")
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| anyhow!("scroll: {}", e))
+            })
+            .await?;
             tokio::time::sleep(std::time::Duration::from_millis(900)).await;
         }
-        page.content().await.map_err(|e| anyhow!("content: {}", e))
+        let html = with_deadline("html read", STEP_TIMEOUT, async {
+            page.content().await.map_err(|e| anyhow!("content: {}", e))
+        })
+        .await?;
+        tracing::debug!(tab, "scrape: html read at {:.1?} ({} bytes)", t0.elapsed(), html.len());
+        Ok(html)
+    }
+
+    /// Drop tab `key` so the next `named_page(key)` opens a fresh one. The close is
+    /// best-effort and bounded: a tab is discarded precisely because it stopped
+    /// answering, so waiting on it would defeat the point.
+    pub async fn discard_tab(&self, key: &str) {
+        let page = {
+            let mut guard = self.inner.lock().await;
+            guard.as_mut().and_then(|st| st.tabs.remove(key))
+        };
+        if let Some(page) = page {
+            let closed = with_deadline("close tab", STEP_TIMEOUT, async {
+                page.close().await.map_err(|e| anyhow!("{}", e))
+            })
+            .await;
+            match closed {
+                Ok(()) => tracing::info!(tab = key, "discarded tab"),
+                Err(e) => tracing::warn!(tab = key, "discarded tab (close failed: {})", e),
+            }
+        }
     }
 
     /// Return tab `tab`'s raw HTML without navigating (used to poll while the user
