@@ -1162,19 +1162,53 @@ fn parse_yandex(html: &str, max: usize) -> Vec<String> {
 }
 
 /// Parse image URLs from a Brave images results page. Brave proxies every image
-/// through `imgs.search.brave.com`, so we keep only those.
+/// through `imgs.search.brave.com`, so only those are Brave's results — but the
+/// proxied copy is a thumbnail, so each one is swapped for the source URL it
+/// encodes (see `brave_original_url`). The `32x32` copies are site favicons, not
+/// results, and are dropped.
 fn parse_brave(html: &str, max: usize) -> Vec<String> {
     let mut urls = Vec::new();
     let mut all_hrefs = Vec::new();
     extract_between(html, "href=\"", "\"", max * 3, &mut all_hrefs);
     extract_between(html, "src=\"", "\"", max * 3, &mut all_hrefs);
     for u in &all_hrefs {
-        if u.contains("imgs.search.brave.com/") && !urls.contains(u) {
-            urls.push(u.clone());
+        if !u.contains("imgs.search.brave.com/") || u.contains("/rs:fit:32:32:") {
+            continue;
+        }
+        // A proxy URL whose payload doesn't decode is still a real image; keep it.
+        let url = brave_original_url(u).unwrap_or_else(|| u.clone());
+        if !urls.contains(&url) {
+            urls.push(url);
         }
         if urls.len() >= max { break; }
     }
     urls
+}
+
+/// Recover the source image URL from a Brave proxy URL.
+///
+/// `imgs.search.brave.com` is an imgproxy front:
+/// `/<signature>/rs:fit:500:0:1:0/g:ce/<payload>` where the payload is the source
+/// URL in URL-safe base64, split into 16-char chunks by `/`, sometimes with an
+/// extension tacked onto the last chunk. Every option segment carries a `:` and
+/// payload chunks never do, so the payload is everything after the last option.
+///
+/// The proxied copies are 500 px wide or 180 px tall, so under a min-size gate a
+/// run downloaded and rejected nearly every Brave candidate (220 of 286 "too
+/// small" rejects in the 2026-09-05 run) while the full-size originals sat
+/// encoded in the URLs it was throwing away.
+fn brave_original_url(proxy: &str) -> Option<String> {
+    let path = proxy.split_once("imgs.search.brave.com/")?.1;
+    let segs: Vec<&str> = path.split('/').collect();
+    let last_opt = segs.iter().rposition(|s| s.contains(':'))?;
+    let mut payload: String = segs[last_opt + 1..].concat();
+    if let Some(dot) = payload.rfind('.') {
+        payload.truncate(dot);
+    }
+    let payload = payload.trim_end_matches('=');
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let url = String::from_utf8(bytes).ok()?;
+    (url.starts_with("http://") || url.starts_with("https://")).then_some(url)
 }
 
 // ── Content dedup (pHash) ───────────────────────────────────────────────────────
@@ -2220,6 +2254,41 @@ mod tests {
             "https://imgs.search.brave.com/abc",
             "https://imgs.search.brave.com/def",
         ]);
+    }
+
+    /// Build a Brave proxy URL the way imgs.search.brave.com does: URL-safe base64 of
+    /// the source URL, split into 16-char chunks separated by `/`.
+    fn brave_proxy(source: &str, opts: &str, suffix: &str) -> String {
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(source.as_bytes());
+        let chunks: Vec<String> = b64.as_bytes().chunks(16)
+            .map(|c| std::str::from_utf8(c).unwrap().to_string()).collect();
+        format!("https://imgs.search.brave.com/SIGNATURE/{}/{}{}", opts, chunks.join("/"), suffix)
+    }
+
+    #[test]
+    fn brave_original_url_decodes_chunked_payload() {
+        let src = "https://example.com/pics/cat.jpg?x=1&y=2";
+        assert_eq!(brave_original_url(&brave_proxy(src, "rs:fit:500:0:1:0/g:ce", "")).as_deref(), Some(src));
+        // Brave sometimes appends an extension to the last chunk.
+        assert_eq!(brave_original_url(&brave_proxy(src, "rs:fit:0:180:1:0/g:ce", ".jpeg")).as_deref(), Some(src));
+        // Not a proxy URL, or a payload that isn't a URL → nothing.
+        assert_eq!(brave_original_url("https://example.com/cat.jpg"), None);
+        assert_eq!(brave_original_url("https://imgs.search.brave.com/abc"), None);
+        assert_eq!(brave_original_url("https://imgs.search.brave.com/SIG/rs:fit:500:0:1:0/g:ce/bm90IGEgdXJs"), None);
+    }
+
+    #[test]
+    fn parse_brave_hands_out_source_urls_and_skips_favicons() {
+        let src = "https://cdn.example.org/full/francine.png";
+        let thumb = brave_proxy(src, "rs:fit:500:0:1:0/g:ce", "");
+        let tall = brave_proxy(src, "rs:fit:0:180:1:0/g:ce", "");
+        let favicon = brave_proxy("https://example.org/favicon.ico", "rs:fit:32:32:1:0/g:ce", "");
+        let html = format!(
+            "<a href=\"{thumb}\">x</a><img src=\"{tall}\"><img src=\"{favicon}\"><img src=\"https://other.com/skip.jpg\">"
+        );
+        // Both proxy copies decode to the same source, so it comes out once; the
+        // favicon copy is dropped; non-Brave URLs never come from this parser.
+        assert_eq!(parse_brave(&html, 10), vec![src]);
     }
 
     #[test]
