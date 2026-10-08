@@ -1,0 +1,5 @@
+{
+  "name": "Agent Bow",
+  "launch": "bow.bat",
+  "image": "tile.png"
+}
