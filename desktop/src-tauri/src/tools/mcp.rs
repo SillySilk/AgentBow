@@ -346,7 +346,7 @@ fn find_config(workspace_root: &str) -> Option<PathBuf> {
             candidates.push(dir.join("mcp.json"));
         }
     }
-    candidates.push(PathBuf::from(r"C:\AI\agent Bow\desktop\mcp.json"));
+    candidates.push(PathBuf::from(r"C:\AI\Apps\agent Bow\desktop\mcp.json"));
     candidates.push(PathBuf::from(workspace_root).join("mcp.json"));
     candidates.push(PathBuf::from("mcp.json"));
 

@@ -695,7 +695,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs llama-server.exe + a real GGUF; run manually with --ignored"]
     async fn engine_loads_real_model_live() {
-        let eng = LlmEngine::new(PathBuf::from(r"C:\AI\agent Bow\desktop\src-tauri\bin\llama"));
+        let eng = LlmEngine::new(PathBuf::from(r"C:\AI\Apps\agent Bow\desktop\src-tauri\bin\llama"));
         let models = scan_models(Path::new(r"C:\AI\models"));
         let m = models.into_iter().find(|m| is_loadable_quant(&m.quant)).expect("a model");
         eng.load(m, 4096).await.expect("load");

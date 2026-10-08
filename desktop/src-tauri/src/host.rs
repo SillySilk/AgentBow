@@ -175,7 +175,7 @@ pub fn run() {
         Ok(c) => c,
         Err(e) => {
             fatal_config_box(&format!(
-                "Bow failed to start:\n\n{}\n\nEdit C:\\AI\\agent Bow\\desktop\\.env and ensure all keys are set.",
+                "Bow failed to start:\n\n{}\n\nEdit C:\\AI\\Apps\\agent Bow\\desktop\\.env and ensure all keys are set.",
                 e
             ));
             std::process::exit(1);
@@ -290,7 +290,7 @@ pub fn run() {
                     .spawn();
             } else if ev.id == env_i.id() {
                 let _ = std::process::Command::new("notepad.exe")
-                    .arg(r"C:\AI\agent Bow\desktop\.env")
+                    .arg(r"C:\AI\Apps\agent Bow\desktop\.env")
                     .spawn();
             } else if ev.id == quit_i.id() {
                 info!("Quit requested — stopping local LLM engine before exit");

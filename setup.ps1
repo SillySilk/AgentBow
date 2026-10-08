@@ -1,5 +1,5 @@
 # Bow Setup Script
-# Run from: C:\AI\agent Bow\
+# Run from: C:\AI\Apps\agent Bow\
 # Usage: powershell -ExecutionPolicy Bypass -File setup.ps1
 
 $ErrorActionPreference = "Stop"

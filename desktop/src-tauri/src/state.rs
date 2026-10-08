@@ -86,7 +86,7 @@ pub(crate) fn env_candidates() -> Vec<PathBuf> {
     }
 
     // 2. Hardcoded dev project path
-    paths.push(PathBuf::from(r"C:\AI\agent Bow\desktop\.env"));
+    paths.push(PathBuf::from(r"C:\AI\Apps\agent Bow\desktop\.env"));
 
     // 3. Current working directory
     paths.push(PathBuf::from(".env"));
