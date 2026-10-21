@@ -1,5 +1,6 @@
 {
   "name": "Agent Bow",
+  "tagline": "Local AI agent",
   "launch": "bow.bat",
   "image": "tile.png"
 }
